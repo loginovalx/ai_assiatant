@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -19,3 +20,16 @@ def ensure_aware(dt: datetime, tz: ZoneInfo) -> datetime:
     напоминание «в 10 утра» сработает в 13:00 по Москве.
     """
     return dt.replace(tzinfo=tz) if dt.tzinfo is None else dt
+
+
+def mentions_time(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b\d{1,2}[:.]\d{2}\b|\bв\s+\d{1,2}\b|"
+            r"\bчерез\s+(?:(?:\d+|два|две|три|четыре|пять|полтора|полчаса)\s+)?(?:час|минут)|"
+            r"\b(?:утром|днём|днем|вечером|полдень|полночь|обед)\b|"
+            r"\bв\s+(?:час|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|одиннадцать|двенадцать)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )

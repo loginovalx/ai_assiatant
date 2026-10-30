@@ -7,7 +7,6 @@ from typing import Protocol
 
 import httpx
 
-
 logger = logging.getLogger(__name__)
 
 

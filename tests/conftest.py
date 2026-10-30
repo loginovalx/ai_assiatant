@@ -69,7 +69,7 @@ async def pool():
     conn = await asyncpg.connect(TEST_DSN)
     await conn.execute("DROP TABLE IF EXISTS events CASCADE")
     for migration in MIGRATIONS:
-        await conn.execute(migration.read_text())
+        await conn.execute(migration.read_text(encoding="utf-8"))
     await conn.close()
 
     pool = await create_pool(TEST_DSN)
@@ -98,3 +98,36 @@ def repo(pool, tz):
 @pytest.fixture
 def semantic_repo(pool, tz):
     return EventRepository(pool, FakeEmbedder(), tz)
+
+
+@pytest.fixture
+async def redis():
+    url = os.environ.get("TEST_REDIS_URL")
+    if not url:
+        pytest.skip("TEST_REDIS_URL не задан")
+    from redis.asyncio import Redis
+
+    client = Redis.from_url(url, decode_responses=True)
+    await client.flushdb()
+    yield client
+    await client.aclose()
+
+
+@pytest.fixture
+def make_agent(pool, redis, tz):
+    from agent.core import Agent
+    from agent.memory import ConversationMemory
+    from agent.tools import McpToolbox
+    from mcp_server.server import mcp
+    from tests.scripted_llm import ScriptedLLM
+
+    def factory(*script):
+        return Agent(
+            ScriptedLLM(*script),
+            "GigaChat-2-Max",
+            McpToolbox(mcp),
+            ConversationMemory(redis, 10, 3600),
+            tz,
+        ), None
+
+    return factory

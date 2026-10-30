@@ -14,8 +14,8 @@ from openai import AsyncOpenAI
 
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.prompt import build_system_prompt
-from agent.tools import McpToolbox, ToolResult
-from common.schemas import AgentResponse, AgentStatus, Event
+from agent.tools import MUTATING_TOOLS, McpToolbox, ToolResult
+from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,9 @@ class Agent:
         self._tz = tz
         self._max_steps = max_steps
 
-    async def handle(self, user_id: str, text: str, now: datetime | None = None) -> AgentResponse:
+    async def handle(
+        self, user_id: str, text: str, now: datetime | None = None, *, confirm_changes: bool = False
+    ) -> AgentResponse:
         now = now or datetime.now(self._tz)
         try:
             history = await self._memory.load(user_id)
@@ -49,7 +51,7 @@ class Agent:
                 *history,
                 {"role": "user", "content": text},
             ]
-            response = await self._run(user_id, messages)
+            response = await self._run(user_id, messages, confirm_changes=confirm_changes)
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
             logger.exception("LLM или MCP недоступны")
             return AgentResponse(reply_text=FALLBACK_ERROR, status=AgentStatus.ERROR)
@@ -71,13 +73,46 @@ class Agent:
     async def reset(self, user_id: str) -> None:
         await self._memory.reset(user_id)
 
-    async def _run(self, user_id: str, messages: list[dict[str, Any]]) -> AgentResponse:
+    async def execute_draft(self, user_id: str, draft: DraftAction) -> AgentResponse:
+        if draft.tool not in MUTATING_TOOLS:
+            return AgentResponse(
+                reply_text="Не получилось выполнить: неизвестное действие.",
+                status=AgentStatus.ERROR,
+            )
+        try:
+            result = await self._toolbox.call(user_id, draft.tool, draft.arguments)
+            if not result.ok:
+                return AgentResponse(
+                    reply_text=f"Не получилось выполнить: {result.payload}",
+                    status=AgentStatus.ERROR,
+                )
+            events = [Event.model_validate(raw) for raw in result.events]
+            if any(event.user_id != user_id for event in events):
+                raise ValueError("Foreign event")
+            response = AgentResponse(
+                reply_text="Готово. " + draft.preview, events=events, status=AgentStatus.DONE
+            )
+            await self._memory.append(
+                user_id, HistoryMessage(role="assistant", content=_with_event_refs(response))
+            )
+            return response
+        except Exception:
+            logger.exception("Ошибка подтверждения черновика")
+            return AgentResponse(
+                reply_text="Не получилось выполнить действие. Проверьте календарь перед повтором.",
+                status=AgentStatus.ERROR,
+            )
+
+    async def _run(
+        self, user_id: str, messages: list[dict[str, Any]], *, confirm_changes: bool = False
+    ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
         events: dict[str, Event] = {}
         mutations: dict[str, ToolResult] = {}
         confirmed: dict[str, Event] = {}
         conflict_warnings: dict[str, Event] = {}
         last_error: str | None = None
+        draft: DraftAction | None = None
 
         for _ in range(self._max_steps):
             try:
@@ -99,6 +134,11 @@ class Agent:
                         events=list(events.values()),
                     )
                 reply = (message.content or "").strip()
+                if draft and reply:
+                    draft.preview = reply
+                    return AgentResponse(
+                        reply_text=reply, status=AgentStatus.NEEDS_CONFIRMATION, draft=draft
+                    )
                 if not reply:
                     return (
                         _confirmed_response(confirmed, conflict_warnings)
@@ -129,12 +169,23 @@ class Agent:
                     )
 
                 fingerprint = json.dumps([name, args], ensure_ascii=False, sort_keys=True)
+                preview = confirm_changes and name in MUTATING_TOOLS
                 result = mutations.get(fingerprint) or (
-                    await self._toolbox.call(user_id, name, args)
+                    (
+                        await self._toolbox.call(user_id, name, args, dry_run=True)
+                        if preview
+                        else await self._toolbox.call(user_id, name, args)
+                    )
                     if args is not None
                     else ToolResult(ok=False, payload="Аргументы не являются корректным JSON")
                 )
                 last_error = None if result.ok else str(result.payload)
+                if preview and result.ok:
+                    draft = DraftAction(tool=name, arguments=args, preview="")
+                    messages.append(
+                        {"role": "tool", "tool_call_id": call.id, "content": result.for_llm()}
+                    )
+                    continue
                 for raw in result.events:
                     event = Event.model_validate(raw)
                     if event.user_id != user_id:
@@ -176,7 +227,9 @@ def _with_event_refs(response: AgentResponse) -> str:
     знал, о какой записи речь. Пользователь эту сводку не видит — только модель в истории.
     """
     if not response.events:
-        return response.reply_text
+        return response.reply_text + (
+            f"\n[черновик: {response.draft.model_dump_json()}]" if response.draft else ""
+        )
     refs = "; ".join(f"id={e.id}, {e.type}, «{e.name}», {_when(e)}" for e in response.events[:10])
     return f"{response.reply_text}\n[записи в этом ответе: {refs}]"
 

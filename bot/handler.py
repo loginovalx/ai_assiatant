@@ -2,17 +2,21 @@
 
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 from redis.asyncio import Redis
 
 from bot.agent_client import AgentClient, AgentUnavailable
 from bot.asr import SpeechRecognitionError, SpeechRecognizer
+from bot.drafts import DraftStore
 from bot.max_api import MaxAPI, MaxAPIError
 from bot.state import StateStore
 from common.calendar_import import CalendarImportError, parse_calendar_csv
 from common.config import get_settings
 from common.repository import EventRepository
+from common.schemas import EventStatus
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,19 @@ _HELP = (
 _MAX_CSV_BYTES = 5_000_000
 _BUSY = "Ещё думаю над прошлым запросом. Попробуй через несколько секунд."
 _AUDIO_EXT = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac")
+CONFIRM_BUTTONS = [
+    [
+        {"type": "callback", "text": "Подтвердить", "payload": "draft:confirm"},
+        {"type": "callback", "text": "Исправить", "payload": "draft:edit"},
+        {"type": "callback", "text": "Отмена", "payload": "draft:cancel"},
+    ]
+]
+QUICK_ACTIONS = [
+    [
+        {"type": "callback", "text": "Сегодня", "payload": "quick:today"},
+        {"type": "callback", "text": "Завтра", "payload": "quick:tomorrow"},
+    ]
+]
 
 
 def _attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -130,6 +147,97 @@ class BotHandler:
         self.state = state
         self.redis = redis
         self.repo = repo
+        self.drafts = DraftStore(redis)
+
+    async def _result(self, user_id, chat_id, result, to_user=True):
+        buttons = None
+        if result.status == "needs_confirmation" and result.draft:
+            await self.drafts.save(user_id, result.draft)
+            buttons = CONFIRM_BUTTONS
+        await self.max_api.send(
+            chat_id, result.reply_text or "Агент не вернул ответ", to_user=to_user, buttons=buttons
+        )
+
+    async def _callback(self, update):
+        callback = update.get("callback") or {}
+        user = (callback.get("user") or {}).get("user_id")
+        payload = callback.get("payload") or ""
+        callback_id = callback.get("callback_id")
+        if user is None or not callback_id:
+            return
+        user_id = str(user)
+        if payload.startswith("quick:"):
+            question = {
+                "quick:today": "Что у меня сегодня?",
+                "quick:tomorrow": "Что у меня завтра?",
+            }.get(payload)
+            if question:
+                await self.handle_update(
+                    {
+                        "update_type": "message_created",
+                        "message": {
+                            "sender": {"user_id": user},
+                            "recipient": {"chat_type": "dialog"},
+                            "body": {"mid": "callback:" + callback_id, "text": question},
+                        },
+                    }
+                )
+            await self.max_api.answer_callback(callback_id)
+            return
+        request_id = await self.state.acquire(user_id, "thinking")
+        if request_id is None:
+            await self.max_api.answer_callback(callback_id, _BUSY)
+            return
+        try:
+            if payload.startswith("event:"):
+                await self._event_action(user_id, callback_id, payload)
+                return
+            draft = await self.drafts.load(user_id)
+            if payload == "draft:cancel":
+                await self.drafts.drop(user_id)
+                await self.max_api.send(int(user), "Отменил действие.", to_user=True)
+                await self.max_api.answer_callback(callback_id, "Отменено")
+            elif payload == "draft:edit":
+                await self.max_api.send(int(user), "Что поправить?", to_user=True)
+                await self.max_api.answer_callback(callback_id)
+            elif payload == "draft:confirm" and draft:
+                result = await self.agent.confirm(user_id, draft)
+                await self.drafts.drop(user_id)
+                await self._result(user_id, int(user), result)
+                await self.max_api.answer_callback(callback_id, "✅ Подтверждено")
+            else:
+                await self.max_api.answer_callback(callback_id, "Черновик устарел")
+        finally:
+            await self.state.release(user_id, request_id)
+
+    async def _event_action(self, user_id: str, callback_id: str, payload: str) -> None:
+        """Кнопки под уведомлением: «Готово» или «На час позже».
+
+        repo сам ограничивает действие владельцем записи: чужой user_id вернёт None,
+        и база не изменится — но колбэк всё равно отвечаем, чтобы кнопка не крутилась.
+        """
+        if self.repo is None:
+            await self.max_api.answer_callback(callback_id, "Действие недоступно")
+            return
+        _, action, raw_id = payload.split(":", 2)
+        try:
+            event_id = UUID(raw_id)
+        except ValueError:
+            await self.max_api.answer_callback(callback_id, "Не поняла, о какой записи речь")
+            return
+        if action == "done":
+            event = await self.repo.set_status(user_id, event_id, EventStatus.DONE)
+            await self.max_api.answer_callback(
+                callback_id, "Готово 👍" if event else "Запись не найдена"
+            )
+        elif action == "snooze":
+            new_start = datetime.now(get_settings().tz) + timedelta(hours=1)
+            event = await self.repo.postpone(user_id, event_id, new_start)
+            await self.max_api.answer_callback(
+                callback_id, "Отложила на час." if event else "Запись не найдена"
+            )
+        else:
+            await self.max_api.answer_callback(callback_id, "Неизвестное действие")
 
     async def _greet_if_new(self, user_id: str, reply: Callable[[str], Awaitable[None]]) -> None:
         """Приветствие ровно один раз на пользователя: флаг переживает перезапуск бота."""
@@ -164,6 +272,9 @@ class BotHandler:
 
     async def handle_update(self, update: dict[str, Any]) -> None:
         kind = update.get("update_type")
+        if kind == "message_callback":
+            await self._callback(update)
+            return
         if kind == "bot_started":
             user = update.get("user") or {}
             user_id = user.get("user_id")
@@ -207,7 +318,7 @@ class BotHandler:
         text = ((message.get("body") or {}).get("text") or "").strip()
         if text in {"/start", "/help"}:
             await self.redis.set(f"bot:greeted:{user_id}", "1")
-            await reply(_HELP)
+            await self.max_api.send(chat_id, _HELP, to_user=to_user, buttons=QUICK_ACTIONS)
             return
 
         # Первое сообщение от незнакомого пользователя: сначала представимся.
@@ -276,8 +387,19 @@ class BotHandler:
             else:
                 await reply("⏳ Думаю над запросом…")
 
-            result = await self.agent.ask(user_id=user_id, text=text)
-            await reply(result.reply_text or "Агент не вернул ответ")
+            pending = await self.drafts.load(user_id)
+            if pending and text.casefold().strip(" .!") in {"да", "подтвердить", "подтверждаю"}:
+                result = await self.agent.confirm(user_id, pending)
+                await self.drafts.drop(user_id)
+            elif pending and text.casefold().strip(" .!") in {"нет", "отмена", "отмени"}:
+                await self.drafts.drop(user_id)
+                await reply("Отменил действие.")
+                return
+            else:
+                result = await self.agent.ask(
+                    user_id=user_id, text=text, confirm_changes=is_voice or pending is not None
+                )
+            await self._result(user_id, chat_id, result, to_user)
         except (SpeechRecognitionError, MaxAPIError) as exc:
             logger.warning("Audio problem for user %s: %s", user_id, exc)
             await reply(f"Не получилось обработать голос: {exc}. Попробуй ещё раз.")

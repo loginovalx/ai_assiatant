@@ -160,17 +160,32 @@ class AgentStatus(StrEnum):
     DONE = "done"
     NEED_CLARIFICATION = "need_clarification"
     ERROR = "error"
+    NEEDS_CONFIRMATION = "needs_confirmation"
+
+
+class DraftAction(BaseModel):
+    tool: str
+    arguments: dict = Field(default_factory=dict)
+    preview: str
+    status: str = "pending_confirmation"
 
 
 class AgentRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
     text: str = Field(min_length=1, max_length=4000)
+    confirm_changes: bool = False
 
 
 class AgentResponse(BaseModel):
     reply_text: str
     status: AgentStatus
     events: list[Event] = []
+    draft: DraftAction | None = None
+
+
+class AgentConfirmRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=64)
+    draft: DraftAction
 
 
 class AgentResetRequest(BaseModel):

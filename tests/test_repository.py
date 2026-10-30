@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from common.schemas import EventCreate, EventType
+from common.schemas import EventCreate, EventStatus, EventType
 
 USER = "user-1"
 
@@ -122,3 +122,19 @@ async def test_search_ranks_multiple_signals_higher(semantic_repo):
     hits = await semantic_repo.search(USER, "презентация")
     assert hits[0].name == "Подготовить презентацию"
     assert set(hits[0].matched_by) >= {"text", "semantic"}
+
+
+async def test_postpone_clears_notified_and_checks_owner(repo, tz):
+    """«На час позже»: время сдвинуто, напоминание вернётся в очередь; чужая кнопка не двигает."""
+    now = datetime.now(tz)
+    event = await add(repo, EventType.REMINDER, "Позвонить в сервис", now - timedelta(minutes=1))
+    await repo.claim_due_events(now, timedelta(hours=1), 10)
+
+    later = await repo.postpone(USER, event.id, now + timedelta(hours=1))
+    assert later.start_at > now + timedelta(minutes=59)
+    assert await repo.claim_due_events(now + timedelta(hours=1, seconds=1), timedelta(hours=1), 10)
+
+    assert await repo.postpone("other-user", event.id, now + timedelta(hours=2)) is None
+    cancelled = await add(repo, EventType.TASK, "Прочее")
+    await repo.set_status(USER, cancelled.id, EventStatus.CANCELLED)
+    assert await repo.postpone(USER, cancelled.id, now + timedelta(hours=1)) is None

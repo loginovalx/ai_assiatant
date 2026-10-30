@@ -34,12 +34,13 @@ from common.schemas import (
     SearchHit,
     check_duration,
 )
-from common.timeutils import ensure_aware
+from common.timeutils import ensure_aware, mentions_time
 
 logger = logging.getLogger(__name__)
 
 # Небольшой запас на задержку между репликой пользователя и вызовом тула.
 PAST_TOLERANCE = timedelta(minutes=5)
+DRAFT_EVENT_ID = UUID("00000000-0000-0000-0000-000000000000")
 
 UserId = Annotated[str, Field(description="ID пользователя MAX. Передавай всегда, как есть.")]
 EventTypeName = Literal["task", "meeting", "reminder"]
@@ -126,6 +127,7 @@ async def create_event(
         ),
     ] = None,
     duration_minutes: Duration = None,
+    dry_run: bool = False,
 ) -> EventWithConflicts:
     """Создать задачу, напоминание или встречу.
 
@@ -148,6 +150,12 @@ async def create_event(
         raise ToolError(_validation_message(error)) from error
 
     now = datetime.now(get_settings().tz).replace(microsecond=0)
+    if (
+        data.type in {EventType.MEETING, EventType.REMINDER}
+        and description
+        and not mentions_time(description)
+    ):
+        raise ToolError("В исходном запросе нет времени, только день. Спроси точное время.")
     if data.start_at is not None and data.start_at < now - PAST_TOLERANCE:
         raise ToolError(
             f"Время {data.start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "
@@ -165,7 +173,17 @@ async def create_event(
         )
 
     repo = _repo(ctx)
-    event = await repo.create(data)
+    event = (
+        Event(
+            id=DRAFT_EVENT_ID,
+            **data.model_dump(),
+            status=EventStatus.ACTIVE,
+            created_at=now,
+            updated_at=now,
+        )
+        if dry_run
+        else await repo.create(data)
+    )
     conflicts = await repo.find_conflicts(event)
     logger.info(
         "created event %s type=%s user=%s conflicts=%d",
@@ -290,6 +308,7 @@ async def update_event(
             le=MAX_DURATION_MINUTES,
         ),
     ] = None,
+    dry_run: bool = False,
 ) -> EventWithConflicts:
     """Изменить существующую задачу, напоминание или встречу: перенести время, переименовать,
     поменять длительность.
@@ -303,6 +322,8 @@ async def update_event(
         raise ToolError("Не указано, что менять: нужно хотя бы одно новое значение")
 
     now = datetime.now(get_settings().tz).replace(microsecond=0)
+    if start_at is not None:
+        start_at = ensure_aware(start_at, get_settings().tz)
     if start_at is not None and start_at < now - PAST_TOLERANCE:
         raise ToolError(
             f"Время {start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "
@@ -323,6 +344,19 @@ async def update_event(
     except ValueError as error:
         raise ToolError(str(error)) from error
 
+    if dry_run:
+        changes = {
+            key: value
+            for key, value in {
+                "name": name,
+                "description": description,
+                "start_at": start_at,
+                "duration_minutes": duration_minutes,
+            }.items()
+            if value is not None
+        }
+        event = current.model_copy(update=changes)
+        return EventWithConflicts(**_fields(event), conflicts=await repo.find_conflicts(event))
     event = await repo.update(
         user_id,
         uuid,
@@ -339,12 +373,18 @@ async def update_event(
 
 
 @mcp.tool
-async def complete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Event:
+async def complete_event(
+    user_id: UserId, event_id: EventId, ctx: Context, dry_run: bool = False
+) -> Event:
     """Отметить задачу, напоминание или встречу выполненной.
 
     Для «готово», «сделал», «встреча прошла».
     """
-    event = await _repo(ctx).set_status(user_id, _parse_event_id(event_id), EventStatus.DONE)
+    event = (
+        await _repo(ctx).get(user_id, _parse_event_id(event_id))
+        if dry_run
+        else await _repo(ctx).set_status(user_id, _parse_event_id(event_id), EventStatus.DONE)
+    )
     if event is None:
         raise ToolError("Событие не найдено")
     logger.info("completed event %s user=%s", event.id, user_id)
@@ -352,12 +392,18 @@ async def complete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Ev
 
 
 @mcp.tool
-async def delete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Event:
+async def delete_event(
+    user_id: UserId, event_id: EventId, ctx: Context, dry_run: bool = False
+) -> Event:
     """Удалить задачу, напоминание или встречу: пропадёт из списков и поиска.
 
     Для «удали», «отмени встречу», «эта задача больше не нужна».
     """
-    event = await _repo(ctx).set_status(user_id, _parse_event_id(event_id), EventStatus.CANCELLED)
+    event = (
+        await _repo(ctx).get(user_id, _parse_event_id(event_id))
+        if dry_run
+        else await _repo(ctx).set_status(user_id, _parse_event_id(event_id), EventStatus.CANCELLED)
+    )
     if event is None:
         raise ToolError("Событие не найдено")
     logger.info("deleted event %s user=%s", event.id, user_id)
@@ -381,6 +427,7 @@ async def delete_events(
         bool,
         Field(description="true только после того, как пользователь ответил «да» на вопрос."),
     ] = False,
+    dry_run: bool = False,
 ) -> list[Event]:
     """Удалить сразу ВСЕ записи пользователя заданных типов.
 
@@ -390,7 +437,7 @@ async def delete_events(
     """
     types = [EventType(t) for t in event_types] if event_types else None
     repo = _repo(ctx)
-    if not confirmed:
+    if not confirmed or dry_run:
         count = await repo.cancel_all(user_id, types, dry_run=True)
         if count == 0:
             raise ToolError("Записей такого типа нет — удалять нечего. Так и скажи пользователю.")

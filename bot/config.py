@@ -9,7 +9,7 @@ class Settings:
     max_token: str
     max_api_base: str = "https://platform-api2.max.ru"
     redis_url: str = "redis://localhost:6379/0"
-    agent_url: str = "http://localhost:8001"
+    agent_url: str = "http://localhost:8002"
     asr_provider: str = "whisper"  # whisper | http | disabled
     whisper_model: str = "base"
     asr_http_url: str = ""
@@ -29,7 +29,7 @@ class Settings:
             max_token=getenv("MAX_TOKEN", ""),
             max_api_base=getenv("MAX_API_BASE", "https://platform-api2.max.ru").rstrip("/"),
             redis_url=getenv("REDIS_URL", "redis://localhost:6379/0"),
-            agent_url=getenv("AGENT_URL", "http://localhost:8001").rstrip("/"),
+            agent_url=getenv("AGENT_URL", "http://localhost:8002").rstrip("/"),
             asr_provider=getenv("ASR_PROVIDER", "whisper").lower(),
             whisper_model=getenv("WHISPER_MODEL", "base"),
             asr_http_url=getenv("ASR_HTTP_URL", ""),

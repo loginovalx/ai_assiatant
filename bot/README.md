@@ -39,6 +39,20 @@ docker compose up --build bot   # или без аргумента — подн�
 docker compose exec bot python -m bot.subscribe add https://ваш-домен/webhook
 ```
 
+### Запуск long-polling без Docker и туннеля (проще всего локально)
+
+Вебхуку нужен публичный HTTPS-адрес; long-polling обходится без него — бот сам забирает
+обновления из MAX API (`GET /updates`), код обработки тот же (`bot/handler.py`):
+
+```bash
+set -a; source .env; set +a   # в .env достаточно MAX_TOKEN, REDIS_URL, AGENT_URL
+python -m bot.polling
+```
+
+Курсор `marker` хранится в Redis (`bot:updates:marker`): после рестарта старые обновления
+не приходят повторно, а накопившиеся за простой — приходят. Тем же процессом поднимается
+планировщик напоминаний (`bot/reminders.py`).
+
 **Первое голосовое** с `ASR_PROVIDER=whisper` (по умолчанию) скачает модель Whisper — нужен
 интернет и немного времени на первый запрос. Нет доступа — поставьте `ASR_PROVIDER=http` со
 своим ASR или `ASR_PROVIDER=disabled` (тогда голос обрабатывается только если его текст уже

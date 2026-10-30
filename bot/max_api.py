@@ -41,11 +41,11 @@ class MaxAPI:
         await self.client.aclose()
         await self.media_client.aclose()
 
-    async def updates(self, marker: int | None, timeout: int = 20) -> dict:
+    async def updates(self, marker: int | None, timeout: int = 20) -> dict:  # noqa: ASYNC109
         params: dict[str, str | int] = {
             "timeout": timeout,
             "limit": 100,
-            "types": "message_created,bot_started",
+            "types": "message_created,bot_started,message_callback",
         }
         if marker is not None:
             params["marker"] = marker
@@ -64,7 +64,7 @@ class MaxAPI:
         except (httpx.HTTPError, ValueError) as exc:
             raise MaxAPIError("Не удалось получить подробности сообщения") from exc
 
-    async def send(self, chat_id: int, text: str, *, to_user: bool = False) -> None:
+    async def send(self, chat_id: int, text: str, *, to_user: bool = False, buttons=None) -> None:
         """Send in dialog/chat respecting the per-recipient rate limit.
 
         When MAX provides no chat_id for a dialog, use the sender's user_id.
@@ -78,7 +78,20 @@ class MaxAPI:
                 await asyncio.sleep(pause)
             for attempt in range(3):
                 response = await self.client.post(
-                    "/messages", params={target[0]: target[1]}, json={"text": text[:4000]}
+                    "/messages",
+                    params={target[0]: target[1]},
+                    json={
+                        "text": text[:4000],
+                        **(
+                            {
+                                "attachments": [
+                                    {"type": "inline_keyboard", "payload": {"buttons": buttons}}
+                                ]
+                            }
+                            if buttons
+                            else {}
+                        ),
+                    },
                 )
                 if response.status_code == 429 and attempt < 2:
                     await asyncio.sleep(1.0)
@@ -86,6 +99,14 @@ class MaxAPI:
                 response.raise_for_status()
                 self._last_sent[target] = time.monotonic()
                 return
+
+    async def answer_callback(self, callback_id: str, text: str | None = None) -> None:
+        response = await self.client.post(
+            "/answers",
+            params={"callback_id": callback_id},
+            json={"notification": text} if text else {},
+        )
+        response.raise_for_status()
 
     async def get_audio(self, url: str) -> bytes:
         return await self.get_file(url, self.max_voice_bytes, "голосовое сообщение")

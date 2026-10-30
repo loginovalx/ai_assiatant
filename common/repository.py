@@ -279,6 +279,24 @@ class EventRepository:
         )
         return [self._to_event(r) for r in rows]
 
+    async def postpone(self, user_id: str, event_id: UUID, start_at: datetime) -> Event | None:
+        """Отложить событие по кнопке из уведомления: новое время и возврат в очередь отправки.
+
+        Отметка notified_at сбрасывается тем же запросом, иначе напоминание не придёт повторно.
+        user_id в условии: чужую запись по кнопке под уведомлением изменить нельзя.
+        """
+        row = await self._pool.fetchrow(
+            f"""
+            UPDATE events SET start_at = $3, notified_at = NULL
+            WHERE id = $1 AND user_id = $2 AND status = 'active'
+            RETURNING {_COLUMNS}
+            """,
+            event_id,
+            user_id,
+            start_at,
+        )
+        return None if row is None else self._to_event(row)
+
     async def unmark_notified(self, event_id: UUID) -> None:
         """Вернуть событие в очередь: отправка в MAX не удалась, попробуем в следующий тик."""
         await self._pool.execute("UPDATE events SET notified_at = NULL WHERE id = $1", event_id)

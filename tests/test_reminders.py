@@ -20,7 +20,9 @@ class FakeMax:
         self.sent: list[tuple[int, str]] = []
         self.fail = fail
 
-    async def send(self, chat_id: int, text: str, *, to_user: bool = False) -> None:
+    async def send(
+        self, chat_id: int, text: str, *, to_user: bool = False, buttons: list | None = None
+    ) -> None:
         if self.fail:
             raise OSError("MAX недоступен")
         self.sent.append((chat_id, text))

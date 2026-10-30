@@ -8,7 +8,6 @@ import uuid
 
 from redis.asyncio import Redis
 
-
 _TRANSITION = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])

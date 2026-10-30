@@ -3,7 +3,9 @@
 Запуск: uv run python scripts/chat.py [user_id]
 Команды: :reset — сбросить историю, :q — выйти.
 """
+
 import sys
+
 import httpx
 
 BASE_URL = "http://localhost:8002"
@@ -31,7 +33,9 @@ def main() -> None:
         data = resp.json()
         print(f"Агент [{data['status']}]: {data['reply_text']}")
         for e in data.get("events", []):
-            print(f"  · {e['type']} «{e['name']}» — {e.get('start_at') or 'без даты'} [{e['status']}]")
+            print(
+                f"  · {e['type']} «{e['name']}» — {e.get('start_at') or 'без даты'} [{e['status']}]"
+            )
         print()
 
 

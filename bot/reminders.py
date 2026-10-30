@@ -8,6 +8,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from bot.max_api import MaxAPI, MaxAPIError
@@ -15,6 +16,16 @@ from common.repository import EventRepository
 from common.schemas import Event, EventType
 
 logger = logging.getLogger(__name__)
+
+
+def event_buttons(event_id: UUID) -> list[list[dict[str, str]]]:
+    """Кнопки под уведомлением: закрыть напоминание или отложить на час."""
+    return [
+        [
+            {"type": "callback", "text": "Готово", "payload": f"event:done:{event_id}"},
+            {"type": "callback", "text": "На час позже", "payload": f"event:snooze:{event_id}"},
+        ]
+    ]
 
 
 def format_notification(event: Event) -> str:
@@ -72,7 +83,10 @@ class ReminderSender:
             try:
                 # chat_id у личного диалога с ботом совпадает с user_id отправителя.
                 await self._max_api.send(
-                    int(event.user_id), format_notification(event), to_user=True
+                    int(event.user_id),
+                    format_notification(event),
+                    to_user=True,
+                    buttons=event_buttons(event.id),
                 )
                 sent += 1
             except (MaxAPIError, ValueError, OSError) as exc:

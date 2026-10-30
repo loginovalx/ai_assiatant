@@ -49,7 +49,7 @@ async def main(path: str, user_id: str) -> None:
         chunk = rows[i : i + BATCH_SIZE]
         vectors = await embedder.embed([r["text"] for r in chunk]) or [None] * len(chunk)
 
-        for row, vec in zip(chunk, vectors):
+        for row, vec in zip(chunk, vectors, strict=False):
             start_at = datetime.fromisoformat(f"{row['date']}T{row['time']}").replace(tzinfo=tz)
             await pool.execute(
                 """
@@ -72,5 +72,9 @@ async def main(path: str, user_id: str) -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(sys.argv[1] if len(sys.argv) > 1 else "dataset_e.tsv",
-                      sys.argv[2] if len(sys.argv) > 2 else "demo"))
+    asyncio.run(
+        main(
+            sys.argv[1] if len(sys.argv) > 1 else "dataset_e.tsv",
+            sys.argv[2] if len(sys.argv) > 2 else "demo",
+        )
+    )

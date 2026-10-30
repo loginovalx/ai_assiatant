@@ -16,7 +16,7 @@ from agent.core import Agent
 from agent.memory import ConversationMemory
 from agent.tools import McpToolbox
 from common.config import get_settings
-from common.schemas import AgentRequest, AgentResetRequest, AgentResponse
+from common.schemas import AgentConfirmRequest, AgentRequest, AgentResetRequest, AgentResponse
 
 logging.basicConfig(level=logging.INFO)
 
@@ -65,9 +65,14 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/agent/message", response_model=AgentResponse)
+@app.post("/v1/agent/message", response_model=AgentResponse, response_model_exclude_none=True)
 async def message(body: AgentRequest, agent: AgentDep) -> AgentResponse:
-    return await agent.handle(body.user_id, body.text)
+    return await agent.handle(body.user_id, body.text, confirm_changes=body.confirm_changes)
+
+
+@app.post("/v1/agent/confirm", response_model=AgentResponse)
+async def confirm(body: AgentConfirmRequest, agent: AgentDep) -> AgentResponse:
+    return await agent.execute_draft(body.user_id, body.draft)
 
 
 @app.post("/v1/agent/reset", status_code=204)

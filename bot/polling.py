@@ -13,6 +13,7 @@ import logging
 
 import httpx
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from bot.agent_client import AgentClient
 from bot.asr import make_asr
@@ -88,9 +89,10 @@ class PollingBot:
                     raise RuntimeError("MAX отклонил MAX_TOKEN — проверьте токен бота") from exc
                 logger.warning("MAX updates error: %s", exc)
                 await asyncio.sleep(_POLL_BACKOFF_SECONDS)
-            except (httpx.HTTPError, ValueError, MaxAPIError) as exc:
-                # Сеть дрогнула — не падаем, пробуем снова; обработчики продолжаются сами.
-                logger.warning("MAX updates недоступны: %s", exc)
+            except (httpx.HTTPError, ValueError, MaxAPIError, RedisError, OSError) as exc:
+                # Сеть дрогнула (в том числе Redis): не падаем, пробуем снова;
+                # маркер остаётся в памяти, обработчики продолжаются сами.
+                logger.warning("MAX polling error: %s", exc)
                 await asyncio.sleep(_POLL_BACKOFF_SECONDS)
 
 

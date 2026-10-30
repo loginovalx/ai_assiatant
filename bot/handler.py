@@ -418,7 +418,9 @@ class BotHandler:
                 if not text.strip():
                     raise SpeechRecognitionError("Не получилось распознать речь")
                 await self.state.transition(user_id, request_id)
-                await reply(f"📝 Распознал: {text}\n⏳ Думаю…")
+                # Распознанный текст пользователю не показываем: он бывает кривым,
+                # а ответ агент всё равно даёт верный (фидбек QA от роли E).
+                await reply("⏳ Записал в блокнот, думаю…")
             else:
                 await reply("⏳ Думаю над запросом…")
 

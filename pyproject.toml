@@ -17,15 +17,14 @@ dependencies = [
 [dependency-groups]
 mcp = ["fastmcp>=4.1"]
 api = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
+
 bot = [
     "httpx>=0.27",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "redis>=5.0",
-    # ASR_PROVIDER=whisper (по умолчанию в bot/config.py) — локальное распознавание,
-    # тянет PyAV для декодирования голосовых. ASR_PROVIDER=http/disabled этого не требует,
-    # но ставим всегда: один образ на все варианты проще, чем выбор зависимостей на сборке.
     "faster-whisper>=1.0",
+    "av<19",
 ]
 agent = ["fastmcp>=4.1", "fastapi>=0.115", "uvicorn[standard]>=0.30", "openai>=1.50", "redis>=5.0"]
 dev = [

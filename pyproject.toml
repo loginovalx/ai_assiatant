@@ -10,6 +10,7 @@ dependencies = [
     "asyncpg>=0.29",
     "pgvector>=0.3",
     "gigachat>=0.1.40",
+    "tzdata>=2024.1 ; sys_platform == 'win32'",
 ]
 
 # Каждый сервис ставит только свою группу: `uv sync --group mcp`.

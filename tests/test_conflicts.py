@@ -252,7 +252,7 @@ async def test_update_duration_on_reminder_is_rejected(client, tz):
     assert result.is_error and "нет длительности" in result.content[0].text
 
 
-async def test_duration_is_optional_in_tool_schema():
+async def test_duration_is_optional_in_tool_schema(pool):
     async with Client(mcp) as c:
         tools = {t.name: t.input_schema for t in await c.list_tools()}
     for name in ("create_event", "update_event"):

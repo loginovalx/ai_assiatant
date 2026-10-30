@@ -109,7 +109,7 @@ def tomorrow_at(tz, hour: int) -> datetime:
 # --- схема тулов --------------------------------------------------------------
 
 
-async def test_tools_hide_user_id_and_have_no_anyof():
+async def test_tools_hide_user_id_and_have_no_anyof(pool):
     tools = await McpToolbox(mcp).openai_tools()
     names = [t["function"]["name"] for t in tools]
     assert names == [
@@ -270,7 +270,7 @@ async def test_tool_error_goes_back_to_llm(make_agent):
 
     error = json.loads(llm.requests[1]["messages"][-1]["content"])
     assert "нужно указать дату и время" in error["error"]
-    assert response.status == AgentStatus.DONE
+    assert response.status == AgentStatus.NEED_CLARIFICATION
     assert response.events == []
 
 

@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Мои задачи</title>
+
+<!-- MAX Bridge: нужен, чтобы получить настоящий user_id внутри MAX.
+     ВАЖНО: адрес скрипта и названия полей сверить с документацией dev.max.ru.
+     Если скрипт не загрузится (например, в обычном браузере) - ничего страшного, страница работает с ?user_id=... -->
+<script src="https://st.max.ru/js/max-web-app.js"></script>
+
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --card: #ffffff;
+    --text: #1b1d21;
+    --muted: #6b7280;
+    --accent: #3b6cf6;
+    --accent-text: #ffffff;
+    --border: #e3e5ea;
+    --task: #3b6cf6;
+    --meeting: #e0791f;
+    --reminder: #8a4fd6;
+    --error: #d93a3a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --card: #1e2127;
+      --text: #eceef2;
+      --muted: #9aa1ad;
+      --border: #2d313a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 16px;
+    line-height: 1.4;
+  }
+  .app { max-width: 640px; margin: 0 auto; padding: 16px; padding-bottom: 40px; }
+  h1 { font-size: 22px; margin: 4px 0 12px; }
+
+  .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .tab {
+    flex: 1; padding: 10px 8px; border: 1px solid var(--border); border-radius: 12px;
+    background: var(--card); color: var(--text); font-size: 15px; cursor: pointer;
+  }
+  .tab.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip {
+    padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--card); color: var(--text); font-size: 14px; cursor: pointer;
+  }
+  .chip.active { background: var(--text); color: var(--bg); border-color: var(--text); }
+
+  .search { display: flex; gap: 8px; margin-bottom: 16px; }
+  .search input {
+    flex: 1; min-width: 0; padding: 10px 12px; font-size: 16px;
+    border: 1px solid var(--border); border-radius: 12px; background: var(--card); color: var(--text);
+  }
+  .btn {
+    padding: 10px 14px; border: none; border-radius: 12px; background: var(--accent);
+    color: var(--accent-text); font-size: 15px; cursor: pointer;
+  }
+  .btn.secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+
+  .note { color: var(--muted); font-size: 14px; margin: 0 0 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .note button { background: none; border: none; color: var(--accent); font-size: 14px; cursor: pointer; padding: 0; }
+
+  .day { margin: 18px 0 8px; font-size: 14px; color: var(--muted); text-transform: capitalize; font-weight: 600; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .card-top { display: flex; justify-content: space-between; gap: 8px; align-items: flex-start; }
+  .title { font-weight: 600; font-size: 16px; word-break: break-word; }
+  .badge {
+    flex-shrink: 0; font-size: 12px; padding: 2px 8px; border-radius: 999px; color: #fff; background: var(--muted);
+  }
+  .badge.task { background: var(--task); }
+  .badge.meeting { background: var(--meeting); }
+  .badge.reminder { background: var(--reminder); }
+  .meta { color: var(--muted); font-size: 14px; margin-top: 4px; }
+  .desc { font-size: 14px; margin-top: 6px; color: var(--text); opacity: 0.85; word-break: break-word; }
+  .card .btn { margin-top: 10px; padding: 8px 12px; font-size: 14px; }
+
+  .state { text-align: center; color: var(--muted); padding: 40px 12px; }
+  .state.error { color: var(--error); }
+  .state .btn { margin-top: 12px; }
+  .hidden { display: none !important; }
+
+  .userbox { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 14px; margin-bottom: 16px; }
+  .userbox p { margin: 0 0 8px; font-size: 14px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Мои задачи и встречи</h1>
+
+  <!-- Если user_id неоткуда взять - показываем поле, чтобы ввести его руками (для разработки) -->
+  <form id="userForm" class="userbox hidden">
+    <p>Не удалось определить пользователя. Введите user_id (для разработки):</p>
+    <div class="search" style="margin:0">
+      <input id="userInput" type="text" placeholder="например, 123456">
+      <button class="btn" type="submit">ОК</button>
+    </div>
+  </form>
+
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-period="today">Сегодня</button>
+    <button class="tab" data-period="tomorrow">Завтра</button>
+    <button class="tab" data-period="week">Неделя</button>
+  </div>
+
+  <div class="chips" id="chips">
+    <button class="chip" data-type="task">Задачи</button>
+    <button class="chip" data-type="meeting">Встречи</button>
+    <button class="chip" data-type="reminder">Напоминания</button>
+  </div>
+
+  <form class="search" id="searchForm">
+    <input id="searchInput" type="search" placeholder="Поиск по смыслу, например: «врач»">
+    <button class="btn" type="submit">Найти</button>
+  </form>
+
+  <p class="note hidden" id="searchNote">
+    <span id="searchNoteText"></span>
+    <button type="button" id="searchClear">Сбросить поиск</button>
+  </p>
+
+  <div id="list"></div>
+</div>
+
+<script>
+const DEFAULT_API = 'http://localhost:8000';
+
+const params = new URLSearchParams(location.search);
+const API_BASE = (params.get('api') || DEFAULT_API).replace(/\/$/, '');
+
+const TYPE_LABELS = { task: 'Задача', meeting: 'Встреча', reminder: 'Напоминание' };
+
+const state = {
+  period: 'today',          // today | tomorrow | week
+  types: new Set(),         // пусто = показывать все типы
+  query: '',                // непустой = режим поиска
+  userId: '',
+};
+
+/* ---------- user_id ---------- */
+function detectUserId() {
+  const fromUrl = params.get('user_id');
+  if (fromUrl) return fromUrl;
+
+  try {
+    const wa = window.WebApp;
+    const id = wa && wa.initDataUnsafe && wa.initDataUnsafe.user && wa.initDataUnsafe.user.id;
+    if (id) return String(id);
+  } catch (e) { /* ничего */ }
+
+  try { return localStorage.getItem('user_id') || ''; } catch (e) { return ''; }
+}
+
+/* ---------- работа с датами ---------- */
+const pad = (n) => String(n).padStart(2, '0');
+
+function toLocalISO(d) {
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const a = Math.abs(off);
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+    'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) +
+    sign + pad(Math.floor(a / 60)) + ':' + pad(a % 60);
+}
+function toDateOnly(d) {
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+function periodRange(period) {
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const from = new Date(start);
+  const to = new Date(start);
+  if (period === 'today') { to.setDate(to.getDate() + 1); }
+  if (period === 'tomorrow') { from.setDate(from.getDate() + 1); to.setDate(to.getDate() + 2); }
+  if (period === 'week') { to.setDate(to.getDate() + 7); }
+  return { from, to };
+}
+
+/* ---------- запросы к бэкенду ---------- */
+async function api(path, query) {
+  const url = new URL(API_BASE + path);
+  Object.entries(query || {}).forEach(([k, v]) => {
+    if (v === undefined || v === null || v === '') return;
+    if (Array.isArray(v)) v.forEach((x) => url.searchParams.append(k, x));
+    else url.searchParams.set(k, v);
+  });
+  let res;
+  try {
+    res = await fetch(url.toString());
+  } catch (e) {
+    const err = new Error('Нет связи с сервером');
+    err.network = true;
+    throw err;
+  }
+  if (!res.ok) {
+    const err = new Error('Ошибка сервера: ' + res.status);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+async function fetchPeriod() {
+  const { from, to } = periodRange(state.period);
+  const base = {
+    user_id: state.userId,
+    include_undated: state.period === 'week' ? 'true' : 'false',
+  };
+  try {
+    return await api('/v1/events', { ...base, from: toLocalISO(from), to: toLocalISO(to) });
+  } catch (e) {
+    if (e.status === 422) {
+      return await api('/v1/events', { ...base, from: toDateOnly(from), to: toDateOnly(to) });
+    }
+    throw e;
+  }
+}
+
+function fetchSearch() {
+  return api('/v1/events/search', { user_id: state.userId, q: state.query });
+}
+
+/* ---------- разбор ответа ---------- */
+function pick(obj, keys) {
+  for (const k of keys) {
+    if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
+  }
+  return null;
+}
+
+function extractList(data) {
+  if (Array.isArray(data)) return data;
+  if (data && typeof data === 'object') {
+    for (const k of ['items', 'events', 'results', 'data']) {
+      if (Array.isArray(data[k])) return data[k];
+    }
+  }
+  return [];
+}
+
+function normalize(raw) {
+  const o = (raw && typeof raw.event === 'object' && raw.event) ? raw.event : raw; // в поиске бывает {event:{...}, score}
+  const whenRaw = pick(o, ['start_at', 'starts_at', 'start', 'start_time', 'datetime', 'due_at', 'due', 'remind_at', 'scheduled_at', 'date', 'time']);
+  let when = null;
+  let dateOnly = false;
+  if (whenRaw) {
+    const d = new Date(whenRaw);
+    if (!isNaN(d.getTime())) {
+      when = d;
+      dateOnly = typeof whenRaw === 'string' && whenRaw.length <= 10;
+    }
+  }
+  const endRaw = pick(o, ['end_at', 'ends_at', 'end', 'end_time']);
+  let end = null;
+  if (endRaw) {
+    const d = new Date(endRaw);
+    if (!isNaN(d.getTime())) end = d;
+  }
+  return {
+    id: pick(o, ['id', 'event_id', 'uuid']),
+    title: pick(o, ['title', 'name', 'summary', 'text']) || 'Без названия',
+    type: String(pick(o, ['type', 'kind', 'event_type']) || '').toLowerCase(),
+    description: pick(o, ['description', 'details', 'notes', 'note']),
+    place: pick(o, ['location', 'place']),
+    when, dateOnly, end,
+  };
+}
+
+/* ---------- отрисовка ---------- */
+const listEl = document.getElementById('list');
+
+function el(tag, className, text) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function showState(text, kind, withRetry) {
+  listEl.innerHTML = '';
+  const box = el('div', 'state' + (kind ? ' ' + kind : ''), text);
+  if (withRetry) {
+    const b = el('button', 'btn', 'Повторить');
+    b.addEventListener('click', load);
+    box.appendChild(document.createElement('br'));
+    box.appendChild(b);
+  }
+  listEl.appendChild(box);
+}
+
+function fmtTime(d) { return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+function fmtDay(d) {
+  return d.toLocaleDateString('ru-RU', { weekday: 'long', day: 'numeric', month: 'long' });
+}
+
+function renderCard(ev) {
+  const card = el('div', 'card');
+  const top = el('div', 'card-top');
+  top.appendChild(el('div', 'title', ev.title));
+  if (ev.type) {
+    top.appendChild(el('span', 'badge ' + ev.type, TYPE_LABELS[ev.type] || ev.type));
+  }
+  card.appendChild(top);
+
+  let metaText;
+  if (!ev.when) metaText = 'Без даты';
+  else if (ev.dateOnly) metaText = fmtDay(ev.when);
+  else metaText = fmtDay(ev.when) + ', ' + fmtTime(ev.when) + (ev.end ? '–' + fmtTime(ev.end) : '');
+  card.appendChild(el('div', 'meta', metaText));
+
+  if (ev.place) card.appendChild(el('div', 'meta', '📍 ' + ev.place));
+  if (ev.description) card.appendChild(el('div', 'desc', ev.description));
+
+  if (ev.id !== null && ev.id !== undefined) {
+    const b = el('button', 'btn secondary', '📅 В календарь');
+    b.addEventListener('click', () => downloadIcs(ev, b));
+    card.appendChild(b);
+  }
+  return card;
+}
+
+function render(events) {
+  if (state.types.size > 0) {
+    events = events.filter((e) => state.types.has(e.type));
+  }
+  if (events.length === 0) {
+    showState(state.query ? 'По запросу ничего не найдено' : 'Здесь пока ничего нет', '', false);
+    return;
+  }
+  // сортировка: по времени, "без даты" в конце (в режиме поиска порядок бэкенда сохраняем)
+  if (!state.query) {
+    events.sort((a, b) => {
+      if (!a.when && !b.when) return 0;
+      if (!a.when) return 1;
+      if (!b.when) return -1;
+      return a.when - b.when;
+    });
+  }
+  listEl.innerHTML = '';
+  let lastKey = null;
+  events.forEach((ev) => {
+    const key = ev.when ? toDateOnly(ev.when) : 'none';
+    if (key !== lastKey) {
+      listEl.appendChild(el('div', 'day', ev.when ? fmtDay(ev.when) : 'Без даты'));
+      lastKey = key;
+    }
+    listEl.appendChild(renderCard(ev));
+  });
+}
+
+/* ---------- загрузка ---------- */
+let loadCounter = 0;
+async function load() {
+  if (!state.userId) {
+    document.getElementById('userForm').classList.remove('hidden');
+    showState('Укажите user_id, чтобы увидеть задачи', '', false);
+    return;
+  }
+  const myId = ++loadCounter; // чтобы старый медленный ответ не перетёр новый
+  showState('Загрузка…', '', false);
+  try {
+    const data = state.query ? await fetchSearch() : await fetchPeriod();
+    if (myId !== loadCounter) return;
+    render(extractList(data).map(normalize));
+  } catch (e) {
+    if (myId !== loadCounter) return;
+    const msg = e.network
+      ? 'Сервер недоступен. Проверьте соединение и попробуйте ещё раз.'
+      : 'Не получилось загрузить данные. ' + e.message;
+    showState(msg, 'error', true);
+  }
+}
+
+/* ---------- календарь (.ics) ---------- */
+async function downloadIcs(ev, btn) {
+  const url = API_BASE + '/v1/events/' + encodeURIComponent(ev.id) + '/ics?user_id=' + encodeURIComponent(state.userId);
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Готовлю файл…';
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('bad status');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'event-' + ev.id + '.ics';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  } catch (e) {
+    // запасной вариант: просто открыть ссылку (в вебвью так иногда надёжнее)
+    window.open(url, '_blank');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+/* ---------- обработчики ---------- */
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab');
+  if (!btn) return;
+  state.period = btn.dataset.period;
+  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t === btn));
+  // переключение периода выходит из режима поиска
+  clearSearch(false);
+  load();
+});
+
+document.getElementById('chips').addEventListener('click', (e) => {
+  const btn = e.target.closest('.chip');
+  if (!btn) return;
+  const t = btn.dataset.type;
+  if (state.types.has(t)) state.types.delete(t); else state.types.add(t);
+  btn.classList.toggle('active', state.types.has(t));
+  load();
+});
+
+const searchInput = document.getElementById('searchInput');
+const searchNote = document.getElementById('searchNote');
+
+function clearSearch(reload) {
+  state.query = '';
+  searchInput.value = '';
+  searchNote.classList.add('hidden');
+  if (reload) load();
+}
+
+document.getElementById('searchForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const q = searchInput.value.trim();
+  if (!q) { clearSearch(true); return; }
+  state.query = q;
+  document.getElementById('searchNoteText').textContent = 'Результаты поиска: «' + q + '»';
+  searchNote.classList.remove('hidden');
+  load();
+});
+document.getElementById('searchClear').addEventListener('click', () => clearSearch(true));
+
+document.getElementById('userForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const v = document.getElementById('userInput').value.trim();
+  if (!v) return;
+  state.userId = v;
+  try { localStorage.setItem('user_id', v); } catch (err) { /* ничего */ }
+  document.getElementById('userForm').classList.add('hidden');
+  load();
+});
+
+/* ---------- старт ---------- */
+try { if (window.WebApp && typeof window.WebApp.ready === 'function') window.WebApp.ready(); } catch (e) { /* ничего */ }
+state.userId = detectUserId();
+load();
+</script>
+</body>
+</html>

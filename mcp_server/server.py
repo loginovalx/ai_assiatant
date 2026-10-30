@@ -127,6 +127,15 @@ async def create_event(
         ),
     ] = None,
     duration_minutes: Duration = None,
+    user_text: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Дословная реплика пользователя, из которой ты делаешь вывод. "
+                "По ней тул отличает названное пользователем время от выдуманного."
+            )
+        ),
+    ] = None,
     dry_run: bool = False,
 ) -> EventWithConflicts:
     """Создать задачу, напоминание или встречу.
@@ -150,10 +159,14 @@ async def create_event(
         raise ToolError(_validation_message(error)) from error
 
     now = datetime.now(get_settings().tz).replace(microsecond=0)
+    # Время проверяем по дословной реплике пользователя (user_text), а не по description:
+    # модель кладёт в description только суть, а время — в start_at. Без user_text
+    # (HTTP API, старые вызовы) проверяем description как раньше.
+    source_text = user_text if user_text else description
     if (
         data.type in {EventType.MEETING, EventType.REMINDER}
-        and description
-        and not mentions_time(description)
+        and source_text
+        and not mentions_time(source_text)
     ):
         raise ToolError("В исходном запросе нет времени, только день. Спроси точное время.")
     if data.start_at is not None and data.start_at < now - PAST_TOLERANCE:
@@ -248,21 +261,37 @@ async def search_events(
     ],
     ctx: Context,
     start_time: Annotated[
-        datetime | None, Field(description="Искать начиная с этого момента. Обычно null")
+        datetime | None,
+        Field(
+            description=(
+                "Начало периода, если пользователь его назвал: «за 2026 год» — "
+                "1 января 2026. null = искать за всё время."
+            )
+        ),
     ] = None,
     end_time: Annotated[
-        datetime | None, Field(description="Искать до этого момента. Обычно null")
+        datetime | None,
+        Field(
+            description=(
+                "Конец периода, если пользователь его назвал («по 30 октября» — "
+                "30 октября 23:59). null = без верхней границы."
+            )
+        ),
     ] = None,
-    limit: Annotated[int, Field(ge=1, le=20)] = 5,
+    limit: Annotated[int | None, Field(ge=1, le=50)] = None,
 ) -> list[SearchHit]:
     """Найти ранее созданные события по смыслу, даже если слова не совпадают точно.
 
     Для «найди задачу про презентацию», «когда у меня была встреча с Иваном».
     Результаты отсортированы по релевантности; если список пуст — ничего не найдено.
+    limit=None значит «сам реши»: запрос за период обычно хочет полный список,
+    обычный поиск — короткую выдачу. Вернулось ровно limit — сообщи «как минимум столько».
     """
     settings = get_settings()
     start = ensure_aware(start_time, settings.tz) if start_time else None
     end = ensure_aware(end_time, settings.tz) if end_time else None
+    if limit is None:
+        limit = 50 if (start is not None or end is not None) else 10
     return await _repo(ctx).search(user_id, query.strip(), start, end, limit)
 
 

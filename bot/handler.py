@@ -118,6 +118,23 @@ def _audio_present(message: dict[str, Any]) -> bool:
     return any(_is_audio_attachment(a) for a in _attachments(message))
 
 
+def _untyped_file_present(message: dict[str, Any]) -> bool:
+    """Вложение-файл без имени и mime: в апдейте оно выглядит и как CSV, и как аудио.
+
+    Такие файлы нельзя различить по самому апдейту — подробности берём у /messages.
+    """
+    return any(
+        _is_audio_attachment(a)
+        and not _attachment_filename(a)
+        and not str(
+            (a.get("payload") or {}).get("mime_type")
+            or (a.get("payload") or {}).get("content_type")
+            or ""
+        )
+        for a in _attachments(message)
+    )
+
+
 def _brief_attachment_diagnostics(message: dict[str, Any]) -> list[dict[str, Any]]:
     """No raw URL, token, transcription, or personal filename in logs."""
     return [
@@ -299,6 +316,9 @@ class BotHandler:
         chat_id = recipient.get("chat_id")
         # Private assistant: don't disclose task information in a group or channel.
         if recipient.get("chat_type") not in (None, "dialog"):
+            logger.info(
+                "MAX message skipped: not a dialog (chat_type=%s)", recipient.get("chat_type")
+            )
             return
         if user_id is None:
             return
@@ -335,12 +355,20 @@ class BotHandler:
         )
         url, transcription = extract_audio(message)
         is_voice = _audio_present(message)
+        fetched: dict[str, Any] | None = None
 
         # The MAX event may omit payload.url/filename (or all attachments).
         # The message endpoint can return richer details for this same mid.
-        if not text and (not is_voice or not (url or transcription)) and mid:
+        # Файл без имени может оказаться CSV-календарём, поэтому подробности нужны
+        # до того, как решаем: это голос или файл.
+        if (
+            not text
+            and mid
+            and (not is_voice or not (url or transcription) or _untyped_file_present(message))
+        ):
             try:
                 full_message = await self.max_api.get_message(str(mid))
+                fetched = full_message
                 logger.info(
                     "MAX fetched message: attachments=%s",
                     _brief_attachment_diagnostics(full_message),
@@ -352,6 +380,13 @@ class BotHandler:
                     transcription = fetched_transcription or transcription
             except MaxAPIError as exc:
                 logger.warning("MAX message details unavailable: %s", exc)
+
+        # CSV без имени в апдейте: узнаём о нём только из подробностей сообщения.
+        if fetched is not None:
+            csv_url = extract_csv(fetched)
+            if csv_url:
+                await self._import_csv(user_id, csv_url, reply)
+                return
 
         if is_voice and not (url or transcription):
             logger.warning(

@@ -57,7 +57,13 @@ class PollingBot:
     async def poll_once(self, marker: int | None) -> int | None:
         """Один запрос /updates: раздать обновления, сохранить курсор. Новый marker → наружу."""
         data = await self._max_api.updates(marker, timeout=self._timeout)
-        for update in data.get("updates") or []:
+        updates = data.get("updates") or []
+        if updates:
+            logger.info(
+                "MAX updates batch: %s",
+                [u.get("update_type") for u in updates if isinstance(u, dict)],
+            )
+        for update in updates:
             if not isinstance(update, dict) or not isinstance(update.get("update_type"), str):
                 logger.warning("MAX polling: пропуск неизвестного обновления")
                 continue

@@ -138,3 +138,33 @@ async def test_full_clarification_flow_through_agent(make_agent, tz, pool):
 
     third = await agent.handle(USER, "В 10")
     assert third.events[0].start_at == start
+
+
+async def test_user_text_with_time_passes_despite_bare_description(client, tz):
+    """Модель кладёт суть в description, а время — в start_at. Время считаем названным,
+    если оно есть в дословной реплике пользователя (user_text), а не в description."""
+    args = {
+        "user_id": USER,
+        "event_type": "reminder",
+        "name": "Позвонить Ивану",
+        "description": "позвоните Ивану",
+        "start_at": tomorrow(tz, hour=10).isoformat(),
+        "user_text": "Напомни завтра в 10 утра позвонить Ивану",
+    }
+    result = await client.call_tool("create_event", args, raise_on_error=False)
+    assert not result.is_error, result.content[0].text
+
+
+async def test_user_text_without_time_still_refuses_invented_hour(client, tz):
+    """А вот если в реплике пользователя времени не было — выдуманный час отвергается."""
+    args = {
+        "user_id": USER,
+        "event_type": "reminder",
+        "name": "Позвонить Марине",
+        "description": "Напомни позвонить Марине",
+        "start_at": tomorrow(tz, hour=10).isoformat(),
+        "user_text": "Напомни завтра позвонить Марине",
+    }
+    result = await client.call_tool("create_event", args, raise_on_error=False)
+    assert result.is_error
+    assert "нет времени, только день" in result.content[0].text

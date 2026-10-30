@@ -194,3 +194,71 @@ async def test_text_command_is_not_deferred(handler):
 
     assert agent.asked[0]["confirm_changes"] is False  # текст выполняется сразу
     assert max_api.sent[-1]["buttons"] is None
+
+
+_CSV_BYTES = "id,date,time,text\n1,2026-11-05,10:00,Позвонить Ивану\n".encode()
+
+
+class CsvMax(FakeMax):
+    """Апдейт приходит без имени файла; подробности от /messages называют его CSV."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.downloaded: list[str] = []
+
+    async def get_message(self, mid):
+        return {
+            "body": {
+                "mid": mid,
+                "attachments": [
+                    {
+                        "type": "file",
+                        "payload": {"filename": "calendar.csv", "url": "https://mycdn.me/x"},
+                    }
+                ],
+            }
+        }
+
+    async def get_file(self, url, max_bytes, what="файл"):
+        self.downloaded.append(url)
+        return _CSV_BYTES
+
+
+class FakeRepo:
+    def __init__(self) -> None:
+        self.imported: list[tuple[str, int]] = []
+
+    async def import_calendar(self, user_id, rows) -> int:
+        self.imported.append((user_id, len(rows)))
+        return len(rows)
+
+
+async def test_csv_file_without_filename_in_update_is_imported(redis_client):
+    """MAX не всегда передаёт имя файла в апдейте: CSV не должен превращаться в «голос»."""
+    max_api = CsvMax()
+    repo = FakeRepo()
+    bot = BotHandler(
+        max_api,
+        asr=None,
+        agent=FakeAgent(),
+        state=StateStore(redis_client),
+        redis=redis_client,
+        repo=repo,
+    )
+    update = {
+        "update_type": "message_created",
+        "message": {
+            "sender": {"user_id": USER},
+            "recipient": {"chat_type": "dialog", "chat_id": USER},
+            "body": {
+                "mid": "m-csv",
+                "text": "",
+                "attachments": [{"type": "file", "payload": {}}],
+            },
+        },
+    }
+    await bot.handle_update(update)
+
+    assert max_api.downloaded == ["https://mycdn.me/x"]
+    assert repo.imported == [(str(USER), 1)]
+    assert any("Загрузил событий: 1" in s["text"] for s in max_api.sent)

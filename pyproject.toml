@@ -16,14 +16,16 @@ dependencies = [
 # Владельцы bot / agent дописывают сюда свои зависимости.
 [dependency-groups]
 mcp = ["fastmcp>=4.1"]
-api = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
-
+api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "python-multipart>=0.0.9"]
 bot = [
     "httpx>=0.27",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "redis>=5.0",
     "faster-whisper>=1.0",
+    # faster-whisper 1.2.1 зовёт av.open(..., metadata_errors=...) — аргумент убрали
+    # в av==19: "TypeError: open() got an unexpected keyword argument 'metadata_errors'".
+    # Без верхней границы uv берёт av 19.x и распознавание голоса падает на каждом файле.
     "av<19",
 ]
 agent = ["fastmcp>=4.1", "fastapi>=0.115", "uvicorn[standard]>=0.30", "openai>=1.50", "redis>=5.0"]

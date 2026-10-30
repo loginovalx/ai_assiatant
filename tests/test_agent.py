@@ -119,6 +119,7 @@ async def test_tools_hide_user_id_and_have_no_anyof():
         "update_event",
         "complete_event",
         "delete_event",
+        "delete_events",
         "ask_user",
     ]
 
@@ -166,6 +167,21 @@ def test_prompt_has_time_and_calendar(tz):
     assert "2026-11-02: понедельник, 2 ноября" in prompt
 
 
+def test_prompt_forbids_inventing_hour_and_retelling_description(tz):
+    """Три правила против багов, которые ловились на живом GigaChat: выдуманный час,
+    молча потерянная длительность и пересказ description вместо полей записи."""
+    prompt = build_system_prompt(datetime(2026, 10, 29, 19, 45, tzinfo=tz))
+    assert "«завтра», «в пятницу», «15 ноября») — это не время" in prompt
+    assert "Никогда не подставляй час сам" in prompt
+    assert "создавай task со временем и длительностью" in prompt
+    assert "Поле description — это исходная фраза пользователя" in prompt
+    # Живой тест: «напомни о вылете в 20:00» бот поставил ровно на 20:00 — слишком поздно.
+    assert "время самого\n   события, а не напоминания" in prompt
+    assert "за сколько напомнить" in prompt
+    # Живой тест: на «днём» бот ответил «напомню завтра днём» — без часа, и человек не узнал 13:00.
+    assert "Ответ «напомню завтра днём» без часа — ошибка" in prompt
+
+
 # --- сценарии -----------------------------------------------------------------
 
 
@@ -210,32 +226,34 @@ async def test_model_cannot_choose_user_id(make_agent, pool):
 async def test_clarification_then_create(make_agent, tz, redis):
     start = tomorrow_at(tz, 15)
     agent, llm = make_agent(
-        tool_call("ask_user", {"question": "На какое время поставить встречу?"}),
+        tool_call("ask_user", {"question": "Во сколько встреча и сколько она продлится?"}),
         tool_call(
             "create_event",
             {
                 "event_type": "meeting",
                 "name": "Встреча с дизайнером",
                 "start_at": start.isoformat(),
+                "duration_minutes": 90,
             },
         ),
-        text("Поставил встречу с дизайнером на завтра, 15:00."),
+        text("Поставил встречу с дизайнером на завтра, с 15:00 до 16:30."),
     )
 
     first = await agent.handle(USER, "Поставь встречу с дизайнером на завтра")
     assert first.status == AgentStatus.NEED_CLARIFICATION
-    assert first.reply_text == "На какое время поставить встречу?"
+    assert first.reply_text == "Во сколько встреча и сколько она продлится?"
 
-    second = await agent.handle(USER, "В три часа дня")
+    second = await agent.handle(USER, "В три часа дня, на полтора часа")
     assert second.status == AgentStatus.DONE
     assert second.events[0].name == "Встреча с дизайнером"
+    assert second.events[0].end_at == start + timedelta(minutes=90)
 
     # Второй запрос к LLM содержит первый обмен: так модель склеивает уточнение с просьбой.
     sent = [m["content"] for m in llm.requests[1]["messages"] if m["role"] in ("user", "assistant")]
     assert sent[:3] == [
         "Поставь встречу с дизайнером на завтра",
-        "На какое время поставить встречу?",
-        "В три часа дня",
+        "Во сколько встреча и сколько она продлится?",
+        "В три часа дня, на полтора часа",
     ]
 
     history = await ConversationMemory(redis, 10, 60).load(USER)
@@ -254,6 +272,32 @@ async def test_tool_error_goes_back_to_llm(make_agent):
     assert "нужно указать дату и время" in error["error"]
     assert response.status == AgentStatus.DONE
     assert response.events == []
+
+
+async def test_meeting_duration_unknown_falls_back_to_hour(make_agent, tz, pool):
+    """Модель забыла спросить длительность → тул отказал с подсказкой → модель спросила →
+    «не знаю» → встреча на час. Проверяем, что подсказка тула доходит до модели и что
+    до ответа пользователя в базе ничего не появилось."""
+    start = tomorrow_at(tz, 15)
+    meeting = {"event_type": "meeting", "name": "Встреча с Олей", "start_at": start.isoformat()}
+    agent, llm = make_agent(
+        tool_call("create_event", meeting),
+        tool_call("ask_user", {"question": "Сколько продлится встреча?"}, call_id="call_2"),
+        tool_call("create_event", {**meeting, "duration_minutes": 60}),
+        text("Поставил встречу с Олей завтра в 15:00 на час — если нужно, поменяю."),
+    )
+
+    first = await agent.handle(USER, "Встреча с Олей завтра в 15")
+    error = json.loads(llm.requests[1]["messages"][-1]["content"])
+    assert "длительность встречи" in error["error"]
+    assert first.status == AgentStatus.NEED_CLARIFICATION
+    assert first.reply_text == "Сколько продлится встреча?"
+    assert await pool.fetchval("SELECT count(*) FROM events") == 0
+
+    second = await agent.handle(USER, "Не знаю")
+    assert second.status == AgentStatus.DONE
+    assert second.events[0].duration_minutes == 60
+    assert second.events[0].end_at == start + timedelta(hours=1)
 
 
 async def test_list_today(make_agent, tz):
@@ -303,6 +347,54 @@ async def test_update_event_reschedule(make_agent, tz, pool):
     )
 
 
+async def test_delete_all_fits_in_step_limit_with_confirmation(make_agent, pool):
+    """Регрессия живого теста: «удали все задачи» упиралось в лимит шагов («Запутался»)."""
+    for i in range(10):
+        await pool.execute(
+            "INSERT INTO events (user_id, type, name, description) VALUES ($1, 'task', $2, '')",
+            USER,
+            f"Дело {i}",
+        )
+    kinds = {"event_types": ["task", "reminder"]}
+    agent, llm = make_agent(
+        tool_call("delete_events", kinds),
+        tool_call("ask_user", {"question": "Удалить все записи (10 шт.)?"}, call_id="call_2"),
+        tool_call("delete_events", {**kinds, "confirmed": True}),
+        text("Удалил 10 записей."),
+    )
+
+    first = await agent.handle(USER, "Удали все мои задачи и напоминания")
+    assert first.status == AgentStatus.NEED_CLARIFICATION
+    assert (
+        "будет удалено записей — 10"
+        in json.loads(llm.requests[1]["messages"][-1]["content"])["error"]
+    )
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 10
+
+    second = await agent.handle(USER, "Да")
+    assert second.status == AgentStatus.DONE
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 0
+
+
+async def test_reminder_with_duration_becomes_task(make_agent, tz, pool):
+    """Названную длительность нельзя терять: тул отказывает, модель пересоздаёт как дело."""
+    start = tomorrow_at(tz, 10)
+    args = {"name": "Самолёт в Нижний Новгород", "start_at": start.isoformat()}
+    agent, llm = make_agent(
+        tool_call("create_event", {**args, "event_type": "reminder", "duration_minutes": 120}),
+        tool_call("create_event", {**args, "event_type": "task", "duration_minutes": 120}),
+        text("Поставил как дело завтра с 10:00 до 12:00 — у напоминаний длительности не бывает."),
+    )
+    response = await agent.handle(USER, "Напомни, завтра в 10 самолёт, на два часа")
+
+    error = json.loads(llm.requests[1]["messages"][-1]["content"])
+    assert "создавай task" in error["error"]
+    assert response.status == AgentStatus.DONE
+    assert response.events[0].duration_minutes == 120
+    assert response.events[0].end_at == start + timedelta(hours=2)
+    assert await pool.fetchval("SELECT type FROM events") == "task"
+
+
 async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool):
     """Пересечение: запись сохраняется, модель видит conflicts, а пересекающаяся встреча
     попадает в скрытую сводку — «перенеси ту встречу» работает следующим сообщением."""
@@ -313,6 +405,7 @@ async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool)
                 "event_type": "meeting",
                 "name": "Созвон с Иваном",
                 "start_at": tomorrow_at(tz, 15).isoformat(),
+                "duration_minutes": 60,
             },
         ),
         text("Поставил созвон с Иваном завтра в 15:00."),

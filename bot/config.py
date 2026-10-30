@@ -18,6 +18,10 @@ class Settings:
     max_voice_bytes: int = 15_000_000
     polling_timeout: int = 20
     reset_state_on_start: bool = True
+    # Как часто планировщик проверяет базу и насколько далеко в прошлое смотрит.
+    # lookback не даёт после долгого простоя вывалить пользователю всё пропущенное.
+    reminder_interval_seconds: int = 30
+    reminder_lookback_minutes: int = 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,4 +39,6 @@ class Settings:
             polling_timeout=int(getenv("POLLING_TIMEOUT", "20")),
             reset_state_on_start=getenv("RESET_STATE_ON_START", "true").lower()
             in {"true", "1", "yes"},
+            reminder_interval_seconds=int(getenv("REMINDER_INTERVAL_SECONDS", "30")),
+            reminder_lookback_minutes=int(getenv("REMINDER_LOOKBACK_MINUTES", "60")),
         )

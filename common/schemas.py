@@ -49,7 +49,10 @@ def check_duration(
     if duration_minutes is None:
         return
     if event_type == EventType.REMINDER:
-        raise ValueError("У напоминания нет длительности: это момент времени")
+        raise ValueError(
+            "У напоминания нет длительности: это момент времени. "
+            "Пользователь назвал длительность — создавай task с этой длительностью"
+        )
     if start_at is None:
         raise ValueError("Длительность можно указать только у записи с датой и временем")
 
@@ -142,6 +145,15 @@ class EventWithConflicts(Event):
 class SearchHit(Event):
     score: float = Field(description="Чем больше, тем релевантнее (Reciprocal Rank Fusion)")
     matched_by: list[str] = Field(description="Какие способы поиска нашли запись")
+
+
+class ImportResult(BaseModel):
+    """Итог загрузки календаря из CSV."""
+
+    imported: int = Field(description="Добавлено новых событий")
+    duplicates: int = Field(description="Уже были в календаре: тот же id, повторная загрузка")
+    invalid: int = Field(description="Строк пропущено из-за ошибок формата")
+    errors: list[str] = Field(default_factory=list, description="Первые ошибки, по одной на строку")
 
 
 class AgentStatus(StrEnum):

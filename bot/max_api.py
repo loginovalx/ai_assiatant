@@ -88,19 +88,23 @@ class MaxAPI:
                 return
 
     async def get_audio(self, url: str) -> bytes:
+        return await self.get_file(url, self.max_voice_bytes, "голосовое сообщение")
+
+    async def get_file(self, url: str, max_bytes: int, what: str = "файл") -> bytes:
+        """Скачать вложение с CDN MAX с ограничением размера. Токен бота туда не уходит."""
         if not _safe_media_url(url):
-            raise MaxAPIError("Недоверенный URL голосового вложения")
+            raise MaxAPIError(f"Недоверенный URL вложения ({what})")
         try:
             async with self.media_client.stream("GET", url) as response:
                 response.raise_for_status()
                 length = response.headers.get("content-length")
-                if length and int(length) > self.max_voice_bytes:
-                    raise MaxAPIError("Голосовое сообщение слишком большое")
+                if length and int(length) > max_bytes:
+                    raise MaxAPIError(f"Слишком большой {what}")
                 data = bytearray()
                 async for chunk in response.aiter_bytes():
                     data.extend(chunk)
-                    if len(data) > self.max_voice_bytes:
-                        raise MaxAPIError("Голосовое сообщение слишком большое")
+                    if len(data) > max_bytes:
+                        raise MaxAPIError(f"Слишком большой {what}")
                 return bytes(data)
         except (httpx.HTTPError, ValueError) as exc:
-            raise MaxAPIError("Не удалось скачать голосовое сообщение") from exc
+            raise MaxAPIError(f"Не удалось скачать {what}") from exc

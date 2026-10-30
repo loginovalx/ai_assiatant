@@ -168,6 +168,7 @@ async def test_create_warns_but_still_saves(client, tz):
             "event_type": "meeting",
             "name": "Созвон с Иваном",
             "start_at": tomorrow(tz, 15).isoformat(),
+            "duration_minutes": 60,
         },
     )
     assert first.structured_content["conflicts"] == []
@@ -197,6 +198,7 @@ async def test_update_into_busy_slot_warns_and_skips_itself(client, tz):
             "event_type": "meeting",
             "name": "Планёрка",
             "start_at": tomorrow(tz, 10).isoformat(),
+            "duration_minutes": 60,
         },
     )
     other = await client.call_tool(
@@ -206,6 +208,7 @@ async def test_update_into_busy_slot_warns_and_skips_itself(client, tz):
             "event_type": "meeting",
             "name": "Созвон",
             "start_at": tomorrow(tz, 14).isoformat(),
+            "duration_minutes": 60,
         },
     )
     event_id = other.structured_content["id"]

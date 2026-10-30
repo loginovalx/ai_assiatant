@@ -131,10 +131,14 @@ services:
       args: { GROUP: bot }
     command: ["uvicorn", "bot.webhook:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers"]
     environment:
-      # DATABASE_URL из якоря бот не использует; REDIS_URL/AGENT_URL — свои (адрес внутри сети).
+      # Боту нужна база: планировщик сам достаёт из неё наступившие напоминания,
+      # а присланный в чат CSV-календарь сохраняется туда же, к голосовым записям.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
       AGENT_URL: http://agent:8002
     depends_on:
+      postgres:
+        condition: service_healthy
       redis:
         condition: service_healthy
       agent:

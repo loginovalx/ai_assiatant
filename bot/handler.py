@@ -1,6 +1,7 @@
 """MAX message routing + user-friendly progress + Redis FSM."""
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from redis.asyncio import Redis
@@ -9,13 +10,26 @@ from bot.agent_client import AgentClient, AgentUnavailable
 from bot.asr import SpeechRecognitionError, SpeechRecognizer
 from bot.max_api import MaxAPI, MaxAPIError
 from bot.state import StateStore
+from common.calendar_import import CalendarImportError, parse_calendar_csv
+from common.config import get_settings
+from common.repository import EventRepository
 
 logger = logging.getLogger(__name__)
 
 _HELP = (
-    "Привет! Отправь текст или голосовое сообщение. Например: "
-    "«Напомни завтра в 10 позвонить Ивану»."
+    "Привет! Я твой персональный AI-ассистент.\n\n"
+    "Помогаю вести дела и расписание: создаю встречи и напоминания, нахожу события "
+    "в календаре, рассказываю о предстоящем и напоминаю о нём в нужное время.\n\n"
+    "Напиши или скажи голосом, например:\n"
+    "• «Что у меня завтра?»\n"
+    "• «Напомни в 18:00 отправить отчёт»\n"
+    "• «Поставь встречу с Марией на пятницу в 14:00»\n"
+    "• «Когда у меня следующая встреча с Иваном?»\n\n"
+    "Можно обычным языком — я разберусь. А ещё можно прислать CSV-файл "
+    "с календарём (колонки id, date, time, text), и я загружу его себе."
 )
+# Больше 1000 строк CSV для теста не нужно, а файл на мегабайты — повод отказать сразу.
+_MAX_CSV_BYTES = 5_000_000
 _BUSY = "Ещё думаю над прошлым запросом. Попробуй через несколько секунд."
 _AUDIO_EXT = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac")
 
@@ -25,18 +39,38 @@ def _attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
     return [a for a in (body.get("attachments") or []) if isinstance(a, dict)]
 
 
+def _attachment_filename(attachment: dict[str, Any]) -> str:
+    payload = attachment.get("payload") or {}
+    return str(
+        payload.get("filename") or payload.get("name") or attachment.get("filename") or ""
+    ).lower()
+
+
+def extract_csv(message: dict[str, Any]) -> str | None:
+    """URL вложенного CSV-файла, если он есть: им пользователь загружает календарь."""
+    for attachment in _attachments(message):
+        if attachment.get("type") not in {"file", None} or not _attachment_filename(
+            attachment
+        ).endswith(".csv"):
+            continue
+        payload = attachment.get("payload") or {}
+        url = payload.get("url") or attachment.get("url")
+        if isinstance(url, str) and url:
+            return url
+    return None
+
+
 def _is_audio_attachment(attachment: dict[str, Any]) -> bool:
     kind = attachment.get("type")
     if kind in {"audio", "voice"}:
         return True
     if kind != "file":
         return False
+    if _attachment_filename(attachment).endswith(".csv"):
+        return False  # это загрузка календаря, а не голосовое
     payload = attachment.get("payload") or {}
     filename = str(
-        payload.get("filename")
-        or payload.get("name")
-        or attachment.get("filename")
-        or ""
+        payload.get("filename") or payload.get("name") or attachment.get("filename") or ""
     ).lower()
     mime = str(payload.get("mime_type") or payload.get("content_type") or "").lower()
     if filename:
@@ -88,12 +122,45 @@ class BotHandler:
         agent: AgentClient,
         state: StateStore,
         redis: Redis,
+        repo: EventRepository | None = None,
     ):
         self.max_api = max_api
         self.asr = asr
         self.agent = agent
         self.state = state
         self.redis = redis
+        self.repo = repo
+
+    async def _greet_if_new(self, user_id: str, reply: Callable[[str], Awaitable[None]]) -> None:
+        """Приветствие ровно один раз на пользователя: флаг переживает перезапуск бота."""
+        if await self.redis.set(f"bot:greeted:{user_id}", "1", nx=True):
+            await reply(_HELP)
+
+    async def _import_csv(
+        self, user_id: str, url: str, reply: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """Загрузить присланный CSV в тот же календарь, где живут созданные голосом записи."""
+        if self.repo is None:
+            await reply("Загрузка календаря сейчас недоступна.")
+            return
+        await reply("Загружаю календарь из файла…")
+        try:
+            data = await self.max_api.get_file(url, _MAX_CSV_BYTES, "файл календаря")
+            rows, errors = parse_calendar_csv(data, get_settings().tz)
+            imported = await self.repo.import_calendar(user_id, rows)
+        except (MaxAPIError, CalendarImportError) as exc:
+            await reply(f"Не получилось загрузить календарь: {exc}")
+            return
+
+        skipped = len(rows) - imported
+        parts = [f"Загрузил событий: {imported}."]
+        if skipped:
+            parts.append(f"Уже были в календаре: {skipped}.")
+        if errors:
+            parts.append("Пропущено строк с ошибками: " + str(len(errors)))
+            parts.append("Например — " + "; ".join(errors[:3]))
+        parts.append("Теперь спрашивай: «что у меня завтра?»")
+        await reply(" ".join(parts))
 
     async def handle_update(self, update: dict[str, Any]) -> None:
         kind = update.get("update_type")
@@ -101,6 +168,9 @@ class BotHandler:
             user = update.get("user") or {}
             user_id = user.get("user_id")
             chat_id = update.get("chat_id")
+            if user_id is not None:
+                # Представились здесь — не повторяем приветствие перед первым ответом.
+                await self.redis.set(f"bot:greeted:{user_id}", "1")
             if chat_id is not None:
                 await self.max_api.send(int(chat_id), _HELP)
             elif user_id is not None:
@@ -136,10 +206,22 @@ class BotHandler:
 
         text = ((message.get("body") or {}).get("text") or "").strip()
         if text in {"/start", "/help"}:
+            await self.redis.set(f"bot:greeted:{user_id}", "1")
             await reply(_HELP)
             return
-        logger.info("MAX incoming: text=%s attachments=%s", bool(text),
-                    _brief_attachment_diagnostics(message))
+
+        # Первое сообщение от незнакомого пользователя: сначала представимся.
+        await self._greet_if_new(user_id, reply)
+
+        csv_url = extract_csv(message)
+        if csv_url:
+            await self._import_csv(user_id, csv_url, reply)
+            return
+        logger.info(
+            "MAX incoming: text=%s attachments=%s",
+            bool(text),
+            _brief_attachment_diagnostics(message),
+        )
         url, transcription = extract_audio(message)
         is_voice = _audio_present(message)
 
@@ -148,8 +230,10 @@ class BotHandler:
         if not text and (not is_voice or not (url or transcription)) and mid:
             try:
                 full_message = await self.max_api.get_message(str(mid))
-                logger.info("MAX fetched message: attachments=%s",
-                            _brief_attachment_diagnostics(full_message))
+                logger.info(
+                    "MAX fetched message: attachments=%s",
+                    _brief_attachment_diagnostics(full_message),
+                )
                 fetched_url, fetched_transcription = extract_audio(full_message)
                 if _audio_present(full_message):
                     is_voice = True
@@ -159,19 +243,20 @@ class BotHandler:
                 logger.warning("MAX message details unavailable: %s", exc)
 
         if is_voice and not (url or transcription):
-            logger.warning("Audio without URL/transcription, details=%s",
-                           _brief_attachment_diagnostics(message))
-            await reply("Аудиосообщение получено, но MAX не передал ссылку для распознавания. "
-                        "Попробуй отправить голосовое ещё раз.")
+            logger.warning(
+                "Audio without URL/transcription, details=%s",
+                _brief_attachment_diagnostics(message),
+            )
+            await reply(
+                "Аудиосообщение получено, но MAX не передал ссылку для распознавания. "
+                "Попробуй отправить голосовое ещё раз."
+            )
             return
         if not text and not is_voice:
-            await reply("Пришли текст или голосовое сообщение. "
-                        "Для MP3 выбери отправку файла.")
+            await reply("Пришли текст или голосовое сообщение. Для MP3 выбери отправку файла.")
             return
 
-        request_id = await self.state.acquire(
-            user_id, "recognizing" if is_voice else "thinking"
-        )
+        request_id = await self.state.acquire(user_id, "recognizing" if is_voice else "thinking")
         if request_id is None:
             await reply(_BUSY)
             return

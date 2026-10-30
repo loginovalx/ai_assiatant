@@ -24,6 +24,7 @@ from common.db import create_pool
 from common.embeddings import build_embedder
 from common.repository import EventRepository
 from common.schemas import (
+    DEFAULT_MEETING_MINUTES,
     MAX_DURATION_MINUTES,
     Event,
     EventCreate,
@@ -50,9 +51,10 @@ Duration = Annotated[
     int | None,
     Field(
         description=(
-            "Длительность в минутах, только если пользователь её назвал: «на полчаса» → 30, "
-            "«на два часа» → 120, «с 15 до 17» → 120. Иначе null: встреча по умолчанию "
-            "длится час, дело без длительности время не занимает. У напоминания — всегда null."
+            "Длительность в минутах: «на полчаса» → 30, «на два часа» → 120, «с 15 до 17» → 120. "
+            "Для meeting обязательна: не назвали — сначала спроси пользователя; ответил "
+            "«не знаю» — передай 60. Для task — только если назвали, иначе null. "
+            "У reminder — всегда null: назвали длительность у «напомни» — это task."
         ),
         ge=1,
         le=MAX_DURATION_MINUTES,
@@ -128,7 +130,8 @@ async def create_event(
     """Создать задачу, напоминание или встречу.
 
     Если пользователь не назвал время встречи или напоминания — не вызывай тул,
-    а сначала спроси время.
+    а сначала спроси время. У встречи так же нужна длительность: не назвали — спроси,
+    сколько она продлится (можно одним вопросом со временем).
     Если время пересекается с другими встречами или делами, запись всё равно сохраняется,
     а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
     """
@@ -149,6 +152,16 @@ async def create_event(
         raise ToolError(
             f"Время {data.start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "
             "Проверь вычисление даты или уточни у пользователя."
+        )
+
+    # Длительность встречи решает, с чем она пересечётся, поэтому не подставляем час молча:
+    # пусть агент спросит. «Не знаю» — тоже ответ: тогда агент сам передаст 60 и скажет об этом.
+    # Проверка только здесь, а не в EventCreate: HTTP API и старые записи живут без длительности.
+    if data.type == EventType.MEETING and data.duration_minutes is None:
+        raise ToolError(
+            "Не указана длительность встречи. Запись не создана: спроси пользователя, "
+            "сколько продлится встреча. Если он не знает — вызови тул снова с "
+            f"duration_minutes={DEFAULT_MEETING_MINUTES} и скажи, что поставил час."
         )
 
     repo = _repo(ctx)
@@ -349,6 +362,46 @@ async def delete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Even
         raise ToolError("Событие не найдено")
     logger.info("deleted event %s user=%s", event.id, user_id)
     return event
+
+
+@mcp.tool
+async def delete_events(
+    user_id: UserId,
+    ctx: Context,
+    event_types: Annotated[
+        list[EventTypeName] | None,
+        Field(
+            description=(
+                'Какие типы удалить: «все задачи и напоминания» → ["task", "reminder"], '
+                "«вообще всё» → null."
+            )
+        ),
+    ] = None,
+    confirmed: Annotated[
+        bool,
+        Field(description="true только после того, как пользователь ответил «да» на вопрос."),
+    ] = False,
+) -> list[Event]:
+    """Удалить сразу ВСЕ записи пользователя заданных типов.
+
+    Для «удали все мои задачи», «очисти всё». Для одной записи используй delete_event.
+    Действие необратимо для пользователя, поэтому без confirmed=true тул ничего не удаляет:
+    он ответит, сколько записей будет удалено, а ты спросишь подтверждение через ask_user.
+    """
+    types = [EventType(t) for t in event_types] if event_types else None
+    repo = _repo(ctx)
+    if not confirmed:
+        count = await repo.cancel_all(user_id, types, dry_run=True)
+        if count == 0:
+            raise ToolError("Записей такого типа нет — удалять нечего. Так и скажи пользователю.")
+        raise ToolError(
+            f"Ничего не удалено: будет удалено записей — {count}. Спроси через ask_user: "
+            f"«Удалить все записи ({count} шт.)? Это нельзя отменить.» Ответил «да» — "
+            "вызови тул снова с confirmed=true; «нет» — ничего не делай."
+        )
+    deleted = await repo.cancel_all(user_id, types)
+    logger.info("bulk deleted %d events user=%s types=%s", len(deleted), user_id, event_types)
+    return deleted
 
 
 @mcp.custom_route("/health", methods=["GET"])

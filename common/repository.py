@@ -1,13 +1,14 @@
 """Весь SQL проекта в одном месте. MCP-сервер и HTTP API ходят в базу только через этот класс."""
 
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import asyncpg
 
+from common.calendar_import import IMPORTED_DURATION_MINUTES, CalendarRow
 from common.embeddings import Embedder
 from common.schemas import (
     DEFAULT_MEETING_MINUTES,
@@ -220,6 +221,98 @@ class EventRepository:
             status.value,
         )
         return None if row is None else self._to_event(row)
+
+    async def import_calendar(self, user_id: str, rows: Sequence[CalendarRow]) -> int:
+        """Импорт строк CSV как событий календаря. Возвращает число реально добавленных.
+
+        Повторная загрузка того же файла ничего не дублирует: (user_id, external_id)
+        уникальны. Тип — task с длительностью: такое событие занимает время, поэтому
+        бот увидит пересечение при «поставь встречу завтра в 14:00».
+        Эмбеддинги не считаем: на тысяче строк это тысяча запросов к GigaChat, а поиск
+        по тексту (полнотекстовый и по опечаткам) работает и без них.
+        """
+        if not rows:
+            return 0
+        inserted = await self._pool.fetch(
+            """
+            INSERT INTO events (user_id, type, name, description, start_at,
+                                duration_minutes, external_id)
+            SELECT $1, 'task', r.name, '', r.start_at, $2, r.external_id
+            FROM unnest($3::text[], $4::timestamptz[], $5::text[])
+                 AS r(name, start_at, external_id)
+            ON CONFLICT (user_id, external_id) WHERE external_id IS NOT NULL DO NOTHING
+            RETURNING id
+            """,
+            user_id,
+            IMPORTED_DURATION_MINUTES,
+            [r.name for r in rows],
+            [r.start_at for r in rows],
+            [r.external_id for r in rows],
+        )
+        return len(inserted)
+
+    async def claim_due_events(
+        self, now: datetime, lookback: timedelta, limit: int = 50
+    ) -> list[Event]:
+        """Забрать наступившие события, которые ещё не отправляли, и сразу пометить их.
+
+        Пометка и выборка — один запрос: два процесса бота не отправят одно напоминание
+        дважды. lookback не даёт после простоя вывалить пользователю всё за годы назад
+        (в импортированном календаре даты бывают и прошлогодние).
+        """
+        rows = await self._pool.fetch(
+            f"""
+            UPDATE events SET notified_at = now()
+            WHERE id IN (
+                SELECT id FROM events
+                WHERE status = 'active' AND notified_at IS NULL
+                  AND start_at IS NOT NULL AND start_at <= $1 AND start_at > $2
+                ORDER BY start_at
+                LIMIT $3
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING {_COLUMNS}
+            """,
+            now,
+            now - lookback,
+            limit,
+        )
+        return [self._to_event(r) for r in rows]
+
+    async def unmark_notified(self, event_id: UUID) -> None:
+        """Вернуть событие в очередь: отправка в MAX не удалась, попробуем в следующий тик."""
+        await self._pool.execute("UPDATE events SET notified_at = NULL WHERE id = $1", event_id)
+
+    async def cancel_all(
+        self, user_id: str, types: Sequence[EventType] | None = None, dry_run: bool = False
+    ) -> list[Event] | int:
+        """Мягко удалить все видимые записи пользователя (опционально — только данных типов).
+
+        dry_run=True ничего не меняет и возвращает количество: им тул спрашивает подтверждение.
+        Иначе возвращает удалённые записи. Чужие записи не затрагиваются никогда.
+        """
+        type_values = [t.value for t in types] if types else None
+        if dry_run:
+            return await self._pool.fetchval(
+                """
+                SELECT count(*) FROM events
+                WHERE user_id = $1 AND status <> 'cancelled'
+                  AND ($2::text[] IS NULL OR type = ANY($2))
+                """,
+                user_id,
+                type_values,
+            )
+        rows = await self._pool.fetch(
+            f"""
+            UPDATE events SET status = 'cancelled'
+            WHERE user_id = $1 AND status <> 'cancelled'
+              AND ($2::text[] IS NULL OR type = ANY($2))
+            RETURNING {_COLUMNS}
+            """,
+            user_id,
+            type_values,
+        )
+        return [self._to_event(r) for r in rows]
 
     async def list_by_period(
         self,

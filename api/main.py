@@ -9,16 +9,19 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.ics import build_ics
+from common.calendar_import import CalendarImportError, parse_calendar_csv
 from common.config import get_settings
 from common.db import create_pool
 from common.embeddings import build_embedder
 from common.repository import EventRepository
-from common.schemas import Event, EventType, SearchHit
+from common.schemas import Event, EventType, ImportResult, SearchHit
 from common.timeutils import ensure_aware
+
+MAX_IMPORT_BYTES = 5_000_000
 
 
 @asynccontextmanager
@@ -38,7 +41,7 @@ app = FastAPI(title="Voice Assistant API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().api_cors_origins,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],  # POST — загрузка календаря из Mini App
     allow_headers=["*"],
 )
 
@@ -84,6 +87,30 @@ async def search_events(
     limit: Annotated[int, Query(ge=1, le=20)] = 10,
 ) -> list[SearchHit]:
     return await repo.search(user_id, q.strip(), limit=limit)
+
+
+@app.post("/v1/events/import", response_model=ImportResult)
+async def import_calendar(
+    repo: Repo,
+    user_id: UserId,
+    file: Annotated[UploadFile, File(description="CSV с колонками id, date, time, text")],
+) -> ImportResult:
+    """Загрузить тестовый календарь из CSV в тот же справочник событий, что и голосовые записи.
+
+    Повторная загрузка того же файла дублей не создаёт: строки сопоставляются по колонке id.
+    """
+    data = await file.read(MAX_IMPORT_BYTES + 1)
+    if len(data) > MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="Файл больше 5 МБ")
+    try:
+        rows, errors = parse_calendar_csv(data, get_settings().tz)
+    except CalendarImportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    imported = await repo.import_calendar(user_id, rows)
+    return ImportResult(
+        imported=imported, duplicates=len(rows) - imported, invalid=len(errors), errors=errors
+    )
 
 
 @app.get(

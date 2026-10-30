@@ -20,7 +20,12 @@ from bot.asr import make_asr
 from bot.config import Settings
 from bot.handler import BotHandler
 from bot.max_api import MaxAPI
+from bot.reminders import ReminderSender
 from bot.state import StateStore
+from common.config import get_settings
+from common.db import create_pool
+from common.embeddings import build_embedder
+from common.repository import EventRepository
 
 logger = logging.getLogger(__name__)
 _active: set[asyncio.Task[None]] = set()
@@ -58,6 +63,12 @@ async def lifespan(app: FastAPI):
 
     redis = Redis.from_url(settings.redis_url, decode_responses=True)
     max_api = MaxAPI(settings.max_token, settings.max_api_base, settings.max_voice_bytes)
+    # Общие настройки (БД, часовой пояс) — те же, что у остальных сервисов.
+    common = get_settings()
+    pool = await create_pool(common.database_url)
+    embedder = build_embedder(common)
+    repo = EventRepository(pool, embedder, common.tz)
+    scheduler: asyncio.Task[None] | None = None
     try:
         await redis.ping()
         state = StateStore(redis, ttl=settings.bot_state_ttl)
@@ -71,12 +82,23 @@ async def lifespan(app: FastAPI):
             settings.asr_http_token,
         )
         app.state.handler = BotHandler(
-            max_api, asr, AgentClient(settings.agent_url), state, redis
+            max_api, asr, AgentClient(settings.agent_url), state, redis, repo
         )
         app.state.webhook_secret = secret
+        sender = ReminderSender(
+            repo,
+            max_api,
+            common.tz,
+            interval_seconds=settings.reminder_interval_seconds,
+            lookback_minutes=settings.reminder_lookback_minutes,
+        )
+        scheduler = asyncio.create_task(sender.run_forever())
         logger.info("MAX Webhook ready; ASR_PROVIDER=%s", settings.asr_provider)
         yield
     finally:
+        if scheduler is not None:
+            scheduler.cancel()
+            await asyncio.gather(scheduler, return_exceptions=True)
         if _active:
             tasks = list(_active)
             for task in tasks:
@@ -84,6 +106,8 @@ async def lifespan(app: FastAPI):
             await asyncio.gather(*tasks, return_exceptions=True)
         await max_api.close()
         await redis.aclose()
+        await embedder.aclose()
+        await pool.close()
 
 
 app = FastAPI(title="MAX Bot Webhook", lifespan=lifespan)

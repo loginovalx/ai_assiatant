@@ -2075,6 +2075,7 @@ agent = [
 ]
 api = [
     { name = "fastapi" },
+    { name = "python-multipart" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 bot = [
@@ -2095,6 +2096,7 @@ dev = [
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "python-multipart" },
     { name = "redis" },
     { name = "ruff" },
     { name = "uvicorn", extra = ["standard"] },
@@ -2122,6 +2124,7 @@ agent = [
 ]
 api = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
 bot = [
@@ -2142,6 +2145,7 @@ dev = [
     { name = "pre-commit", specifier = ">=3.8" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "redis", specifier = ">=5.0" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },

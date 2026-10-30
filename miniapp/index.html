@@ -7,7 +7,7 @@
 
 <!-- MAX Bridge: нужен, чтобы получить настоящий user_id внутри MAX.
      ВАЖНО: адрес скрипта и названия полей сверить с документацией dev.max.ru.
-     Если скрипт не загрузится (например, в обычном браузере) - ничего страшного, страница работает с ?user_id=... -->
+     Если скрипт не загрузится (например, в обычном браузере) - страница работает с ?user_id=... -->
 <script src="https://st.max.ru/js/max-web-app.js"></script>
 
 <style>
@@ -87,6 +87,10 @@
   .badge.task { background: var(--task); }
   .badge.meeting { background: var(--meeting); }
   .badge.reminder { background: var(--reminder); }
+  .card.done { opacity: 0.65; }
+  .card.done .title { text-decoration: line-through; }
+  .badge.done-badge { background: #2e9e5b; }
+  .badge-row { display: flex; gap: 6px; flex-shrink: 0; }
   .meta { color: var(--muted); font-size: 14px; margin-top: 4px; }
   .desc { font-size: 14px; margin-top: 6px; color: var(--text); opacity: 0.85; word-break: break-word; }
   .card .btn { margin-top: 10px; padding: 8px 12px; font-size: 14px; }
@@ -139,6 +143,11 @@
 </div>
 
 <script>
+/* ============================================================
+   НАСТРОЙКИ
+   Адрес бэкенда. Для разработки - локальный. Можно переопределить
+   в адресной строке: index.html?user_id=123&api=https://xxxx.ngrok-free.app
+   ============================================================ */
 const DEFAULT_API = 'http://localhost:8000';
 
 const params = new URLSearchParams(location.search);
@@ -155,15 +164,20 @@ const state = {
 
 /* ---------- user_id ---------- */
 function detectUserId() {
+  // 1) для разработки: ?user_id=...
   const fromUrl = params.get('user_id');
   if (fromUrl) return fromUrl;
 
+  // 2) внутри MAX: id пользователя из MAX Bridge.
+  // ВНИМАНИЕ: это "небезопасные" данные без проверки подписи.
+  // Для боевого режима бэкенд должен проверять подписанный initData (window.WebApp.initData).
   try {
     const wa = window.WebApp;
     const id = wa && wa.initDataUnsafe && wa.initDataUnsafe.user && wa.initDataUnsafe.user.id;
     if (id) return String(id);
   } catch (e) { /* ничего */ }
 
+  // 3) введённый руками ранее
   try { return localStorage.getItem('user_id') || ''; } catch (e) { return ''; }
 }
 
@@ -220,12 +234,15 @@ async function fetchPeriod() {
   const { from, to } = periodRange(state.period);
   const base = {
     user_id: state.userId,
+    // задачи без даты показываем только на вкладке "Неделя", чтобы не засорять "Сегодня"
     include_undated: state.period === 'week' ? 'true' : 'false',
   };
   try {
+    // сначала пробуем передать дату со временем
     return await api('/v1/events', { ...base, from: toLocalISO(from), to: toLocalISO(to) });
   } catch (e) {
     if (e.status === 422) {
+      // если бэкенд хочет только дату - пробуем так
       return await api('/v1/events', { ...base, from: toDateOnly(from), to: toDateOnly(to) });
     }
     throw e;
@@ -237,6 +254,8 @@ function fetchSearch() {
 }
 
 /* ---------- разбор ответа ---------- */
+// Мы не знаем точные названия полей, поэтому пробуем несколько вариантов.
+// После просмотра /docs можно оставить только нужные.
 function pick(obj, keys) {
   for (const k of keys) {
     if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
@@ -272,7 +291,12 @@ function normalize(raw) {
     const d = new Date(endRaw);
     if (!isNaN(d.getTime())) end = d;
   }
+  const statusRaw = String(pick(o, ['status', 'state']) || 'active').toLowerCase();
+  const doneFlag = pick(o, ['done', 'is_done', 'completed', 'is_completed']);
+  const done = ['done', 'completed', 'complete', 'finished'].includes(statusRaw) || doneFlag === true;
+  const cancelled = ['cancelled', 'canceled', 'deleted'].includes(statusRaw);
   return {
+    done, cancelled,
     id: pick(o, ['id', 'event_id', 'uuid']),
     title: pick(o, ['title', 'name', 'summary', 'text']) || 'Без названия',
     type: String(pick(o, ['type', 'kind', 'event_type']) || '').toLowerCase(),
@@ -310,12 +334,15 @@ function fmtDay(d) {
 }
 
 function renderCard(ev) {
-  const card = el('div', 'card');
+  const card = el('div', 'card' + (ev.done ? ' done' : ''));
   const top = el('div', 'card-top');
   top.appendChild(el('div', 'title', ev.title));
+  const badges = el('div', 'badge-row');
+  if (ev.done) badges.appendChild(el('span', 'badge done-badge', '✓ Выполнено'));
   if (ev.type) {
-    top.appendChild(el('span', 'badge ' + ev.type, TYPE_LABELS[ev.type] || ev.type));
+    badges.appendChild(el('span', 'badge ' + ev.type, TYPE_LABELS[ev.type] || ev.type));
   }
+  top.appendChild(badges);
   card.appendChild(top);
 
   let metaText;
@@ -336,6 +363,7 @@ function renderCard(ev) {
 }
 
 function render(events) {
+  events = events.filter((e) => !e.cancelled); // отменённые не показываем
   if (state.types.size > 0) {
     events = events.filter((e) => state.types.has(e.type));
   }
@@ -405,7 +433,7 @@ async function downloadIcs(ev, btn) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   } catch (e) {
-    // запасной вариант: просто открыть ссылку (в вебвью так иногда надёжнее)
+    // запасной вариант - просто открыть ссылку
     window.open(url, '_blank');
   } finally {
     btn.disabled = false;

@@ -16,7 +16,7 @@ from fastmcp import Client, FastMCP
 
 logger = logging.getLogger(__name__)
 
-HIDDEN_ARGS = frozenset({"user_id", "dry_run", "idempotency_key", "event_ids"})
+HIDDEN_ARGS = frozenset({"user_id", "dry_run", "idempotency_key", "event_ids", "user_text"})
 
 # Тул без MCP: им модель сообщает, что ей не хватает данных. Явный сигнал надёжнее,
 # чем угадывать по знаку вопроса в ответе.
@@ -111,9 +111,12 @@ class McpToolbox:
         dry_run: bool = False,
         idempotency_key: str | None = None,
         event_ids: list[str] | None = None,
+        user_text: str | None = None,
     ) -> ToolResult:
         args = {k: v for k, v in arguments.items() if k not in HIDDEN_ARGS}
         args["user_id"] = user_id  # всегда наш, даже если модель прислала свой
+        if user_text is not None and name == "create_event":
+            args["user_text"] = user_text
         if dry_run and name in MUTATING_TOOLS:
             args["dry_run"] = True
         if idempotency_key is not None and name == "create_event":

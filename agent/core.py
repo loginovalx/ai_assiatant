@@ -6,7 +6,8 @@
 
 import json
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo
@@ -53,13 +54,19 @@ class Agent:
         now = now or datetime.now(self._tz)
         try:
             history = await self._memory.load(user_id)
+            source_text = _user_source(history, text)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": build_system_prompt(now)},
-                *history,
+                *({"role": item["role"], "content": item["content"]} for item in history),
                 {"role": "user", "content": text},
             ]
             response = await self._run(
-                user_id, messages, confirm_changes=confirm_changes, request_id=request_id
+                user_id,
+                messages,
+                confirm_changes=confirm_changes,
+                request_id=request_id,
+                read_period=_month_to_date_period(text, now),
+                source_text=source_text,
             )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
             logger.exception("LLM или MCP недоступны")
@@ -69,10 +76,17 @@ class Agent:
         # начинаться с чистого листа, а не с половины старого запроса.
         if response.status != AgentStatus.ERROR:
             try:
+                assistant = HistoryMessage(
+                    role="assistant",
+                    content=_with_event_refs(response),
+                    clarification_text=(
+                        source_text if response.status == AgentStatus.NEED_CLARIFICATION else ""
+                    ),
+                )
                 await self._memory.append(
                     user_id,
                     HistoryMessage(role="user", content=text),
-                    HistoryMessage(role="assistant", content=_with_event_refs(response)),
+                    assistant,
                 )
             except Exception:
                 # Запись события уже могла завершиться: не заставляем повторять её.
@@ -95,6 +109,7 @@ class Agent:
                     draft.tool,
                     draft.arguments,
                     idempotency_key=str(draft.id),
+                    user_text=draft.arguments.get("user_text"),
                 )
             elif draft.tool == "delete_events":
                 result = await self._toolbox.call(
@@ -151,6 +166,8 @@ class Agent:
         *,
         confirm_changes: bool = False,
         request_id: UUID | None = None,
+        read_period: tuple[datetime, datetime] | None = None,
+        source_text: str | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
         events: dict[str, Event] = {}
@@ -209,6 +226,17 @@ class Agent:
             for call in message.tool_calls:
                 name = call.function.name
                 args = _parse_args(call.function.arguments)
+                evidence = {}
+                if name == "create_event" and source_text is not None:
+                    evidence["user_text"] = source_text
+                    if args is not None:
+                        args = {**args, "user_text": source_text}
+                if name == "get_events" and args is not None and read_period is not None:
+                    args = {
+                        **args,
+                        "start_time": read_period[0].isoformat(),
+                        "end_time": read_period[1].isoformat(),
+                    }
                 logger.info("tool call %s %s", name, args)
 
                 if name == "ask_user":
@@ -243,16 +271,19 @@ class Agent:
                                 ok=False, payload="Аргументы не являются корректным JSON"
                             )
                         elif preview:
-                            result = await self._toolbox.call(user_id, name, args, dry_run=True)
+                            result = await self._toolbox.call(
+                                user_id, name, args, dry_run=True, **evidence
+                            )
                         elif name == "create_event" and request_id is not None:
                             result = await self._toolbox.call(
                                 user_id,
                                 name,
                                 args,
                                 idempotency_key=str(uuid5(request_id, f"create:{mutation_number}")),
+                                **evidence,
                             )
                         else:
-                            result = await self._toolbox.call(user_id, name, args)
+                            result = await self._toolbox.call(user_id, name, args, **evidence)
                     except Exception:
                         if not confirmed:
                             raise
@@ -314,6 +345,48 @@ class Agent:
         if confirmed:
             return _confirmed_response(confirmed, conflict_warnings)
         return AgentResponse(reply_text=TOO_MANY_STEPS, status=AgentStatus.ERROR)
+
+
+def _user_source(history: list[HistoryMessage], text: str) -> str:
+    """Keep actual user evidence across a pending clarification, not unrelated turns."""
+    pending = ""
+    if history and history[-1]["role"] == "assistant":
+        last = history[-1]
+        if "clarification_text" in last:
+            pending = last["clarification_text"]
+        elif last["content"].rstrip().endswith("?") and re.search(
+            r"во\s+сколько|на\s+какое\s+время|на\s+какую\s+дату|какой\s+день|"
+            r"о\s+ч[её]м|сколько\s+продлится|длительност|за\s+сколько|сколько\s+заранее",
+            last["content"],
+            re.I,
+        ):
+            # Compatibility with history saved before explicit status metadata.
+            pending = next(
+                (item["content"] for item in reversed(history[:-1]) if item["role"] == "user"),
+                "",
+            )
+    return (pending + "\n" + text if pending else text)[-6000:]
+
+
+def _month_to_date_period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
+    """Resolve an explicit month-to-date read against the trusted request clock.
+
+    Multiple periods or explicit dates stay with the normal interpretation path.
+    This never changes mutation or semantic-search arguments.
+    """
+    text = text.casefold()
+    if len(re.findall(r"\bмесяц\w*", text)) != 1 or re.search(
+        r"\d|\b(?:вчера|завтра|недел\w*|прошл\w*|следующ\w*)\b", text
+    ):
+        return None
+    if not re.search(
+        r"(?:с\s+начала\s+(?:этого|текущего)\s+месяца|"
+        r"в\s+(?:этом|текущем)\s+месяце)\s+по\s+сегодняшний\s+день\b",
+        text,
+    ):
+        return None
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return today.replace(day=1), today + timedelta(days=1)
 
 
 def _parse_args(raw: str | None) -> dict[str, Any] | None:

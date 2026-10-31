@@ -1,0 +1,38 @@
+diff --git a/miniapp/index.html b/miniapp/index.html
+index eafd1e5..62a989d 100644
+--- a/miniapp/index.html
++++ b/miniapp/index.html
+@@ -151,7 +151,16 @@
+ const params = new URLSearchParams(location.search);
+ const initData = window.WebApp?.initData ||
+   new URLSearchParams(location.hash.slice(1)).get('WebAppData') || '';
+-const DEFAULT_API = location.protocol === 'file:' ? 'http://localhost:8000' : location.origin;
++// Some sandboxed webview contexts (notably MAX's in-app WebKit webview)
++// report location.origin as the literal string "null" instead of a real
++// origin. Fall back to rebuilding it from protocol+host in that case, so
++// API_BASE never ends up holding the string "null" (which later breaks
++// `new URL(API_BASE + path)` with "The string did not match the expected
++// pattern.").
++const realOrigin = (location.origin && location.origin !== 'null')
++  ? location.origin
++  : `${location.protocol}//${location.host}`;
++const DEFAULT_API = location.protocol === 'file:' ? 'http://localhost:8000' : realOrigin;
+ // A URL parameter must never redirect signed MAX data to an arbitrary server.
+ const isLocalDev = !initData && ['localhost', '127.0.0.1', ''].includes(location.hostname);
+ const API_BASE = ((isLocalDev && params.get('api')) || DEFAULT_API).replace(/\/$/, '');
+@@ -202,7 +211,14 @@ function periodRange(period) {
+ 
+ /* ---------- запросы к бэкенду ---------- */
+ async function api(path, query, method = 'GET') {
+-  const url = new URL(API_BASE + path);
++  let url;
++  try {
++    url = new URL(API_BASE + path);
++  } catch (e) {
++    const err = new Error('Не удалось определить адрес сервера. Откройте мини-приложение заново через MAX.');
++    err.network = true;
++    throw err;
++  }
+   Object.entries(query || {}).forEach(([k, v]) => {
+     if (v === undefined || v === null || v === '') return;
+     if (Array.isArray(v)) v.forEach((x) => url.searchParams.append(k, x));

@@ -347,8 +347,13 @@ async def test_update_event_reschedule(make_agent, tz, pool):
     )
 
 
-async def test_delete_all_fits_in_step_limit_with_confirmation(make_agent, pool):
-    """Регрессия живого теста: «удали все задачи» упиралось в лимит шагов («Запутался»)."""
+async def test_text_bulk_delete_confirms_with_frozen_snapshot(make_agent, pool):
+    """Текстовое «удали все задачи» тоже идёт через подтверждение, а не служебную ошибку тула.
+
+    Регрессия живого теста: модель пересказывала пользователю текст ToolError
+    («Ничего не удалено: будет удалено записей — N...»), а на «да» удаляла всё
+    подходящее на тот момент, а не тот снимок, который человек видел в вопросе.
+    """
     for i in range(10):
         await pool.execute(
             "INSERT INTO events (user_id, type, name, description) VALUES ($1, 'task', $2, '')",
@@ -356,24 +361,26 @@ async def test_delete_all_fits_in_step_limit_with_confirmation(make_agent, pool)
             f"Дело {i}",
         )
     kinds = {"event_types": ["task", "reminder"]}
-    agent, llm = make_agent(
+    agent, _ = make_agent(
         tool_call("delete_events", kinds),
-        tool_call("ask_user", {"question": "Удалить все записи (10 шт.)?"}, call_id="call_2"),
-        tool_call("delete_events", {**kinds, "confirmed": True}),
-        text("Удалил 10 записей."),
+        text("Удалить все записи (10 шт.)? Это нельзя отменить."),
     )
 
     first = await agent.handle(USER, "Удали все мои задачи и напоминания")
-    assert first.status == AgentStatus.NEED_CLARIFICATION
-    assert (
-        "будет удалено записей — 10"
-        in json.loads(llm.requests[1]["messages"][-1]["content"])["error"]
-    )
+    assert first.status == AgentStatus.NEEDS_CONFIRMATION
+    assert "10" in first.reply_text
     assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 10
+    assert len(first.draft.arguments["event_ids"]) == 10
 
-    second = await agent.handle(USER, "Да")
+    # Запись, добавленная после предпросмотра, под подтверждение не попадает.
+    await pool.execute(
+        "INSERT INTO events (user_id, type, name, description) VALUES ($1, 'task', $2, '')",
+        USER,
+        "Добавлено после вопроса",
+    )
+    second = await agent.execute_draft(USER, first.draft)
     assert second.status == AgentStatus.DONE
-    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 0
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 1
 
 
 async def test_reminder_with_duration_becomes_task(make_agent, tz, pool):

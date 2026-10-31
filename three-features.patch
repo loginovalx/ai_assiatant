@@ -1,0 +1,1798 @@
+diff --git a/.env.example b/.env.example
+index b3b50af..39bdd97 100644
+--- a/.env.example
++++ b/.env.example
+@@ -45,6 +45,11 @@ ASR_PROVIDER=whisper
+ WHISPER_MODEL=base
+ ASR_HTTP_URL=
+ ASR_HTTP_TOKEN=
++# Планировщик напоминаний: как часто смотреть в базу и насколько далеко в прошлое.
++# lookback не даёт после долгого простоя вывалить пользователю все пропущенные напоминания
++# (в импортированном календаре бывают и прошлогодние даты).
++REMINDER_INTERVAL_SECONDS=30
++REMINDER_LOOKBACK_MINUTES=60
+ 
+ # --- Тесты (отдельная база, её содержимое удаляется) ---
+ # TEST_DATABASE_URL=postgresql://assistant:assistant@localhost:5432/assistant_test
+diff --git a/agent/README.md b/agent/README.md
+index 499d18a..0637a05 100644
+--- a/agent/README.md
++++ b/agent/README.md
+@@ -71,8 +71,21 @@ POST /v1/agent/reset     {"user_id": "123"}   → 204, очищает истор
+   возвращают `conflicts`; по промпту модель говорит «Учтите: в это время уже есть …, перенести?»
+   и ничего не переносит сама. Пересекающиеся записи попадают в скрытую сводку, поэтому
+   «перенеси ту встречу» следующим сообщением знает её id.
+-- **Длительность — только названная.** «На полчаса», «с 15 до 17» → `duration_minutes`;
+-  не назвали — не передаём, встреча по умолчанию час.
++- **Длительность встречи — спрашиваем.** «На полчаса», «с 15 до 17» → `duration_minutes`.
++  Не назвали — `ask_user` («Сколько продлится встреча?», или вместе со временем одним
++  вопросом). «Не знаю / не важно» → 60 и в ответе «поставил на час, если нужно — поменяю».
++  Если модель забыла спросить, `create_event` сам откажет с этой подсказкой — встреча
++  без длительности молча не создаётся. У дела длительность только названная.
++- **Час не выдумываем.** «Завтра», «в пятницу» без часа — повод для `ask_user`, а не для
++  10:00 «по умолчанию». Исключение одно: часть дня («утром» → 09:00), и о нём модель говорит
++  вслух. Срок с «до» («до пятницы» → 18:00) — только для дел.
++- **Длительность у «напомни» → дело.** У напоминания длительности не бывает, но терять
++  названные «два часа» нельзя: `create_event` отказывает с подсказкой создать `task`,
++  модель пересоздаёт запись делом и объясняет это пользователю.
++- **Про данные отвечаем по полям.** `description` — исходная фраза пользователя, в ней
++  может быть то, чего в записи нет (живой GigaChat на вопрос о длительности напоминания
++  пересказывал фразу: «с 10:00 до 12:00» при пустом `duration_minutes`). Время и
++  длительность — только из `start_at`, `end_at`, `duration_minutes`.
+ 
+ ## Тесты
+ 
+diff --git a/agent/prompt.py b/agent/prompt.py
+index dc24df0..5163900 100644
+--- a/agent/prompt.py
++++ b/agent/prompt.py
+@@ -40,6 +40,17 @@ _TEMPLATE = """\
+ 1. Создание. Определи тип, короткое название без даты и время. Вызови create_event,
+    в description передай исходную фразу пользователя целиком.
+ 2. Нет времени у встречи или напоминания — не выдумывай: вызови ask_user и спроси время.
++   Только день («завтра», «в пятницу», «15 ноября») — это не время: часа нет, спроси его.
++   Никогда не подставляй час сам: 10:00 «по умолчанию» — ошибка, лучше один вопрос.
++   «Напомни о вылете / о встрече / о звонке, который в 20:00» — 20:00 это время самого
++   события, а не напоминания: напоминать в момент события бесполезно. Если не сказали,
++   за сколько напомнить, спроси через ask_user: «За сколько напомнить — за час, за 30 минут?».
++   Ответили — создай reminder на (время события минус это время), в name укажи событие
++   с его временем: «Вылет в 20:00». Сказали точное время напоминания («напомни в 18:30
++   про вылет в 20:00») или «напомни ровно в 20:00» — ставь, как сказали, без вопросов.
++   У встречи нужна ещё и длительность. Если её не назвали — тоже спроси через ask_user.
++   Не хватает и времени, и длительности — спроси одним вопросом: «Во сколько встреча
++   и сколько она продлится?». Есть только время — «Сколько продлится встреча?».
+    Когда пользователь ответит, создай запись по исходной просьбе из истории диалога.
+ 3. «Что у меня сегодня / завтра / на неделе» — get_events.
+    Период — полуинтервал [start_time, end_time): «сегодня» = с 00:00 сегодня до 00:00 завтра;
+@@ -54,6 +65,9 @@ _TEMPLATE = """\
+    название и время последних созданных или найденных записей). Если непонятно, о какой
+    именно записи речь (например, несколько «встреча с Иваном» подряд) — не угадывай,
+    вызови ask_user и уточни, какую.
++   «Удали все задачи», «очисти всё» — ОДИН вызов delete_events, а не delete_event в цикле
++   (на цикл не хватит шагов). Тул сам скажет, сколько записей удалится, — спроси
++   подтверждение через ask_user и после «да» вызови тул с confirmed=true.
+ 6. Если тул вернул ошибку — исправь аргументы и вызови снова или спроси пользователя.
+ 7. Пересечения. Если create_event или update_event вернул непустой conflicts — запись уже
+    сохранена, но время занято. Скажи, что сделано, и обязательно предупреди, с чем
+@@ -63,21 +77,39 @@ _TEMPLATE = """\
+ 
+ ## Правила времени
+ - Все даты — ISO 8601 со смещением, как в строке «Сейчас».
+-- Часть дня без часа: утром — 09:00, днём — 13:00, вечером — 19:00. Упомяни это в ответе.
++- Часть дня без часа: утром — 09:00, днём — 13:00, вечером — 19:00. В ответе обязательно
++  назови этот час цифрами: «Напомню завтра в 13:00 — поставил на 13:00, раз вы сказали
++  "днём"; если нужно другое время, скажите». Ответ «напомню завтра днём» без часа — ошибка:
++  пользователь не узнает, на какое время встало.
++  Это единственный случай, когда час можно поставить самому. Нет и части дня — спроси.
+ - Час от 1 до 7 без «утра» или «ночи» — это дневное время: «в 3» = 15:00.
+-- Срок задачи без часа («до пятницы») — 18:00 этого дня.
++- Срок дела со словом «до» («сдать отчёт до пятницы») — 18:00 этого дня. Только для task:
++  у встречи и напоминания час всегда спрашивай.
+ - «Через N минут/часов» — считай от текущего времени.
+-- Длительность (duration_minutes) — только если пользователь её назвал: «на полчаса» → 30,
+-  «на два часа» → 120, «с 15 до 17» → начало 15:00 и 120 минут. Не назвал — не передавай:
+-  встреча по умолчанию длится час. У напоминания длительности не бывает.
++- Длительность (duration_minutes) переводи в минуты: «на полчаса» → 30, «на два часа» → 120,
++  «полтора часа» → 90, «с 15 до 17» → начало 15:00 и 120 минут.
++- У встречи длительность обязательна, но не выдумывай её — спроси (см. пункт 2).
++  Ответили «не знаю», «не важно», «как обычно», «сам реши» — передай 60 и скажи в ответе:
++  «Поставил на час — если нужно, поменяю».
++- У дела длительность — только если её назвали, иначе не передавай.
++- У напоминания длительности не бывает: это момент времени. Если пользователь сказал
++  «напомни» и назвал длительность («самолёт завтра в 10, на два часа») — это не напоминание,
++  а дело: создавай task со временем и длительностью и скажи об этом: «Поставил как дело
++  с 10:00 до 12:00 — у напоминаний длительности не бывает». Молча терять названную
++  длительность нельзя.
+ - Время не может быть в прошлом. Если вышло прошлое — скорее всего, имелся в виду
+   следующий такой день.
+ 
+ ## Ответ пользователю
+ - По-русски, коротко, одно-два предложения. Без markdown, без эмодзи: ответ могут озвучить.
+ - Подтверждай, что сделано, и называй дату словами: «Напомню в пятницу, 30 октября, в 10:00».
++  Час всегда цифрами, из поля start_at: никогда не заменяй его словами «днём», «утром».
+ - Список событий — по одному на строку: время (если есть end_at — «с 15:00 до 16:00»), название.
+ - Рассказывай только о том, что вернули тулы. Ничего не придумывай.
++- О времени и длительности записи отвечай строго по полям start_at, end_at и
++  duration_minutes. Поле description — это исходная фраза пользователя, в ней может быть
++  то, что в записи не сохранилось. Нет end_at и duration_minutes — длительности нет,
++  так и скажи: «Это напоминание на 10:00, длительности у него нет».
+ - Если ничего не найдено — так и скажи.
+ - Если просьба не про задачи и встречи — вежливо скажи, что умеешь только это.
+ """
+diff --git a/api/main.py b/api/main.py
+index 43e1b7e..8eb92ae 100644
+--- a/api/main.py
++++ b/api/main.py
+@@ -9,17 +9,20 @@ from datetime import datetime
+ from typing import Annotated
+ from uuid import UUID
+ 
+-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
++from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+ from fastapi.middleware.cors import CORSMiddleware
+ 
+ from api.ics import build_ics
++from common.calendar_import import CalendarImportError, parse_calendar_csv
+ from common.config import get_settings
+ from common.db import create_pool
+ from common.embeddings import build_embedder
+ from common.repository import EventRepository
+-from common.schemas import Event, EventType, SearchHit
++from common.schemas import Event, EventType, ImportResult, SearchHit
+ from common.timeutils import ensure_aware
+ 
++MAX_IMPORT_BYTES = 5_000_000
++
+ 
+ @asynccontextmanager
+ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+@@ -38,7 +41,7 @@ app = FastAPI(title="Voice Assistant API", version="0.1.0", lifespan=lifespan)
+ app.add_middleware(
+     CORSMiddleware,
+     allow_origins=get_settings().api_cors_origins,
+-    allow_methods=["GET"],
++    allow_methods=["GET", "POST"],  # POST — загрузка календаря из Mini App
+     allow_headers=["*"],
+ )
+ 
+@@ -86,6 +89,30 @@ async def search_events(
+     return await repo.search(user_id, q.strip(), limit=limit)
+ 
+ 
++@app.post("/v1/events/import", response_model=ImportResult)
++async def import_calendar(
++    repo: Repo,
++    user_id: UserId,
++    file: Annotated[UploadFile, File(description="CSV с колонками id, date, time, text")],
++) -> ImportResult:
++    """Загрузить тестовый календарь из CSV в тот же справочник событий, что и голосовые записи.
++
++    Повторная загрузка того же файла дублей не создаёт: строки сопоставляются по колонке id.
++    """
++    data = await file.read(MAX_IMPORT_BYTES + 1)
++    if len(data) > MAX_IMPORT_BYTES:
++        raise HTTPException(status_code=413, detail="Файл больше 5 МБ")
++    try:
++        rows, errors = parse_calendar_csv(data, get_settings().tz)
++    except CalendarImportError as exc:
++        raise HTTPException(status_code=422, detail=str(exc)) from exc
++
++    imported = await repo.import_calendar(user_id, rows)
++    return ImportResult(
++        imported=imported, duplicates=len(rows) - imported, invalid=len(errors), errors=errors
++    )
++
++
+ @app.get(
+     "/v1/events/{event_id}/ics",
+     response_class=Response,
+diff --git a/bot/README.md b/bot/README.md
+index a44a99a..0abf7b4 100644
+--- a/bot/README.md
++++ b/bot/README.md
+@@ -10,6 +10,9 @@
+ - Redis FSM `idle → recognizing → thinking → idle` с TTL 5 минут и защитой от одновременных запросов одного пользователя; после рестарта `bot:state:*` сбрасываются.
+ - «Голос получил, распознаю…», «Распознал: … Думаю…», ответ; дружелюбные сообщения об ошибках; игнорирование сообщений ботов, дублей и групповых чатов.
+ - Транспорт — **вебхук** (`bot/webhook.py`, FastAPI): `uvicorn bot.webhook:app`, маршрут `POST /webhook`, проверка подписи заголовком `X-Max-Bot-Api-Secret` (`MAX_WEBHOOK_SECRET`). Подписку регистрирует `bot/subscribe.py`.
++- **Автонапоминания** (`bot/reminders.py`): фоновая задача раз в 30 секунд забирает из базы наступившие события и сама шлёт «Напоминание: …» в MAX. Источник истины — таблица `events` (колонка `notified_at`), поэтому перезапуск сервиса напоминания не теряет и не дублирует.
++- **Загрузка календаря**: CSV-файл (`id,date,time,text`), присланный боту в чат, разбирается и сохраняется в общий календарь пользователя. Тот же импорт доступен через `POST /v1/events/import` у HTTP API.
++- **Приветствие** при первом контакте (`bot_started`, `/start`, `/help` или первое сообщение незнакомого пользователя) — один раз, флаг `bot:greeted:*` в Redis.
+ 
+ > **Не проверено на реальном MAX в этом окружении:** для этого нужен `MAX_TOKEN` и живой доступ к API; проект содержит автотесты на искусственных обновлениях. Развернутый публичный бот/прототип не создан этим архивом.
+ 
+diff --git a/bot/config.py b/bot/config.py
+index c12f800..0433bc1 100644
+--- a/bot/config.py
++++ b/bot/config.py
+@@ -18,6 +18,10 @@ class Settings:
+     max_voice_bytes: int = 15_000_000
+     polling_timeout: int = 20
+     reset_state_on_start: bool = True
++    # Как часто планировщик проверяет базу и насколько далеко в прошлое смотрит.
++    # lookback не даёт после долгого простоя вывалить пользователю всё пропущенное.
++    reminder_interval_seconds: int = 30
++    reminder_lookback_minutes: int = 60
+ 
+     @classmethod
+     def from_env(cls) -> "Settings":
+@@ -35,4 +39,6 @@ class Settings:
+             polling_timeout=int(getenv("POLLING_TIMEOUT", "20")),
+             reset_state_on_start=getenv("RESET_STATE_ON_START", "true").lower()
+             in {"true", "1", "yes"},
++            reminder_interval_seconds=int(getenv("REMINDER_INTERVAL_SECONDS", "30")),
++            reminder_lookback_minutes=int(getenv("REMINDER_LOOKBACK_MINUTES", "60")),
+         )
+diff --git a/bot/handler.py b/bot/handler.py
+index f03d55c..6578829 100644
+--- a/bot/handler.py
++++ b/bot/handler.py
+@@ -1,6 +1,7 @@
+ """MAX message routing + user-friendly progress + Redis FSM."""
+ 
+ import logging
++from collections.abc import Awaitable, Callable
+ from typing import Any
+ 
+ from redis.asyncio import Redis
+@@ -9,13 +10,26 @@ from bot.agent_client import AgentClient, AgentUnavailable
+ from bot.asr import SpeechRecognitionError, SpeechRecognizer
+ from bot.max_api import MaxAPI, MaxAPIError
+ from bot.state import StateStore
++from common.calendar_import import CalendarImportError, parse_calendar_csv
++from common.config import get_settings
++from common.repository import EventRepository
+ 
+ logger = logging.getLogger(__name__)
+ 
+ _HELP = (
+-    "Привет! Отправь текст или голосовое сообщение. Например: "
+-    "«Напомни завтра в 10 позвонить Ивану»."
++    "Привет! Я твой персональный AI-ассистент.\n\n"
++    "Помогаю вести дела и расписание: создаю встречи и напоминания, нахожу события "
++    "в календаре, рассказываю о предстоящем и напоминаю о нём в нужное время.\n\n"
++    "Напиши или скажи голосом, например:\n"
++    "• «Что у меня завтра?»\n"
++    "• «Напомни в 18:00 отправить отчёт»\n"
++    "• «Поставь встречу с Марией на пятницу в 14:00»\n"
++    "• «Когда у меня следующая встреча с Иваном?»\n\n"
++    "Можно обычным языком — я разберусь. А ещё можно прислать CSV-файл "
++    "с календарём (колонки id, date, time, text), и я загружу его себе."
+ )
++# Больше 1000 строк CSV для теста не нужно, а файл на мегабайты — повод отказать сразу.
++_MAX_CSV_BYTES = 5_000_000
+ _BUSY = "Ещё думаю над прошлым запросом. Попробуй через несколько секунд."
+ _AUDIO_EXT = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac")
+ 
+@@ -25,18 +39,38 @@ def _attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
+     return [a for a in (body.get("attachments") or []) if isinstance(a, dict)]
+ 
+ 
++def _attachment_filename(attachment: dict[str, Any]) -> str:
++    payload = attachment.get("payload") or {}
++    return str(
++        payload.get("filename") or payload.get("name") or attachment.get("filename") or ""
++    ).lower()
++
++
++def extract_csv(message: dict[str, Any]) -> str | None:
++    """URL вложенного CSV-файла, если он есть: им пользователь загружает календарь."""
++    for attachment in _attachments(message):
++        if attachment.get("type") not in {"file", None} or not _attachment_filename(
++            attachment
++        ).endswith(".csv"):
++            continue
++        payload = attachment.get("payload") or {}
++        url = payload.get("url") or attachment.get("url")
++        if isinstance(url, str) and url:
++            return url
++    return None
++
++
+ def _is_audio_attachment(attachment: dict[str, Any]) -> bool:
+     kind = attachment.get("type")
+     if kind in {"audio", "voice"}:
+         return True
+     if kind != "file":
+         return False
++    if _attachment_filename(attachment).endswith(".csv"):
++        return False  # это загрузка календаря, а не голосовое
+     payload = attachment.get("payload") or {}
+     filename = str(
+-        payload.get("filename")
+-        or payload.get("name")
+-        or attachment.get("filename")
+-        or ""
++        payload.get("filename") or payload.get("name") or attachment.get("filename") or ""
+     ).lower()
+     mime = str(payload.get("mime_type") or payload.get("content_type") or "").lower()
+     if filename:
+@@ -88,12 +122,45 @@ class BotHandler:
+         agent: AgentClient,
+         state: StateStore,
+         redis: Redis,
++        repo: EventRepository | None = None,
+     ):
+         self.max_api = max_api
+         self.asr = asr
+         self.agent = agent
+         self.state = state
+         self.redis = redis
++        self.repo = repo
++
++    async def _greet_if_new(self, user_id: str, reply: Callable[[str], Awaitable[None]]) -> None:
++        """Приветствие ровно один раз на пользователя: флаг переживает перезапуск бота."""
++        if await self.redis.set(f"bot:greeted:{user_id}", "1", nx=True):
++            await reply(_HELP)
++
++    async def _import_csv(
++        self, user_id: str, url: str, reply: Callable[[str], Awaitable[None]]
++    ) -> None:
++        """Загрузить присланный CSV в тот же календарь, где живут созданные голосом записи."""
++        if self.repo is None:
++            await reply("Загрузка календаря сейчас недоступна.")
++            return
++        await reply("Загружаю календарь из файла…")
++        try:
++            data = await self.max_api.get_file(url, _MAX_CSV_BYTES, "файл календаря")
++            rows, errors = parse_calendar_csv(data, get_settings().tz)
++            imported = await self.repo.import_calendar(user_id, rows)
++        except (MaxAPIError, CalendarImportError) as exc:
++            await reply(f"Не получилось загрузить календарь: {exc}")
++            return
++
++        skipped = len(rows) - imported
++        parts = [f"Загрузил событий: {imported}."]
++        if skipped:
++            parts.append(f"Уже были в календаре: {skipped}.")
++        if errors:
++            parts.append("Пропущено строк с ошибками: " + str(len(errors)))
++            parts.append("Например — " + "; ".join(errors[:3]))
++        parts.append("Теперь спрашивай: «что у меня завтра?»")
++        await reply(" ".join(parts))
+ 
+     async def handle_update(self, update: dict[str, Any]) -> None:
+         kind = update.get("update_type")
+@@ -101,6 +168,9 @@ class BotHandler:
+             user = update.get("user") or {}
+             user_id = user.get("user_id")
+             chat_id = update.get("chat_id")
++            if user_id is not None:
++                # Представились здесь — не повторяем приветствие перед первым ответом.
++                await self.redis.set(f"bot:greeted:{user_id}", "1")
+             if chat_id is not None:
+                 await self.max_api.send(int(chat_id), _HELP)
+             elif user_id is not None:
+@@ -136,10 +206,22 @@ class BotHandler:
+ 
+         text = ((message.get("body") or {}).get("text") or "").strip()
+         if text in {"/start", "/help"}:
++            await self.redis.set(f"bot:greeted:{user_id}", "1")
+             await reply(_HELP)
+             return
+-        logger.info("MAX incoming: text=%s attachments=%s", bool(text),
+-                    _brief_attachment_diagnostics(message))
++
++        # Первое сообщение от незнакомого пользователя: сначала представимся.
++        await self._greet_if_new(user_id, reply)
++
++        csv_url = extract_csv(message)
++        if csv_url:
++            await self._import_csv(user_id, csv_url, reply)
++            return
++        logger.info(
++            "MAX incoming: text=%s attachments=%s",
++            bool(text),
++            _brief_attachment_diagnostics(message),
++        )
+         url, transcription = extract_audio(message)
+         is_voice = _audio_present(message)
+ 
+@@ -148,8 +230,10 @@ class BotHandler:
+         if not text and (not is_voice or not (url or transcription)) and mid:
+             try:
+                 full_message = await self.max_api.get_message(str(mid))
+-                logger.info("MAX fetched message: attachments=%s",
+-                            _brief_attachment_diagnostics(full_message))
++                logger.info(
++                    "MAX fetched message: attachments=%s",
++                    _brief_attachment_diagnostics(full_message),
++                )
+                 fetched_url, fetched_transcription = extract_audio(full_message)
+                 if _audio_present(full_message):
+                     is_voice = True
+@@ -159,19 +243,20 @@ class BotHandler:
+                 logger.warning("MAX message details unavailable: %s", exc)
+ 
+         if is_voice and not (url or transcription):
+-            logger.warning("Audio without URL/transcription, details=%s",
+-                           _brief_attachment_diagnostics(message))
+-            await reply("Аудиосообщение получено, но MAX не передал ссылку для распознавания. "
+-                        "Попробуй отправить голосовое ещё раз.")
++            logger.warning(
++                "Audio without URL/transcription, details=%s",
++                _brief_attachment_diagnostics(message),
++            )
++            await reply(
++                "Аудиосообщение получено, но MAX не передал ссылку для распознавания. "
++                "Попробуй отправить голосовое ещё раз."
++            )
+             return
+         if not text and not is_voice:
+-            await reply("Пришли текст или голосовое сообщение. "
+-                        "Для MP3 выбери отправку файла.")
++            await reply("Пришли текст или голосовое сообщение. Для MP3 выбери отправку файла.")
+             return
+ 
+-        request_id = await self.state.acquire(
+-            user_id, "recognizing" if is_voice else "thinking"
+-        )
++        request_id = await self.state.acquire(user_id, "recognizing" if is_voice else "thinking")
+         if request_id is None:
+             await reply(_BUSY)
+             return
+diff --git a/bot/max_api.py b/bot/max_api.py
+index cc1f4ab..3805f97 100644
+--- a/bot/max_api.py
++++ b/bot/max_api.py
+@@ -88,19 +88,23 @@ class MaxAPI:
+                 return
+ 
+     async def get_audio(self, url: str) -> bytes:
++        return await self.get_file(url, self.max_voice_bytes, "голосовое сообщение")
++
++    async def get_file(self, url: str, max_bytes: int, what: str = "файл") -> bytes:
++        """Скачать вложение с CDN MAX с ограничением размера. Токен бота туда не уходит."""
+         if not _safe_media_url(url):
+-            raise MaxAPIError("Недоверенный URL голосового вложения")
++            raise MaxAPIError(f"Недоверенный URL вложения ({what})")
+         try:
+             async with self.media_client.stream("GET", url) as response:
+                 response.raise_for_status()
+                 length = response.headers.get("content-length")
+-                if length and int(length) > self.max_voice_bytes:
+-                    raise MaxAPIError("Голосовое сообщение слишком большое")
++                if length and int(length) > max_bytes:
++                    raise MaxAPIError(f"Слишком большой {what}")
+                 data = bytearray()
+                 async for chunk in response.aiter_bytes():
+                     data.extend(chunk)
+-                    if len(data) > self.max_voice_bytes:
+-                        raise MaxAPIError("Голосовое сообщение слишком большое")
++                    if len(data) > max_bytes:
++                        raise MaxAPIError(f"Слишком большой {what}")
+                 return bytes(data)
+         except (httpx.HTTPError, ValueError) as exc:
+-            raise MaxAPIError("Не удалось скачать голосовое сообщение") from exc
++            raise MaxAPIError(f"Не удалось скачать {what}") from exc
+diff --git a/bot/reminders.py b/bot/reminders.py
+new file mode 100644
+index 0000000..08a884d
+--- /dev/null
++++ b/bot/reminders.py
+@@ -0,0 +1,85 @@
++"""Фоновая отправка напоминаний в MAX, когда наступило их время.
++
++Источник истины — таблица events, а не память процесса: после перезапуска бота
++уже созданные напоминания никуда не денутся, а отправленные повторно не придут
++(отметка notified_at ставится в том же запросе, которым событие забирается в работу).
++"""
++
++import asyncio
++import logging
++from datetime import datetime, timedelta
++from zoneinfo import ZoneInfo
++
++from bot.max_api import MaxAPI, MaxAPIError
++from common.repository import EventRepository
++from common.schemas import Event, EventType
++
++logger = logging.getLogger(__name__)
++
++
++def format_notification(event: Event) -> str:
++    """Текст напоминания. Для встреч и дел добавляем время: оно помогает сориентироваться."""
++    if event.type == EventType.REMINDER:
++        return f"Напоминание: {event.name}"
++    kind = "встреча" if event.type == EventType.MEETING else "дело"
++    when = event.start_at.strftime("%H:%M") if event.start_at else ""
++    return f"Напоминание: {kind} «{event.name}» в {when}"
++
++
++class ReminderSender:
++    """Раз в interval секунд проверяет базу и шлёт наступившие напоминания.
++
++    lookback ограничивает «догоняющие» отправки: если бот лежал сутки, пользователь
++    получит только то, что наступило за последний час, а не всю пропущенную историю.
++    В импортированном календаре встречаются и прошлогодние даты — их не трогаем.
++    """
++
++    def __init__(
++        self,
++        repo: EventRepository,
++        max_api: MaxAPI,
++        tz: ZoneInfo,
++        interval_seconds: int = 30,
++        lookback_minutes: int = 60,
++        batch: int = 50,
++    ) -> None:
++        self._repo = repo
++        self._max_api = max_api
++        self._tz = tz
++        self._interval = interval_seconds
++        self._lookback = timedelta(minutes=lookback_minutes)
++        self._batch = batch
++
++    async def run_forever(self) -> None:
++        logger.info("Планировщик напоминаний запущен: раз в %d с", self._interval)
++        while True:
++            try:
++                sent = await self.tick()
++                if sent:
++                    logger.info("Отправлено напоминаний: %d", sent)
++            except asyncio.CancelledError:
++                raise
++            except Exception:  # один сбой не должен останавливать планировщик навсегда
++                logger.exception("Сбой тика планировщика напоминаний")
++            await asyncio.sleep(self._interval)
++
++    async def tick(self, now: datetime | None = None) -> int:
++        """Один проход: забрать наступившее и отправить. Возвращает число отправленных."""
++        now = now or datetime.now(self._tz)
++        due = await self._repo.claim_due_events(now, self._lookback, self._batch)
++        sent = 0
++        for event in due:
++            try:
++                # chat_id у личного диалога с ботом совпадает с user_id отправителя.
++                await self._max_api.send(
++                    int(event.user_id), format_notification(event), to_user=True
++                )
++                sent += 1
++            except (MaxAPIError, ValueError, OSError) as exc:
++                # Снимаем отметку: пользователь не получил сообщение, пробуем в следующий раз.
++                logger.warning("Не удалось отправить напоминание %s: %s", event.id, exc)
++                await self._repo.unmark_notified(event.id)
++            except Exception:
++                logger.exception("Неожиданная ошибка при отправке напоминания %s", event.id)
++                await self._repo.unmark_notified(event.id)
++        return sent
+diff --git a/bot/webhook.py b/bot/webhook.py
+index d21c8e3..8245770 100644
+--- a/bot/webhook.py
++++ b/bot/webhook.py
+@@ -20,7 +20,12 @@ from bot.asr import make_asr
+ from bot.config import Settings
+ from bot.handler import BotHandler
+ from bot.max_api import MaxAPI
++from bot.reminders import ReminderSender
+ from bot.state import StateStore
++from common.config import get_settings
++from common.db import create_pool
++from common.embeddings import build_embedder
++from common.repository import EventRepository
+ 
+ logger = logging.getLogger(__name__)
+ _active: set[asyncio.Task[None]] = set()
+@@ -58,6 +63,12 @@ async def lifespan(app: FastAPI):
+ 
+     redis = Redis.from_url(settings.redis_url, decode_responses=True)
+     max_api = MaxAPI(settings.max_token, settings.max_api_base, settings.max_voice_bytes)
++    # Общие настройки (БД, часовой пояс) — те же, что у остальных сервисов.
++    common = get_settings()
++    pool = await create_pool(common.database_url)
++    embedder = build_embedder(common)
++    repo = EventRepository(pool, embedder, common.tz)
++    scheduler: asyncio.Task[None] | None = None
+     try:
+         await redis.ping()
+         state = StateStore(redis, ttl=settings.bot_state_ttl)
+@@ -71,12 +82,23 @@ async def lifespan(app: FastAPI):
+             settings.asr_http_token,
+         )
+         app.state.handler = BotHandler(
+-            max_api, asr, AgentClient(settings.agent_url), state, redis
++            max_api, asr, AgentClient(settings.agent_url), state, redis, repo
+         )
+         app.state.webhook_secret = secret
++        sender = ReminderSender(
++            repo,
++            max_api,
++            common.tz,
++            interval_seconds=settings.reminder_interval_seconds,
++            lookback_minutes=settings.reminder_lookback_minutes,
++        )
++        scheduler = asyncio.create_task(sender.run_forever())
+         logger.info("MAX Webhook ready; ASR_PROVIDER=%s", settings.asr_provider)
+         yield
+     finally:
++        if scheduler is not None:
++            scheduler.cancel()
++            await asyncio.gather(scheduler, return_exceptions=True)
+         if _active:
+             tasks = list(_active)
+             for task in tasks:
+@@ -84,6 +106,8 @@ async def lifespan(app: FastAPI):
+             await asyncio.gather(*tasks, return_exceptions=True)
+         await max_api.close()
+         await redis.aclose()
++        await embedder.aclose()
++        await pool.close()
+ 
+ 
+ app = FastAPI(title="MAX Bot Webhook", lifespan=lifespan)
+diff --git a/common/calendar_import.py b/common/calendar_import.py
+new file mode 100644
+index 0000000..cdd483a
+--- /dev/null
++++ b/common/calendar_import.py
+@@ -0,0 +1,104 @@
++"""Разбор CSV с тестовым календарём: id, date, time, text.
++
++Формат фиксированный (см. ТЗ), других таблиц не поддерживаем. Файл разбирается целиком
++в память и проверяется построчно: в LLM он не попадает, события сохраняются в ту же
++таблицу events, что и созданные голосом, и дальше живут как обычные записи календаря.
++"""
++
++import csv
++import io
++from dataclasses import dataclass
++from datetime import datetime
++from zoneinfo import ZoneInfo
++
++REQUIRED_COLUMNS = ("id", "date", "time", "text")
++MAX_ROWS = 5000
++MAX_NAME_LENGTH = 200  # столько же, сколько CHECK в схеме events
++MAX_REPORTED_ERRORS = 20
++_TIME_FORMATS = ("%H:%M", "%H:%M:%S")
++
++# Импортированное событие занимает время: иначе бот не увидит пересечения
++# при «поставь встречу завтра в 14:00». Длительность календарного слота по умолчанию.
++IMPORTED_DURATION_MINUTES = 60
++
++
++class CalendarImportError(ValueError):
++    """Файл нельзя импортировать целиком: не тот формат или он пуст."""
++
++
++@dataclass(frozen=True)
++class CalendarRow:
++    external_id: str
++    start_at: datetime
++    name: str
++
++
++def parse_calendar_csv(data: bytes, tz: ZoneInfo) -> tuple[list[CalendarRow], list[str]]:
++    """Вернуть корректные строки и список ошибок по некорректным.
++
++    Одна битая строка не отменяет весь импорт: остальные загрузятся, а про проблемные
++    пользователь получит понятный список. Нечитаемый файл — CalendarImportError.
++    """
++    try:
++        # utf-8-sig: Excel сохраняет CSV с BOM, и без этого первая колонка станет "﻿id".
++        text = data.decode("utf-8-sig")
++    except UnicodeDecodeError as exc:
++        raise CalendarImportError("Файл не в кодировке UTF-8") from exc
++
++    reader = csv.DictReader(io.StringIO(text))
++    columns = {(name or "").strip().lower() for name in (reader.fieldnames or [])}
++    missing = [c for c in REQUIRED_COLUMNS if c not in columns]
++    if missing:
++        raise CalendarImportError(f"В файле нет обязательных колонок: {', '.join(missing)}")
++
++    rows: list[CalendarRow] = []
++    errors: list[str] = []
++    seen: set[str] = set()
++    for line, raw in enumerate(reader, start=2):  # строка 1 — заголовок
++        if len(rows) >= MAX_ROWS:
++            errors.append(f"Файл длиннее {MAX_ROWS} строк: остальные пропущены")
++            break
++        try:
++            row = _parse_row({(k or "").strip().lower(): v for k, v in raw.items()})
++        except ValueError as exc:
++            if len(errors) < MAX_REPORTED_ERRORS:
++                errors.append(f"строка {line}: {exc}")
++            continue
++        if row.external_id in seen:
++            if len(errors) < MAX_REPORTED_ERRORS:
++                errors.append(f"строка {line}: id {row.external_id} повторяется в файле")
++            continue
++        seen.add(row.external_id)
++        rows.append(CalendarRow(row.external_id, row.start_at.replace(tzinfo=tz), row.name))
++
++    if not rows and not errors:
++        raise CalendarImportError("В файле нет ни одной строки с данными")
++    return rows, errors
++
++
++def _parse_row(raw: dict[str, str | None]) -> CalendarRow:
++    external_id = (raw.get("id") or "").strip()
++    date_text = (raw.get("date") or "").strip()
++    time_text = (raw.get("time") or "").strip()
++    name = " ".join((raw.get("text") or "").split())
++
++    if not external_id:
++        raise ValueError("пустой id")
++    if not name:
++        raise ValueError("пустой text")
++    try:
++        day = datetime.strptime(date_text, "%Y-%m-%d").date()
++    except ValueError as exc:
++        raise ValueError(f"дата «{date_text}» не в формате ГГГГ-ММ-ДД") from exc
++
++    for fmt in _TIME_FORMATS:
++        try:
++            moment = datetime.strptime(time_text, fmt).time()
++            break
++        except ValueError:
++            continue
++    else:
++        raise ValueError(f"время «{time_text}» не в формате ЧЧ:ММ")
++
++    # Наивный datetime: часовой пояс пользователя проставит parse_calendar_csv.
++    return CalendarRow(external_id, datetime.combine(day, moment), name[:MAX_NAME_LENGTH])
+diff --git a/common/repository.py b/common/repository.py
+index d82c066..9b49878 100644
+--- a/common/repository.py
++++ b/common/repository.py
+@@ -1,13 +1,14 @@
+ """Весь SQL проекта в одном месте. MCP-сервер и HTTP API ходят в базу только через этот класс."""
+ 
+ from collections.abc import Sequence
+-from datetime import datetime
++from datetime import datetime, timedelta
+ from typing import Any
+ from uuid import UUID
+ from zoneinfo import ZoneInfo
+ 
+ import asyncpg
+ 
++from common.calendar_import import IMPORTED_DURATION_MINUTES, CalendarRow
+ from common.embeddings import Embedder
+ from common.schemas import (
+     DEFAULT_MEETING_MINUTES,
+@@ -221,6 +222,98 @@ class EventRepository:
+         )
+         return None if row is None else self._to_event(row)
+ 
++    async def import_calendar(self, user_id: str, rows: Sequence[CalendarRow]) -> int:
++        """Импорт строк CSV как событий календаря. Возвращает число реально добавленных.
++
++        Повторная загрузка того же файла ничего не дублирует: (user_id, external_id)
++        уникальны. Тип — task с длительностью: такое событие занимает время, поэтому
++        бот увидит пересечение при «поставь встречу завтра в 14:00».
++        Эмбеддинги не считаем: на тысяче строк это тысяча запросов к GigaChat, а поиск
++        по тексту (полнотекстовый и по опечаткам) работает и без них.
++        """
++        if not rows:
++            return 0
++        inserted = await self._pool.fetch(
++            """
++            INSERT INTO events (user_id, type, name, description, start_at,
++                                duration_minutes, external_id)
++            SELECT $1, 'task', r.name, '', r.start_at, $2, r.external_id
++            FROM unnest($3::text[], $4::timestamptz[], $5::text[])
++                 AS r(name, start_at, external_id)
++            ON CONFLICT (user_id, external_id) WHERE external_id IS NOT NULL DO NOTHING
++            RETURNING id
++            """,
++            user_id,
++            IMPORTED_DURATION_MINUTES,
++            [r.name for r in rows],
++            [r.start_at for r in rows],
++            [r.external_id for r in rows],
++        )
++        return len(inserted)
++
++    async def claim_due_events(
++        self, now: datetime, lookback: timedelta, limit: int = 50
++    ) -> list[Event]:
++        """Забрать наступившие события, которые ещё не отправляли, и сразу пометить их.
++
++        Пометка и выборка — один запрос: два процесса бота не отправят одно напоминание
++        дважды. lookback не даёт после простоя вывалить пользователю всё за годы назад
++        (в импортированном календаре даты бывают и прошлогодние).
++        """
++        rows = await self._pool.fetch(
++            f"""
++            UPDATE events SET notified_at = now()
++            WHERE id IN (
++                SELECT id FROM events
++                WHERE status = 'active' AND notified_at IS NULL
++                  AND start_at IS NOT NULL AND start_at <= $1 AND start_at > $2
++                ORDER BY start_at
++                LIMIT $3
++                FOR UPDATE SKIP LOCKED
++            )
++            RETURNING {_COLUMNS}
++            """,
++            now,
++            now - lookback,
++            limit,
++        )
++        return [self._to_event(r) for r in rows]
++
++    async def unmark_notified(self, event_id: UUID) -> None:
++        """Вернуть событие в очередь: отправка в MAX не удалась, попробуем в следующий тик."""
++        await self._pool.execute("UPDATE events SET notified_at = NULL WHERE id = $1", event_id)
++
++    async def cancel_all(
++        self, user_id: str, types: Sequence[EventType] | None = None, dry_run: bool = False
++    ) -> list[Event] | int:
++        """Мягко удалить все видимые записи пользователя (опционально — только данных типов).
++
++        dry_run=True ничего не меняет и возвращает количество: им тул спрашивает подтверждение.
++        Иначе возвращает удалённые записи. Чужие записи не затрагиваются никогда.
++        """
++        type_values = [t.value for t in types] if types else None
++        if dry_run:
++            return await self._pool.fetchval(
++                """
++                SELECT count(*) FROM events
++                WHERE user_id = $1 AND status <> 'cancelled'
++                  AND ($2::text[] IS NULL OR type = ANY($2))
++                """,
++                user_id,
++                type_values,
++            )
++        rows = await self._pool.fetch(
++            f"""
++            UPDATE events SET status = 'cancelled'
++            WHERE user_id = $1 AND status <> 'cancelled'
++              AND ($2::text[] IS NULL OR type = ANY($2))
++            RETURNING {_COLUMNS}
++            """,
++            user_id,
++            type_values,
++        )
++        return [self._to_event(r) for r in rows]
++
+     async def list_by_period(
+         self,
+         user_id: str,
+diff --git a/common/schemas.py b/common/schemas.py
+index 23105e7..8eda0fb 100644
+--- a/common/schemas.py
++++ b/common/schemas.py
+@@ -49,7 +49,10 @@ def check_duration(
+     if duration_minutes is None:
+         return
+     if event_type == EventType.REMINDER:
+-        raise ValueError("У напоминания нет длительности: это момент времени")
++        raise ValueError(
++            "У напоминания нет длительности: это момент времени. "
++            "Пользователь назвал длительность — создавай task с этой длительностью"
++        )
+     if start_at is None:
+         raise ValueError("Длительность можно указать только у записи с датой и временем")
+ 
+@@ -144,6 +147,15 @@ class SearchHit(Event):
+     matched_by: list[str] = Field(description="Какие способы поиска нашли запись")
+ 
+ 
++class ImportResult(BaseModel):
++    """Итог загрузки календаря из CSV."""
++
++    imported: int = Field(description="Добавлено новых событий")
++    duplicates: int = Field(description="Уже были в календаре: тот же id, повторная загрузка")
++    invalid: int = Field(description="Строк пропущено из-за ошибок формата")
++    errors: list[str] = Field(default_factory=list, description="Первые ошибки, по одной на строку")
++
++
+ class AgentStatus(StrEnum):
+     DONE = "done"
+     NEED_CLARIFICATION = "need_clarification"
+diff --git a/db/migrations/003_notifications_and_import.sql b/db/migrations/003_notifications_and_import.sql
+new file mode 100644
+index 0000000..65eae86
+--- /dev/null
++++ b/db/migrations/003_notifications_and_import.sql
+@@ -0,0 +1,23 @@
++-- Две вещи: отметка об отправленном напоминании и идентификатор строки импортированного CSV.
++--
++-- notified_at — когда бот отправил напоминание пользователю. NULL — ещё не отправляли.
++-- Нужна, чтобы после перезапуска сервиса напоминание не пришло повторно: источник
++-- истины в базе, а не в памяти процесса.
++--
++-- external_id — значение колонки id из загруженного CSV. Уникален в пределах пользователя,
++-- поэтому повторная загрузка того же файла не создаёт дублей (ON CONFLICT DO NOTHING).
++--
++-- На пустом volume применяется автоматически после 002. На уже работающей базе — один раз вручную:
++--   docker compose exec -T postgres psql -U assistant -d assistant < db/migrations/003_notifications_and_import.sql
++
++ALTER TABLE events ADD COLUMN IF NOT EXISTS notified_at timestamptz;
++ALTER TABLE events ADD COLUMN IF NOT EXISTS external_id text;
++
++-- Повторный импорт того же файла не плодит дубли. Частичный индекс: события,
++-- созданные голосом, external_id не имеют, и уникальность их не касается.
++CREATE UNIQUE INDEX IF NOT EXISTS events_user_external_idx
++    ON events (user_id, external_id) WHERE external_id IS NOT NULL;
++
++-- Планировщик раз в полминуты ищет наступившие и ещё не отправленные напоминания.
++CREATE INDEX IF NOT EXISTS events_due_idx
++    ON events (start_at) WHERE notified_at IS NULL AND status = 'active';
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 6b655a3..730d634 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -131,10 +131,14 @@ services:
+       args: { GROUP: bot }
+     command: ["uvicorn", "bot.webhook:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers"]
+     environment:
+-      # DATABASE_URL из якоря бот не использует; REDIS_URL/AGENT_URL — свои (адрес внутри сети).
++      # Боту нужна база: планировщик сам достаёт из неё наступившие напоминания,
++      # а присланный в чат CSV-календарь сохраняется туда же, к голосовым записям.
++      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+       REDIS_URL: redis://redis:6379/0
+       AGENT_URL: http://agent:8002
+     depends_on:
++      postgres:
++        condition: service_healthy
+       redis:
+         condition: service_healthy
+       agent:
+diff --git a/docs/backend.md b/docs/backend.md
+index e66cbe6..694cf40 100644
+--- a/docs/backend.md
++++ b/docs/backend.md
+@@ -53,9 +53,33 @@ tools = await client.get_tools()  # create_event, get_events, search_events
+ | `search_events` | `user_id`, `query`, `start_time`, `end_time`, `limit` | список с `score` и `matched_by` |
+ | `update_event` | `user_id`, `event_id`, `name`, `start_at`, `description`, `duration_minutes` | событие + `conflicts` |
+ | `complete_event` / `delete_event` | `user_id`, `event_id` | событие |
+-
+-**Длительность и пересечения.** `duration_minutes` необязателен. Встреча без него длится час,
+-дело без него время не занимает (это срок: «сдать отчёт до 18:00»), у напоминания длительности
++| `delete_events` | `user_id`, `event_types?`, `confirmed?` | список удалённых |
++
++**Импорт календаря из CSV.** `POST /v1/events/import?user_id=…` с файлом (колонки `id`,
++`date` в формате ГГГГ-ММ-ДД, `time` в ЧЧ:ММ, `text`). Строки сохраняются в ту же таблицу
++`events`, что и созданные голосом, типом `task` с длительностью 60 минут — поэтому
++импортированное событие занимает время и участвует в поиске пересечений. Повторная
++загрузка того же файла дублей не создаёт: пара (`user_id`, `external_id` из колонки `id`)
++уникальна. Эмбеддинги на импорте не считаются (на 1000 строк это 1000 запросов к GigaChat),
++поэтому такие события находятся полнотекстовым поиском, но не поиском по смыслу.
++Тот же CSV можно просто прислать боту файлом в чат.
++
++**Автоматические напоминания.** Бот раз в `REMINDER_INTERVAL_SECONDS` (30 с) забирает из базы
++активные события, у которых `start_at` наступил, а `notified_at` пуст, отправляет их в MAX и
++в том же запросе проставляет отметку — повторно после перезапуска сервиса они не придут.
++`REMINDER_LOOKBACK_MINUTES` (60) ограничивает «догоняющие» отправки: после долгого простоя
++пользователь получит только недавнее, а не прошлогодние даты из импортированного календаря.
++Если отправка не удалась, отметка снимается и попытка повторится в следующий тик.
++
++`delete_events` — массовое удаление («удали все задачи»): без `confirmed=true` ничего не
++удаляет и отвечает ошибкой с числом записей, агент спрашивает подтверждение. Один вызов вместо
++цикла по `delete_event`, иначе на 6+ записей не хватает шагов агента.
++
++**Длительность и пересечения.** Для встречи через MCP `duration_minutes` обязателен:
++`create_event` без него отвечает ошибкой «спроси, сколько продлится» и ничего не сохраняет
++(если пользователь не знает — агент передаёт 60 и говорит об этом). В схеме и HTTP API поле
++по-прежнему необязательно: старая встреча без длительности считается часовой. Дело без
++длительности время не занимает (это срок: «сдать отчёт до 18:00»), у напоминания длительности
+ нет. В ответе у события есть `end_at` — конец занятого времени (`null`, если время не занято).
+ Если новая или перенесённая запись пересекается с активными встречами или делами с
+ длительностью, она **всё равно сохраняется**, а пересечения приходят в `conflicts` — агент
+diff --git a/mcp_server/server.py b/mcp_server/server.py
+index f7c1191..341fd72 100644
+--- a/mcp_server/server.py
++++ b/mcp_server/server.py
+@@ -24,6 +24,7 @@ from common.db import create_pool
+ from common.embeddings import build_embedder
+ from common.repository import EventRepository
+ from common.schemas import (
++    DEFAULT_MEETING_MINUTES,
+     MAX_DURATION_MINUTES,
+     Event,
+     EventCreate,
+@@ -50,9 +51,10 @@ Duration = Annotated[
+     int | None,
+     Field(
+         description=(
+-            "Длительность в минутах, только если пользователь её назвал: «на полчаса» → 30, "
+-            "«на два часа» → 120, «с 15 до 17» → 120. Иначе null: встреча по умолчанию "
+-            "длится час, дело без длительности время не занимает. У напоминания — всегда null."
++            "Длительность в минутах: «на полчаса» → 30, «на два часа» → 120, «с 15 до 17» → 120. "
++            "Для meeting обязательна: не назвали — сначала спроси пользователя; ответил "
++            "«не знаю» — передай 60. Для task — только если назвали, иначе null. "
++            "У reminder — всегда null: назвали длительность у «напомни» — это task."
+         ),
+         ge=1,
+         le=MAX_DURATION_MINUTES,
+@@ -128,7 +130,8 @@ async def create_event(
+     """Создать задачу, напоминание или встречу.
+ 
+     Если пользователь не назвал время встречи или напоминания — не вызывай тул,
+-    а сначала спроси время.
++    а сначала спроси время. У встречи так же нужна длительность: не назвали — спроси,
++    сколько она продлится (можно одним вопросом со временем).
+     Если время пересекается с другими встречами или делами, запись всё равно сохраняется,
+     а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
+     """
+@@ -151,6 +154,16 @@ async def create_event(
+             "Проверь вычисление даты или уточни у пользователя."
+         )
+ 
++    # Длительность встречи решает, с чем она пересечётся, поэтому не подставляем час молча:
++    # пусть агент спросит. «Не знаю» — тоже ответ: тогда агент сам передаст 60 и скажет об этом.
++    # Проверка только здесь, а не в EventCreate: HTTP API и старые записи живут без длительности.
++    if data.type == EventType.MEETING and data.duration_minutes is None:
++        raise ToolError(
++            "Не указана длительность встречи. Запись не создана: спроси пользователя, "
++            "сколько продлится встреча. Если он не знает — вызови тул снова с "
++            f"duration_minutes={DEFAULT_MEETING_MINUTES} и скажи, что поставил час."
++        )
++
+     repo = _repo(ctx)
+     event = await repo.create(data)
+     conflicts = await repo.find_conflicts(event)
+@@ -351,6 +364,46 @@ async def delete_event(user_id: UserId, event_id: EventId, ctx: Context) -> Even
+     return event
+ 
+ 
++@mcp.tool
++async def delete_events(
++    user_id: UserId,
++    ctx: Context,
++    event_types: Annotated[
++        list[EventTypeName] | None,
++        Field(
++            description=(
++                'Какие типы удалить: «все задачи и напоминания» → ["task", "reminder"], '
++                "«вообще всё» → null."
++            )
++        ),
++    ] = None,
++    confirmed: Annotated[
++        bool,
++        Field(description="true только после того, как пользователь ответил «да» на вопрос."),
++    ] = False,
++) -> list[Event]:
++    """Удалить сразу ВСЕ записи пользователя заданных типов.
++
++    Для «удали все мои задачи», «очисти всё». Для одной записи используй delete_event.
++    Действие необратимо для пользователя, поэтому без confirmed=true тул ничего не удаляет:
++    он ответит, сколько записей будет удалено, а ты спросишь подтверждение через ask_user.
++    """
++    types = [EventType(t) for t in event_types] if event_types else None
++    repo = _repo(ctx)
++    if not confirmed:
++        count = await repo.cancel_all(user_id, types, dry_run=True)
++        if count == 0:
++            raise ToolError("Записей такого типа нет — удалять нечего. Так и скажи пользователю.")
++        raise ToolError(
++            f"Ничего не удалено: будет удалено записей — {count}. Спроси через ask_user: "
++            f"«Удалить все записи ({count} шт.)? Это нельзя отменить.» Ответил «да» — "
++            "вызови тул снова с confirmed=true; «нет» — ничего не делай."
++        )
++    deleted = await repo.cancel_all(user_id, types)
++    logger.info("bulk deleted %d events user=%s types=%s", len(deleted), user_id, event_types)
++    return deleted
++
++
+ @mcp.custom_route("/health", methods=["GET"])
+ async def health(_: Request) -> JSONResponse:
+     return JSONResponse({"status": "ok"})
+diff --git a/pyproject.toml b/pyproject.toml
+index e82f96e..fbb3b33 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -16,7 +16,7 @@ dependencies = [
+ # Владельцы bot / agent дописывают сюда свои зависимости.
+ [dependency-groups]
+ mcp = ["fastmcp>=4.1"]
+-api = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
++api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "python-multipart>=0.0.9"]
+ bot = [
+     "httpx>=0.27",
+     "fastapi>=0.115",
+@@ -26,6 +26,10 @@ bot = [
+     # тянет PyAV для декодирования голосовых. ASR_PROVIDER=http/disabled этого не требует,
+     # но ставим всегда: один образ на все варианты проще, чем выбор зависимостей на сборке.
+     "faster-whisper>=1.0",
++    # faster-whisper 1.2.1 зовёт av.open(..., metadata_errors=...) — аргумент убрали
++    # в av==19: "TypeError: open() got an unexpected keyword argument 'metadata_errors'".
++    # Без верхней границы uv берёт av 19.x и распознавание голоса падает на каждом файле.
++    "av<19",
+ ]
+ agent = ["fastmcp>=4.1", "fastapi>=0.115", "uvicorn[standard]>=0.30", "openai>=1.50", "redis>=5.0"]
+ dev = [
+diff --git a/tests/test_agent.py b/tests/test_agent.py
+index cd4869c..4fd914e 100644
+--- a/tests/test_agent.py
++++ b/tests/test_agent.py
+@@ -119,6 +119,7 @@ async def test_tools_hide_user_id_and_have_no_anyof():
+         "update_event",
+         "complete_event",
+         "delete_event",
++        "delete_events",
+         "ask_user",
+     ]
+ 
+@@ -166,6 +167,21 @@ def test_prompt_has_time_and_calendar(tz):
+     assert "2026-11-02: понедельник, 2 ноября" in prompt
+ 
+ 
++def test_prompt_forbids_inventing_hour_and_retelling_description(tz):
++    """Три правила против багов, которые ловились на живом GigaChat: выдуманный час,
++    молча потерянная длительность и пересказ description вместо полей записи."""
++    prompt = build_system_prompt(datetime(2026, 10, 29, 19, 45, tzinfo=tz))
++    assert "«завтра», «в пятницу», «15 ноября») — это не время" in prompt
++    assert "Никогда не подставляй час сам" in prompt
++    assert "создавай task со временем и длительностью" in prompt
++    assert "Поле description — это исходная фраза пользователя" in prompt
++    # Живой тест: «напомни о вылете в 20:00» бот поставил ровно на 20:00 — слишком поздно.
++    assert "время самого\n   события, а не напоминания" in prompt
++    assert "за сколько напомнить" in prompt
++    # Живой тест: на «днём» бот ответил «напомню завтра днём» — без часа, и человек не узнал 13:00.
++    assert "Ответ «напомню завтра днём» без часа — ошибка" in prompt
++
++
+ # --- сценарии -----------------------------------------------------------------
+ 
+ 
+@@ -210,32 +226,34 @@ async def test_model_cannot_choose_user_id(make_agent, pool):
+ async def test_clarification_then_create(make_agent, tz, redis):
+     start = tomorrow_at(tz, 15)
+     agent, llm = make_agent(
+-        tool_call("ask_user", {"question": "На какое время поставить встречу?"}),
++        tool_call("ask_user", {"question": "Во сколько встреча и сколько она продлится?"}),
+         tool_call(
+             "create_event",
+             {
+                 "event_type": "meeting",
+                 "name": "Встреча с дизайнером",
+                 "start_at": start.isoformat(),
++                "duration_minutes": 90,
+             },
+         ),
+-        text("Поставил встречу с дизайнером на завтра, 15:00."),
++        text("Поставил встречу с дизайнером на завтра, с 15:00 до 16:30."),
+     )
+ 
+     first = await agent.handle(USER, "Поставь встречу с дизайнером на завтра")
+     assert first.status == AgentStatus.NEED_CLARIFICATION
+-    assert first.reply_text == "На какое время поставить встречу?"
++    assert first.reply_text == "Во сколько встреча и сколько она продлится?"
+ 
+-    second = await agent.handle(USER, "В три часа дня")
++    second = await agent.handle(USER, "В три часа дня, на полтора часа")
+     assert second.status == AgentStatus.DONE
+     assert second.events[0].name == "Встреча с дизайнером"
++    assert second.events[0].end_at == start + timedelta(minutes=90)
+ 
+     # Второй запрос к LLM содержит первый обмен: так модель склеивает уточнение с просьбой.
+     sent = [m["content"] for m in llm.requests[1]["messages"] if m["role"] in ("user", "assistant")]
+     assert sent[:3] == [
+         "Поставь встречу с дизайнером на завтра",
+-        "На какое время поставить встречу?",
+-        "В три часа дня",
++        "Во сколько встреча и сколько она продлится?",
++        "В три часа дня, на полтора часа",
+     ]
+ 
+     history = await ConversationMemory(redis, 10, 60).load(USER)
+@@ -256,6 +274,32 @@ async def test_tool_error_goes_back_to_llm(make_agent):
+     assert response.events == []
+ 
+ 
++async def test_meeting_duration_unknown_falls_back_to_hour(make_agent, tz, pool):
++    """Модель забыла спросить длительность → тул отказал с подсказкой → модель спросила →
++    «не знаю» → встреча на час. Проверяем, что подсказка тула доходит до модели и что
++    до ответа пользователя в базе ничего не появилось."""
++    start = tomorrow_at(tz, 15)
++    meeting = {"event_type": "meeting", "name": "Встреча с Олей", "start_at": start.isoformat()}
++    agent, llm = make_agent(
++        tool_call("create_event", meeting),
++        tool_call("ask_user", {"question": "Сколько продлится встреча?"}, call_id="call_2"),
++        tool_call("create_event", {**meeting, "duration_minutes": 60}),
++        text("Поставил встречу с Олей завтра в 15:00 на час — если нужно, поменяю."),
++    )
++
++    first = await agent.handle(USER, "Встреча с Олей завтра в 15")
++    error = json.loads(llm.requests[1]["messages"][-1]["content"])
++    assert "длительность встречи" in error["error"]
++    assert first.status == AgentStatus.NEED_CLARIFICATION
++    assert first.reply_text == "Сколько продлится встреча?"
++    assert await pool.fetchval("SELECT count(*) FROM events") == 0
++
++    second = await agent.handle(USER, "Не знаю")
++    assert second.status == AgentStatus.DONE
++    assert second.events[0].duration_minutes == 60
++    assert second.events[0].end_at == start + timedelta(hours=1)
++
++
+ async def test_list_today(make_agent, tz):
+     start = tomorrow_at(tz, 9)
+     day = start.replace(hour=0)
+@@ -303,6 +347,54 @@ async def test_update_event_reschedule(make_agent, tz, pool):
+     )
+ 
+ 
++async def test_delete_all_fits_in_step_limit_with_confirmation(make_agent, pool):
++    """Регрессия живого теста: «удали все задачи» упиралось в лимит шагов («Запутался»)."""
++    for i in range(10):
++        await pool.execute(
++            "INSERT INTO events (user_id, type, name, description) VALUES ($1, 'task', $2, '')",
++            USER,
++            f"Дело {i}",
++        )
++    kinds = {"event_types": ["task", "reminder"]}
++    agent, llm = make_agent(
++        tool_call("delete_events", kinds),
++        tool_call("ask_user", {"question": "Удалить все записи (10 шт.)?"}, call_id="call_2"),
++        tool_call("delete_events", {**kinds, "confirmed": True}),
++        text("Удалил 10 записей."),
++    )
++
++    first = await agent.handle(USER, "Удали все мои задачи и напоминания")
++    assert first.status == AgentStatus.NEED_CLARIFICATION
++    assert (
++        "будет удалено записей — 10"
++        in json.loads(llm.requests[1]["messages"][-1]["content"])["error"]
++    )
++    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 10
++
++    second = await agent.handle(USER, "Да")
++    assert second.status == AgentStatus.DONE
++    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 0
++
++
++async def test_reminder_with_duration_becomes_task(make_agent, tz, pool):
++    """Названную длительность нельзя терять: тул отказывает, модель пересоздаёт как дело."""
++    start = tomorrow_at(tz, 10)
++    args = {"name": "Самолёт в Нижний Новгород", "start_at": start.isoformat()}
++    agent, llm = make_agent(
++        tool_call("create_event", {**args, "event_type": "reminder", "duration_minutes": 120}),
++        tool_call("create_event", {**args, "event_type": "task", "duration_minutes": 120}),
++        text("Поставил как дело завтра с 10:00 до 12:00 — у напоминаний длительности не бывает."),
++    )
++    response = await agent.handle(USER, "Напомни, завтра в 10 самолёт, на два часа")
++
++    error = json.loads(llm.requests[1]["messages"][-1]["content"])
++    assert "создавай task" in error["error"]
++    assert response.status == AgentStatus.DONE
++    assert response.events[0].duration_minutes == 120
++    assert response.events[0].end_at == start + timedelta(hours=2)
++    assert await pool.fetchval("SELECT type FROM events") == "task"
++
++
+ async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool):
+     """Пересечение: запись сохраняется, модель видит conflicts, а пересекающаяся встреча
+     попадает в скрытую сводку — «перенеси ту встречу» работает следующим сообщением."""
+@@ -313,6 +405,7 @@ async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool)
+                 "event_type": "meeting",
+                 "name": "Созвон с Иваном",
+                 "start_at": tomorrow_at(tz, 15).isoformat(),
++                "duration_minutes": 60,
+             },
+         ),
+         text("Поставил созвон с Иваном завтра в 15:00."),
+diff --git a/tests/test_calendar_import.py b/tests/test_calendar_import.py
+new file mode 100644
+index 0000000..4fba69b
+--- /dev/null
++++ b/tests/test_calendar_import.py
+@@ -0,0 +1,119 @@
++"""Импорт тестового календаря из CSV: разбор файла и попадание строк в общий календарь."""
++
++from datetime import datetime, timedelta
++
++import pytest
++
++from common.calendar_import import (
++    IMPORTED_DURATION_MINUTES,
++    CalendarImportError,
++    parse_calendar_csv,
++)
++from common.repository import EventRepository
++from common.schemas import EventCreate, EventType
++
++USER = "user-1"
++
++HEADER = "id,date,time,text\n"
++THREE_ROWS = HEADER + (
++    "1,2024-01-07,14:45,Подготовить техническое задание\n"
++    "2,2024-01-12,13:45,Отправить договор Ивану\n"
++    "3,2024-01-14,14:30,Отправить итоги встречи Марии\n"
++)
++
++
++def test_parses_rows_with_user_timezone(tz):
++    rows, errors = parse_calendar_csv(THREE_ROWS.encode(), tz)
++    assert errors == []
++    assert [r.external_id for r in rows] == ["1", "2", "3"]
++    assert rows[0].name == "Подготовить техническое задание"
++    assert rows[0].start_at == datetime(2024, 1, 7, 14, 45, tzinfo=tz)
++
++
++def test_excel_bom_does_not_break_first_column(tz):
++    """Excel пишет CSV с BOM, и наивный разбор видит колонку «﻿id» вместо «id»."""
++    rows, errors = parse_calendar_csv(b"\xef\xbb\xbf" + THREE_ROWS.encode(), tz)
++    assert errors == [] and len(rows) == 3
++
++
++def test_missing_columns_rejected(tz):
++    with pytest.raises(CalendarImportError, match="time, text"):
++        parse_calendar_csv(b"id,date\n1,2024-01-07\n", tz)
++
++
++def test_empty_file_rejected(tz):
++    with pytest.raises(CalendarImportError, match="ни одной строки"):
++        parse_calendar_csv(HEADER.encode(), tz)
++
++
++def test_bad_rows_are_skipped_but_good_ones_load(tz):
++    data = HEADER + (
++        "1,2024-01-07,14:45,Хорошая строка\n"
++        "2,07.01.2024,14:45,Дата не в том формате\n"
++        "3,2024-01-07,25:99,Время не в том формате\n"
++        "4,2024-01-07,14:45,\n"
++        ",2024-01-07,14:45,Без id\n"
++        "1,2024-01-08,10:00,Повтор id из первой строки\n"
++    )
++    rows, errors = parse_calendar_csv(data.encode(), tz)
++
++    assert [r.external_id for r in rows] == ["1"]
++    assert len(errors) == 5
++    assert "строка 3" in errors[0] and "ГГГГ-ММ-ДД" in errors[0]
++    assert "ЧЧ:ММ" in errors[1]
++    assert "повторяется" in errors[4]
++
++
++def test_long_text_truncated_to_column_limit(tz):
++    rows, _ = parse_calendar_csv((HEADER + f"1,2024-01-07,14:45,{'я' * 300}\n").encode(), tz)
++    assert len(rows[0].name) == 200
++
++
++async def test_import_is_idempotent_and_visible_in_calendar(repo: EventRepository, tz):
++    """Повторная загрузка того же файла не плодит дубли, а события видны как обычные."""
++    rows, _ = parse_calendar_csv(THREE_ROWS.encode(), tz)
++
++    assert await repo.import_calendar(USER, rows) == 3
++    assert await repo.import_calendar(USER, rows) == 0  # тот же файл второй раз
++
++    day = datetime(2024, 1, 7, tzinfo=tz)
++    found = await repo.list_by_period(USER, day, day + timedelta(days=1))
++    assert [e.name for e in found] == ["Подготовить техническое задание"]
++    assert found[0].duration_minutes == IMPORTED_DURATION_MINUTES
++
++
++async def test_imported_event_is_found_by_text_search(repo: EventRepository, tz):
++    rows, _ = parse_calendar_csv(THREE_ROWS.encode(), tz)
++    await repo.import_calendar(USER, rows)
++
++    hits = await repo.search(USER, "договор")
++    assert [h.name for h in hits] == ["Отправить договор Ивану"]
++
++
++async def test_imported_event_occupies_time_and_conflicts(repo: EventRepository, tz):
++    """Главное требование ТЗ: загруженный календарь учитывается при создании новых встреч."""
++    rows, _ = parse_calendar_csv(THREE_ROWS.encode(), tz)
++    await repo.import_calendar(USER, rows)
++
++    meeting = await repo.create(
++        EventCreate(
++            user_id=USER,
++            type=EventType.MEETING,
++            name="Новая встреча",
++            start_at=datetime(2024, 1, 7, 15, 0, tzinfo=tz),  # внутри слота 14:45–15:45
++            duration_minutes=30,
++        )
++    )
++    conflicts = await repo.find_conflicts(meeting)
++    assert [c.name for c in conflicts] == ["Подготовить техническое задание"]
++
++
++async def test_import_separates_users(repo: EventRepository, tz):
++    rows, _ = parse_calendar_csv(THREE_ROWS.encode(), tz)
++    await repo.import_calendar(USER, rows)
++    # Тот же внешний id у другого пользователя — отдельная запись, а не конфликт.
++    assert await repo.import_calendar("user-2", rows) == 3
++
++    day = datetime(2024, 1, 7, tzinfo=tz)
++    mine = await repo.list_by_period(USER, day, day + timedelta(days=1))
++    assert len(mine) == 1
+diff --git a/tests/test_conflicts.py b/tests/test_conflicts.py
+index 7a465df..82fa3d7 100644
+--- a/tests/test_conflicts.py
++++ b/tests/test_conflicts.py
+@@ -168,6 +168,7 @@ async def test_create_warns_but_still_saves(client, tz):
+             "event_type": "meeting",
+             "name": "Созвон с Иваном",
+             "start_at": tomorrow(tz, 15).isoformat(),
++            "duration_minutes": 60,
+         },
+     )
+     assert first.structured_content["conflicts"] == []
+@@ -197,6 +198,7 @@ async def test_update_into_busy_slot_warns_and_skips_itself(client, tz):
+             "event_type": "meeting",
+             "name": "Планёрка",
+             "start_at": tomorrow(tz, 10).isoformat(),
++            "duration_minutes": 60,
+         },
+     )
+     other = await client.call_tool(
+@@ -206,6 +208,7 @@ async def test_update_into_busy_slot_warns_and_skips_itself(client, tz):
+             "event_type": "meeting",
+             "name": "Созвон",
+             "start_at": tomorrow(tz, 14).isoformat(),
++            "duration_minutes": 60,
+         },
+     )
+     event_id = other.structured_content["id"]
+diff --git a/tests/test_mcp.py b/tests/test_mcp.py
+index 30a980c..9cc8887 100644
+--- a/tests/test_mcp.py
++++ b/tests/test_mcp.py
+@@ -29,9 +29,53 @@ async def test_tools_are_listed(client):
+         "update_event",
+         "complete_event",
+         "delete_event",
++        "delete_events",
+     }
+ 
+ 
++async def test_bulk_delete_asks_confirmation_then_deletes_only_mine(client, pool, tz):
++    start = datetime.now(tz).replace(minute=0, second=0, microsecond=0) + timedelta(hours=3)
++    for i in range(8):  # больше лимита шагов агента: цикл по одной записи не пролез бы
++        await client.call_tool(
++            "create_event", {"user_id": USER, "event_type": "task", "name": f"Дело {i}"}
++        )
++    await client.call_tool(
++        "create_event",
++        {"user_id": USER, "event_type": "reminder", "name": "Зарядка", "start_at": iso(start)},
++    )
++    await client.call_tool(
++        "create_event",
++        {
++            "user_id": USER,
++            "event_type": "meeting",
++            "name": "Встреча",
++            "start_at": iso(start),
++            "duration_minutes": 30,
++        },
++    )
++    await client.call_tool(
++        "create_event", {"user_id": "someone-else", "event_type": "task", "name": "Чужое"}
++    )
++    args = {"user_id": USER, "event_types": ["task", "reminder"]}
++
++    # Без подтверждения — ничего не удалено, а в тексте число для вопроса пользователю.
++    asked = await client.call_tool("delete_events", args, raise_on_error=False)
++    assert asked.is_error and "будет удалено записей — 9" in asked.content[0].text
++    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'cancelled'") == 0
++
++    done = await client.call_tool("delete_events", {**args, "confirmed": True})
++    assert len(done.structured_content["result"]) == 9
++    left = await pool.fetch("SELECT name FROM events WHERE status <> 'cancelled' ORDER BY name")
++    assert [r["name"] for r in left] == ["Встреча", "Чужое"]  # встреча и чужая задача целы
++
++
++async def test_bulk_delete_with_nothing_to_delete(client):
++    result = await client.call_tool(
++        "delete_events", {"user_id": USER, "event_types": ["task"]}, raise_on_error=False
++    )
++    assert result.is_error and "удалять нечего" in result.content[0].text
++
++
+ async def test_create_and_get_today(client, tz):
+     start = datetime.now(tz).replace(minute=0, second=0, microsecond=0) + timedelta(hours=2)
+     created = await client.call_tool(
+@@ -42,6 +86,7 @@ async def test_create_and_get_today(client, tz):
+             "name": "Встреча с командой",
+             "description": "Добавь встречу с командой через два часа",
+             "start_at": iso(start),
++            "duration_minutes": 60,
+         },
+     )
+     assert created.structured_content["name"] == "Встреча с командой"
+@@ -69,6 +114,70 @@ async def test_meeting_without_time_is_rejected_with_reason(client):
+     assert "нужно указать дату и время" in result.content[0].text
+ 
+ 
++async def test_meeting_without_duration_asks_instead_of_guessing(client, pool, tz):
++    """Время есть, длительности нет: не сохраняем с часом молча, а просим агента спросить."""
++    start = datetime.now(tz).replace(minute=0, second=0, microsecond=0) + timedelta(hours=3)
++    args = {
++        "user_id": USER,
++        "event_type": "meeting",
++        "name": "Встреча с Олей",
++        "start_at": iso(start),
++    }
++
++    result = await client.call_tool("create_event", args, raise_on_error=False)
++    assert result.is_error
++    assert "длительность встречи" in result.content[0].text
++    assert "duration_minutes=60" in result.content[0].text  # подсказка на случай «не знаю»
++    assert await pool.fetchval("SELECT count(*) FROM events") == 0
++
++    # Пользователь ответил «не знаю» — агент передаёт час, встреча создаётся.
++    created = await client.call_tool("create_event", {**args, "duration_minutes": 60})
++    assert created.structured_content["end_at"] == iso(start + timedelta(hours=1))
++
++
++async def test_reminder_with_duration_points_to_task(client, pool, tz):
++    """«Напомни про самолёт завтра в 10, на два часа» — это не момент времени.
++    Тул отказывает и подсказывает модели создать task, чтобы названные 2 часа не пропали."""
++    start = datetime.now(tz).replace(minute=0, second=0, microsecond=0) + timedelta(hours=3)
++    args = {
++        "user_id": USER,
++        "event_type": "reminder",
++        "name": "Самолёт в Нижний Новгород",
++        "start_at": iso(start),
++        "duration_minutes": 120,
++    }
++
++    result = await client.call_tool("create_event", args, raise_on_error=False)
++    assert result.is_error
++    assert "создавай task" in result.content[0].text
++    assert await pool.fetchval("SELECT count(*) FROM events") == 0
++
++    created = await client.call_tool("create_event", {**args, "event_type": "task"})
++    assert created.structured_content["duration_minutes"] == 120
++    assert created.structured_content["end_at"] == iso(start + timedelta(hours=2))
++
++
++async def test_reminder_without_duration_has_no_end(client, tz):
++    start = datetime.now(tz).replace(minute=0, second=0, microsecond=0) + timedelta(hours=3)
++    created = await client.call_tool(
++        "create_event",
++        {"user_id": USER, "event_type": "reminder", "name": "Зарядка", "start_at": iso(start)},
++    )
++    # По этим двум полям модель обязана отвечать «длительности нет», а не пересказывать фразу.
++    assert created.structured_content["duration_minutes"] is None
++    assert created.structured_content["end_at"] is None
++
++
++async def test_duration_still_optional_for_tasks(client, tz):
++    start = datetime.now(tz).replace(minute=0, second=0, microsecond=0) + timedelta(hours=3)
++    created = await client.call_tool(
++        "create_event",
++        {"user_id": USER, "event_type": "task", "name": "Отчёт", "start_at": iso(start)},
++    )
++    assert created.structured_content["duration_minutes"] is None
++    assert created.structured_content["end_at"] is None
++
++
+ async def test_time_in_past_is_rejected(client, tz):
+     result = await client.call_tool(
+         "create_event",
+diff --git a/tests/test_reminders.py b/tests/test_reminders.py
+new file mode 100644
+index 0000000..ad88f15
+--- /dev/null
++++ b/tests/test_reminders.py
+@@ -0,0 +1,124 @@
++"""Автоматическая отправка напоминаний: планировщик берёт наступившее из базы и шлёт в MAX."""
++
++from datetime import datetime, timedelta
++from uuid import uuid4
++
++import pytest
++
++from bot.reminders import ReminderSender, format_notification
++from common.calendar_import import parse_calendar_csv
++from common.repository import EventRepository
++from common.schemas import Event, EventCreate, EventStatus, EventType
++
++USER = "100500"
++
++
++class FakeMax:
++    """Вместо настоящего MAX: записывает отправленное, умеет падать по требованию."""
++
++    def __init__(self, fail: bool = False) -> None:
++        self.sent: list[tuple[int, str]] = []
++        self.fail = fail
++
++    async def send(self, chat_id: int, text: str, *, to_user: bool = False) -> None:
++        if self.fail:
++            raise OSError("MAX недоступен")
++        self.sent.append((chat_id, text))
++
++
++@pytest.fixture
++def sender(repo, tz):
++    def build(max_api, lookback_minutes: int = 60) -> ReminderSender:
++        return ReminderSender(repo, max_api, tz, lookback_minutes=lookback_minutes)
++
++    return build
++
++
++async def add(repo: EventRepository, start_at, type_=EventType.REMINDER, name="Позвонить Ивану"):
++    return await repo.create(EventCreate(user_id=USER, type=type_, name=name, start_at=start_at))
++
++
++async def test_sends_due_reminder_once(repo, sender, tz):
++    now = datetime.now(tz).replace(microsecond=0)
++    await add(repo, now - timedelta(minutes=1))
++    max_api = FakeMax()
++
++    assert await sender(max_api).tick(now) == 1
++    assert max_api.sent == [(int(USER), "Напоминание: Позвонить Ивану")]
++
++    # Второй тик (и перезапуск сервиса) повтором не оборачивается: отметка в базе.
++    assert await sender(max_api).tick(now) == 0
++    assert len(max_api.sent) == 1
++
++
++async def test_future_reminder_waits(repo, sender, tz):
++    now = datetime.now(tz).replace(microsecond=0)
++    await add(repo, now + timedelta(minutes=5))
++    max_api = FakeMax()
++
++    assert await sender(max_api).tick(now) == 0
++    assert await sender(max_api).tick(now + timedelta(minutes=6)) == 1
++
++
++async def test_old_events_are_not_blasted_after_downtime(repo, sender, tz):
++    """В импортированном календаре есть прошлогодние даты: вывалить их пользователю нельзя."""
++    now = datetime.now(tz).replace(microsecond=0)
++    old_csv = "id,date,time,text\n1,2024-01-07,14:45,Старое дело\n".encode()
++    rows, _ = parse_calendar_csv(old_csv, tz)
++    await repo.import_calendar(USER, rows)
++    await add(repo, now - timedelta(hours=5), name="Напоминание из вчера")
++    await add(repo, now - timedelta(minutes=10), name="Только что наступило")
++    max_api = FakeMax()
++
++    assert await sender(max_api).tick(now) == 1
++    assert "Только что наступило" in max_api.sent[0][1]
++
++
++async def test_done_and_cancelled_are_skipped(repo, sender, tz):
++    now = datetime.now(tz).replace(microsecond=0)
++    done = await add(repo, now - timedelta(minutes=1), name="Выполненное")
++    await repo.set_status(USER, done.id, EventStatus.DONE)
++    cancelled = await add(repo, now - timedelta(minutes=1), name="Удалённое")
++    await repo.set_status(USER, cancelled.id, EventStatus.CANCELLED)
++    max_api = FakeMax()
++
++    assert await sender(max_api).tick(now) == 0
++
++
++async def test_failed_send_is_retried_next_tick(repo, sender, tz):
++    now = datetime.now(tz).replace(microsecond=0)
++    await add(repo, now - timedelta(minutes=1))
++
++    broken = FakeMax(fail=True)
++    assert await sender(broken).tick(now) == 0  # MAX лежал — отметку сняли обратно
++
++    working = FakeMax()
++    assert await sender(working).tick(now) == 1
++    assert len(working.sent) == 1
++
++
++async def test_meeting_notification_mentions_time(repo, sender, tz):
++    now = datetime.now(tz).replace(microsecond=0)
++    start = now - timedelta(minutes=1)
++    await add(repo, start, type_=EventType.MEETING, name="Созвон с Иваном")
++    max_api = FakeMax()
++
++    await sender(max_api).tick(now)
++    assert max_api.sent[0][1] == f"Напоминание: встреча «Созвон с Иваном» в {start:%H:%M}"
++
++
++def test_reminder_text_matches_spec(tz):
++    """Текст из ТЗ дословно: «Напоминание: позвонить Ивану.»"""
++    now = datetime.now(tz)
++    event = Event(
++        id=uuid4(),
++        user_id=USER,
++        type=EventType.REMINDER,
++        name="позвонить Ивану",
++        description="",
++        start_at=now,
++        status=EventStatus.ACTIVE,
++        created_at=now,
++        updated_at=now,
++    )
++    assert format_notification(event) == "Напоминание: позвонить Ивану"
+diff --git a/uv.lock b/uv.lock
+index 249af07..550bbcf 100644
+--- a/uv.lock
++++ b/uv.lock
+@@ -136,28 +136,28 @@ wheels = [
+ 
+ [[package]]
+ name = "av"
+-version = "19.0.2"
+-source = { registry = "https://pypi.org/simple" }
+-sdist = { url = "https://files.pythonhosted.org/packages/23/01/76b6bf563fe907597cf58f10d10168e93fe588b6db9f2658db87e87efa7e/av-19.0.2.tar.gz", hash = "sha256:bebbc52598886480f4d861c575dc2b020785d6c04e1308680ddcc545e1b94c66", size = 4277157, upload-time = "2026-10-21T03:45:30.799Z" }
+-wheels = [
+-    { url = "https://files.pythonhosted.org/packages/4a/2f/f51f37820741134516e841053d5ecebf6350fbd451adcbff9ead96aa1244/av-19.0.2-cp312-abi3-macosx_11_0_x86_64.whl", hash = "sha256:f5f7bcf987567cd3f9b01f1c375c59bf59d8a5b98c9c5c154aeda7a11e0c5dce", size = 22627374, upload-time = "2026-10-21T03:44:28.296Z" },
+-    { url = "https://files.pythonhosted.org/packages/7c/42/067d0bcd2c07103f18cc23b510a8289dd80330e984c49d51ce0bafcee017/av-19.0.2-cp312-abi3-macosx_14_0_arm64.whl", hash = "sha256:b0dff6dfcc6ff9944fbbff15bc4ee2d90a2c1695d493bdea96e86f48823e9feb", size = 18556422, upload-time = "2026-10-21T03:44:31.267Z" },
+-    { url = "https://files.pythonhosted.org/packages/de/0c/448f89f76cf5e4da35dd6294a1e8155b75daa8839f2f2fa353775855d152/av-19.0.2-cp312-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:04c8e412642c652cb2b1997a9cb2114546ee7d894600c631f4be8ceb26a0d0d2", size = 32683287, upload-time = "2026-10-21T03:44:34.588Z" },
+-    { url = "https://files.pythonhosted.org/packages/e1/7f/9f1237feb894afa472ef834aa1fbfe4d6398f28dc7e86a1b418650204c36/av-19.0.2-cp312-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:9c1da7aad0fa6c13b4a5c1e7985be0d13f8526a96284573acaf3d55ead6d3fe8", size = 34990159, upload-time = "2026-10-21T03:44:37.637Z" },
+-    { url = "https://files.pythonhosted.org/packages/f1/b5/1bde0e54e525d88ad8f5becae657f8142543fd3be9d10b72141f041ca868/av-19.0.2-cp312-abi3-manylinux_2_31_armv7l.whl", hash = "sha256:9d4f9f78c0ce1f20deb72626fdb3c723757f61a8cd6fbb7dd44d9401884a91fd", size = 44422922, upload-time = "2026-10-21T03:44:41.847Z" },
+-    { url = "https://files.pythonhosted.org/packages/08/21/65997929fa4dd7c20f64e742aa87205a8d65485718a2ab51633756078e83/av-19.0.2-cp312-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:dfe7af5aa8243afd5d4778f85ad1a7c948e37fad272869da1f8f93f8d57fa7ad", size = 33754699, upload-time = "2026-10-21T03:44:45.772Z" },
+-    { url = "https://files.pythonhosted.org/packages/30/44/4de8c0ff5a5e25ceb0841efc0a4a7530a22d61800bc0cc19a1d03aa04358/av-19.0.2-cp312-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:44d3faae747cf04a33f39db8ae983ff3d93adc864ee663bc186b25b686803c3e", size = 36014845, upload-time = "2026-10-21T03:44:49.64Z" },
+-    { url = "https://files.pythonhosted.org/packages/32/5a/743a83666ded197df8b9957e2800bef9a39d52b23be2ca211bbd14b5fb22/av-19.0.2-cp312-abi3-win_amd64.whl", hash = "sha256:3ce5a1d7b916d13c16ac58f1756f0fee4af2d53f02bc1403e18550b50d375a22", size = 28150949, upload-time = "2026-10-21T03:44:53.434Z" },
+-    { url = "https://files.pythonhosted.org/packages/42/fe/e79d786628d9c0428f72214dbe4b90ee0c625e04d552a604d5235ff35515/av-19.0.2-cp312-abi3-win_arm64.whl", hash = "sha256:79a277b077e3768a0ea9f881ca0b3bc96d4135a8d3a7a579938adb58718d0dfd", size = 20708023, upload-time = "2026-10-21T03:44:56.435Z" },
+-    { url = "https://files.pythonhosted.org/packages/08/f5/e7988f64d3debf50748f1c4372a3dac70cfe53720563056cb57bd77771a6/av-19.0.2-cp314-cp314t-macosx_11_0_x86_64.whl", hash = "sha256:b632e026f4375037438a6b2b5d6a489e55bc9504fad22078991ef96211bec2a9", size = 22911715, upload-time = "2026-10-21T03:44:59.378Z" },
+-    { url = "https://files.pythonhosted.org/packages/76/86/dbe91321e6b233970c7fdfdb82cb1750a745e5779ab9ee69a6ce2589b1cb/av-19.0.2-cp314-cp314t-macosx_14_0_arm64.whl", hash = "sha256:32a8d37bde9e24ad0cc855140cbeecde17a363d7dc7928dcfc71a34b5f3ed387", size = 18864540, upload-time = "2026-10-21T03:45:02.227Z" },
+-    { url = "https://files.pythonhosted.org/packages/5a/c7/afca86772d825f5eb5fd8d1a193b206ed9a4a0d74ffbe5bbe0a19521ed7d/av-19.0.2-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:1e7cb7b66a832bce8996af5b94f1cf4014a05ff51e0005feac4cb2566d711020", size = 36479296, upload-time = "2026-10-21T03:45:05.955Z" },
+-    { url = "https://files.pythonhosted.org/packages/b3/71/6c6fc7e80dd5aa71109cb9324638620c40b7de8f677a6446d2f744295587/av-19.0.2-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:b559ff381bd800c46fee6a17d7e22a3443708cdd58d0901ae91d27cf5dd0578c", size = 38467551, upload-time = "2026-10-21T03:45:09.493Z" },
+-    { url = "https://files.pythonhosted.org/packages/3f/93/fa67f5d4180e57e7f740053fd855a6d312f4848f1e5582b8d3ab131184dd/av-19.0.2-cp314-cp314t-manylinux_2_31_armv7l.whl", hash = "sha256:91924f5c836b1cbf89fe1522c642f98e89a733124908561fd49dc7a70e9b6d10", size = 46223361, upload-time = "2026-10-21T03:45:13.396Z" },
+-    { url = "https://files.pythonhosted.org/packages/25/f9/f98627770ccb4761e8cb87edd8b4bcf91549288bca95130c1a91ea7cdcb8/av-19.0.2-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:ae4618eab172f8135596972252f39c7399291c921e661c1771ba26b9254b800f", size = 37349208, upload-time = "2026-10-21T03:45:17.213Z" },
+-    { url = "https://files.pythonhosted.org/packages/7e/3a/183b4f96a604a8544180e256d16f9a6c0534d6b7db22dc22fb0842aa96fc/av-19.0.2-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:8596fad2017d380708de35ddf9d34f808b8488c912cdc3f361691d866d9dc32d", size = 39475989, upload-time = "2026-10-21T03:45:20.658Z" },
+-    { url = "https://files.pythonhosted.org/packages/22/6e/84b65c58171a6d75a5d129a9cf856ca730843f8c476f08033e7f9d4a1af6/av-19.0.2-cp314-cp314t-win_amd64.whl", hash = "sha256:9db27c2248112a8eed3edd3ca83cf4405f52a402cda2eb1956035e646e6b99c6", size = 29064804, upload-time = "2026-10-21T03:45:24.24Z" },
+-    { url = "https://files.pythonhosted.org/packages/60/4e/d96cc9fff457069c52754f63151a0340cb4886330d58e09061f203696b60/av-19.0.2-cp314-cp314t-win_arm64.whl", hash = "sha256:0e425d631510ca21e47c58f3837a9dceae0453c24e926408c8a12b95239cbbd6", size = 21916888, upload-time = "2026-10-21T03:45:27.298Z" },
++version = "18.1.0"
++source = { registry = "https://pypi.org/simple" }
++sdist = { url = "https://files.pythonhosted.org/packages/8d/f4/f22114d30d3435e38c6af2b4870f37b864403dca6ae7af747a289ce0a18e/av-18.1.0.tar.gz", hash = "sha256:47bfc286e1bc9de7ab4681fc2b575cd2460a66919d31ffe1bd5aa54fae531a28", size = 4451061, upload-time = "2026-08-12T22:28:18.761Z" }
++wheels = [
++    { url = "https://files.pythonhosted.org/packages/05/d4/d7cdc8bff143c17a6d35924375ae28dd692cacde38700a7d419fde54f44a/av-18.1.0-cp311-abi3-macosx_11_0_x86_64.whl", hash = "sha256:ae75d8bb6467895ed1f8572ededf7ffa49eac07f6e483222f5d7d62a41d12f04", size = 22546147, upload-time = "2026-08-12T22:27:11.851Z" },
++    { url = "https://files.pythonhosted.org/packages/3f/c9/37a619297492256b77d5ed906e7d8166c10a26ed251dccf1ae03ab19bff6/av-18.1.0-cp311-abi3-macosx_14_0_arm64.whl", hash = "sha256:b30a4e8d934558e19602b68998a4d9ac9f250fa0dacef216f7e8e40153b13316", size = 18217603, upload-time = "2026-08-12T22:27:14.713Z" },
++    { url = "https://files.pythonhosted.org/packages/d9/84/2464ffb64c08c5ce8b522c8e74594714414e3b0575267652c5c51c0574b9/av-18.1.0-cp311-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:6fc837cc51adf80331ac850779cd53b5d4c4460b0ebe9057a02a921c6736f19d", size = 33640142, upload-time = "2026-08-12T22:27:17.835Z" },
++    { url = "https://files.pythonhosted.org/packages/27/3a/204dbfc3e08eb4cdc6e6ff57be02150bc44523ebdb50182d10025792ebd9/av-18.1.0-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:8a032e8d8ebc73dec079364b9b4a6837638a2d106e8472314e685ffbf163e700", size = 35786210, upload-time = "2026-08-12T22:27:20.984Z" },
++    { url = "https://files.pythonhosted.org/packages/e1/99/b0d04ec553ff9a7e00455458dfa3a39c8a8f627b273056b4e5fe57d590de/av-18.1.0-cp311-abi3-manylinux_2_31_armv7l.whl", hash = "sha256:3c8b1f8b46f99d52e2d8b0ed5d0cdadf172d24794d46e2077b16e44ed08e26ff", size = 39379798, upload-time = "2026-08-12T22:27:24.432Z" },
++    { url = "https://files.pythonhosted.org/packages/56/b1/e00d4feae59160149df6126585e726fdc6300798fd40c5dd324879e81f68/av-18.1.0-cp311-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:ab5ac081bc9eaf54109120d4e56284674fecfbe520d9aa1707c7fa911ec5f4d2", size = 34690321, upload-time = "2026-08-12T22:27:27.769Z" },
++    { url = "https://files.pythonhosted.org/packages/dc/94/836fa987e3084d11a21489f11357fb24843ef3aa8faf74ddddfc603d5062/av-18.1.0-cp311-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:191224788d87af06c31784a395bb73f14b72f33d7f4871ace0157de2abdc6276", size = 36859932, upload-time = "2026-08-12T22:27:31.403Z" },
++    { url = "https://files.pythonhosted.org/packages/33/b4/76ba21e46704f632004276b85289a1582e95f5eff760436d6149875a1881/av-18.1.0-cp311-abi3-win_amd64.whl", hash = "sha256:ea1480b7a8d5405cb5f382b344731bf125fd2c1c6fae3964f6c48595628387ff", size = 27595679, upload-time = "2026-08-12T22:27:35.177Z" },
++    { url = "https://files.pythonhosted.org/packages/4f/ad/a3135884c5753b09773176b97201ae602f67ad14206c395ff838d66bf9b0/av-18.1.0-cp311-abi3-win_arm64.whl", hash = "sha256:5509ec12aaa19fd6601de13cfa6f4cdad450da07982118510592875d970454d6", size = 20257584, upload-time = "2026-08-12T22:27:38.472Z" },
++    { url = "https://files.pythonhosted.org/packages/4f/5b/4a756265d7fb164336c8d377bca21c39cfa2c178be23cedee840a69b59c5/av-18.1.0-cp314-cp314t-macosx_11_0_x86_64.whl", hash = "sha256:b36b0bae9e4c62f9487c99481ec15e4e3870fcc868522cd6d18fc2d6bfa04f01", size = 22795654, upload-time = "2026-08-12T22:27:42.016Z" },
++    { url = "https://files.pythonhosted.org/packages/d5/cc/1bc841462114a1adf4f7d87456ab78a6972e23271e71865fcd2bbd0e7360/av-18.1.0-cp314-cp314t-macosx_14_0_arm64.whl", hash = "sha256:025f84494cb23278498f03b0d8117d3e47a1cbc9c44b97eb31875cf02251e46b", size = 18435735, upload-time = "2026-08-12T22:27:45.787Z" },
++    { url = "https://files.pythonhosted.org/packages/b8/20/005500ed17a2e62a5e4bb94aa3786942560ec2f55ec1895ebf174c87abef/av-18.1.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:08a9ae288299cfcbf739dba4ad0c53b9b71f45184303dd45947920d022fed695", size = 37090807, upload-time = "2026-08-12T22:27:50.14Z" },
++    { url = "https://files.pythonhosted.org/packages/5c/f7/11e7f6d848d3690c31ca4f8578167393e619177f1493ccc93b9400852d4e/av-18.1.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:cf8a17466bef07765dbdecc9e66ed9b25d20b4e14f654fbf35345a58ac45fa0c", size = 38976836, upload-time = "2026-08-12T22:27:54.565Z" },
++    { url = "https://files.pythonhosted.org/packages/c3/63/b271473b24e806062d31191e40c6d65545e9cf59f80f044eba56dcbba0f4/av-18.1.0-cp314-cp314t-manylinux_2_31_armv7l.whl", hash = "sha256:d49a5c542dfdc00f43c6cdb6cc41dac1781ee206fe180b56aa7433dfa816dfae", size = 40896630, upload-time = "2026-08-12T22:27:59.118Z" },
++    { url = "https://files.pythonhosted.org/packages/6b/9f/2ab7fa292a947ad3466ed8e655eefa3b82f535d7ea598c297b4471a937c4/av-18.1.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:5548b79e2bf1f59b3e9aedc918a72d9dc45b9adaac10ff9470d5dbdda0002e47", size = 37895673, upload-time = "2026-08-12T22:28:03.98Z" },
++    { url = "https://files.pythonhosted.org/packages/e9/d8/04507c57249b399c3e4f23f01d221532f357338b5316fd2858fbd343127d/av-18.1.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:e7ea063f6690193ea335a1d592d6e0274350d45e2ed6af83ee107cb90cbfd84f", size = 39992431, upload-time = "2026-08-12T22:28:08.736Z" },
++    { url = "https://files.pythonhosted.org/packages/d6/d6/bc4b95bea9c2353a7e4d62a3fcfad9adcf0f881741c6ce01ee179d539ce3/av-18.1.0-cp314-cp314t-win_amd64.whl", hash = "sha256:e4d48b9f12cad009cc72fe4f4099107de5e819c95f82767f4fd01a01481c0661", size = 28497798, upload-time = "2026-08-12T22:28:13.003Z" },
++    { url = "https://files.pythonhosted.org/packages/c1/d2/0c277a46f12647c1833f40496e132fb6001e0d19e6144b5ea30896461feb/av-18.1.0-cp314-cp314t-win_arm64.whl", hash = "sha256:5cd9085028902c9880622bd37a12fd4b33060f06a52311f6f4867ca9f29a2c3b", size = 21421979, upload-time = "2026-08-12T22:28:16.48Z" },
+ ]
+ 
+ [[package]]
+@@ -2075,9 +2075,11 @@ agent = [
+ ]
+ api = [
+     { name = "fastapi" },
++    { name = "python-multipart" },
+     { name = "uvicorn", extra = ["standard"] },
+ ]
+ bot = [
++    { name = "av" },
+     { name = "fastapi" },
+     { name = "faster-whisper" },
+     { name = "httpx" },
+@@ -2085,6 +2087,7 @@ bot = [
+     { name = "uvicorn", extra = ["standard"] },
+ ]
+ dev = [
++    { name = "av" },
+     { name = "fastapi" },
+     { name = "faster-whisper" },
+     { name = "fastmcp" },
+@@ -2093,6 +2096,7 @@ dev = [
+     { name = "pre-commit" },
+     { name = "pytest" },
+     { name = "pytest-asyncio" },
++    { name = "python-multipart" },
+     { name = "redis" },
+     { name = "ruff" },
+     { name = "uvicorn", extra = ["standard"] },
+@@ -2120,9 +2124,11 @@ agent = [
+ ]
+ api = [
+     { name = "fastapi", specifier = ">=0.115" },
++    { name = "python-multipart", specifier = ">=0.0.9" },
+     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+ ]
+ bot = [
++    { name = "av", specifier = "<19" },
+     { name = "fastapi", specifier = ">=0.115" },
+     { name = "faster-whisper", specifier = ">=1.0" },
+     { name = "httpx", specifier = ">=0.27" },
+@@ -2130,6 +2136,7 @@ bot = [
+     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+ ]
+ dev = [
++    { name = "av", specifier = "<19" },
+     { name = "fastapi", specifier = ">=0.115" },
+     { name = "faster-whisper", specifier = ">=1.0" },
+     { name = "fastmcp", specifier = ">=4.1" },
+@@ -2138,6 +2145,7 @@ dev = [
+     { name = "pre-commit", specifier = ">=3.8" },
+     { name = "pytest", specifier = ">=8.3" },
+     { name = "pytest-asyncio", specifier = ">=0.24" },
++    { name = "python-multipart", specifier = ">=0.0.9" },
+     { name = "redis", specifier = ">=5.0" },
+     { name = "ruff", specifier = ">=0.6" },
+     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },

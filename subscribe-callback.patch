@@ -1,0 +1,13 @@
+diff --git a/bot/subscribe.py b/bot/subscribe.py
+index 09a8060..cf03f1b 100644
+--- a/bot/subscribe.py
++++ b/bot/subscribe.py
+@@ -39,7 +39,7 @@ async def run(command: str, url: str | None) -> None:
+         assert url is not None
+         payload = {
+             "url": verify_url(url),
+-            "update_types": ["message_created", "bot_started"],
++            "update_types": ["message_created", "bot_started", "message_callback"],
+             "secret": secret,
+         }
+     elif command == "delete":

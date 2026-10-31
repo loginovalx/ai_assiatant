@@ -217,7 +217,11 @@ class Agent:
                     )
 
                 fingerprint = json.dumps([name, args], ensure_ascii=False, sort_keys=True)
-                preview = confirm_changes and name in MUTATING_TOOLS
+                # Массовое удаление подтверждаем всегда, даже в текстовом режиме. Иначе тул
+                # отказывает служебной ошибкой, модель пересказывает её пользователю как есть,
+                # а на «да» вызывает тул заново без снимка ID — и удаляет всё, что подходит
+                # на тот момент, а не те записи, число которых человек видел в вопросе.
+                preview = (confirm_changes or name == "delete_events") and name in MUTATING_TOOLS
                 if preview and draft_fingerprint is not None and fingerprint != draft_fingerprint:
                     return AgentResponse(
                         reply_text=(

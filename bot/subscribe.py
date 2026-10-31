@@ -39,7 +39,7 @@ async def run(command: str, url: str | None) -> None:
         assert url is not None
         payload = {
             "url": verify_url(url),
-            "update_types": ["message_created", "bot_started"],
+            "update_types": ["message_created", "bot_started", "message_callback"],
             "secret": secret,
         }
     elif command == "delete":

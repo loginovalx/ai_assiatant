@@ -4,7 +4,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from redis.asyncio import Redis
 
@@ -55,6 +55,47 @@ _IMPORT_HELP = (
 # Больше 1000 строк CSV для теста не нужно, а файл на мегабайты — повод отказать сразу.
 _MAX_CSV_BYTES = 5_000_000
 _BUSY = "Ещё думаю над прошлым запросом. Попробуй через несколько секунд."
+_UPDATE_LEASE_SECONDS = 300
+_RELEASE_UPDATE = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+class UpdateInProgress(RuntimeError):
+    """A duplicate MAX delivery arrived while its original handler still owns a lease."""
+
+
+def is_valid_update(update: Any) -> bool:
+    """Check just the nested shapes the handler dereferences; missing bodies are valid."""
+    if not isinstance(update, dict) or not isinstance(update.get("update_type"), str):
+        return False
+    kind = update["update_type"]
+    if kind == "message_created":
+        message = update.get("message")
+        if not isinstance(message, dict) or not message:
+            return False
+        return all(
+            value is None or isinstance(value, dict)
+            for value in (message.get("sender"), message.get("recipient"), message.get("body"))
+        )
+    if kind == "message_callback":
+        callback = update.get("callback")
+        if not isinstance(callback, dict):
+            return False
+        user = callback.get("user")
+        payload = callback.get("payload")
+        return (user is None or isinstance(user, dict)) and (
+            payload is None or isinstance(payload, str)
+        )
+    if kind == "bot_started":
+        user = update.get("user")
+        return user is None or isinstance(user, dict)
+    return True
+
+
 _AUDIO_EXT = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac")
 CONFIRM_BUTTONS = [
     [
@@ -340,6 +381,38 @@ class BotHandler:
         await reply(" ".join(parts))
 
     async def handle_update(self, update: dict[str, Any]) -> None:
+        """Handle an update and persist message dedupe only after successful work.
+
+        Redis distinguishes a leased in-progress delivery from a completed one.
+        A crash leaves only the expiring lease, so polling/webhook retries remain
+        possible; stable request IDs make committed agent writes safe to repeat if
+        the crash happened before completion was recorded.
+        """
+        message = update.get("message") or {}
+        mid = (message.get("body") or {}).get("mid")
+        if update.get("update_type") != "message_created" or mid is None:
+            await self._handle_update(update)
+            return
+
+        mid = str(mid)
+        done_key = f"bot:done:{mid}"
+        pending_key = f"bot:processing:{mid}"
+        if await self.redis.get(done_key):
+            return
+
+        claim = uuid4().hex
+        if not await self.redis.set(pending_key, claim, nx=True, ex=_UPDATE_LEASE_SECONDS):
+            raise UpdateInProgress("MAX update is already being processed")
+        try:
+            # Close the race where another worker completed after the first read.
+            if await self.redis.get(done_key):
+                return
+            await self._handle_update(update)
+            await self.redis.set(done_key, "1", ex=86400)
+        finally:
+            await self.redis.eval(_RELEASE_UPDATE, 1, pending_key, claim)
+
+    async def _handle_update(self, update: dict[str, Any]) -> None:
         kind = update.get("update_type")
         if kind == "message_callback":
             await self._callback(update)
@@ -360,6 +433,7 @@ class BotHandler:
             return
 
         message = update.get("message") or {}
+        mid = (message.get("body") or {}).get("mid")
         sender = message.get("sender") or {}
         if sender.get("is_bot"):
             return
@@ -380,12 +454,6 @@ class BotHandler:
 
         async def reply(message_text: str) -> None:
             await self.max_api.send(chat_id, message_text, to_user=to_user)
-
-        mid = (message.get("body") or {}).get("mid")
-        if mid is not None:
-            is_new = await self.redis.set(f"bot:seen:{mid}", "1", nx=True, ex=86400)
-            if not is_new:
-                return
 
         text = ((message.get("body") or {}).get("text") or "").strip()
         if text in {"/start", "/help"}:

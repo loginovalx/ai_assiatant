@@ -65,13 +65,11 @@ def _fmt(dt: datetime) -> str:
 
 
 def _escape(text: str) -> str:
-    return (
-        text.replace("\\", "\\\\")
-        .replace(";", "\\;")
-        .replace(",", "\\,")
-        .replace("\r\n", "\\n")
-        .replace("\n", "\\n")
-    )
+    # RFC 5545 text values encode line breaks as the two literal characters \\n.
+    # Normalize all newline spellings first, including bare CR, so user text cannot
+    # inject a new iCalendar property or component.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
 def _fold(line: str, limit: int = 75) -> str:

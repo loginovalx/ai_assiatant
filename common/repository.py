@@ -53,12 +53,13 @@ ORDER BY start_at
 # Слова запроса объединяем через ИЛИ (а не И, как plainto_tsquery), иначе
 # «задачу про договор» не найдёт запись «Подписать договор» из-за слова «задача».
 _SEARCH_SQL = f"""
-WITH base AS (
+WITH base AS MATERIALIZED (
     SELECT * FROM events
     WHERE user_id = $1
       AND status <> 'cancelled'
       AND ($3::timestamptz IS NULL OR start_at >= $3)
       AND ($4::timestamptz IS NULL OR start_at < $4)
+      AND ($7::text[] IS NULL OR type = ANY($7))
 ),
 q AS (
     SELECT replace(plainto_tsquery('russian', $2)::text, ' & ', ' | ')::tsquery AS tq
@@ -188,6 +189,15 @@ class EventRepository:
         new_duration = (
             duration_minutes if duration_minutes is not None else current.duration_minutes
         )
+        validated = EventCreate(
+            user_id=user_id,
+            type=new_type,
+            name=new_name,
+            description=new_description,
+            start_at=new_start,
+            duration_minutes=new_duration,
+        )
+        new_name, new_description = validated.name, validated.description
 
         recompute = name is not None or description is not None or event_type is not None
         embedding = (
@@ -442,16 +452,42 @@ class EventRepository:
         start: datetime | None = None,
         end: datetime | None = None,
         limit: int = 5,
+        types: Sequence[EventType] | None = None,
     ) -> list[SearchHit]:
+        query = query.strip()
+        if not query:
+            return []
         embedding = await self._embed_one(query)
-        rows = await self._pool.fetch(_SEARCH_SQL, user_id, query, start, end, embedding, limit)
+        judge = getattr(self._embedder, "relevant_indices", None)
+        rows = await self._pool.fetch(
+            _SEARCH_SQL,
+            user_id,
+            query,
+            start,
+            end,
+            embedding,
+            max(limit, 50) if embedding is not None and judge is not None else limit,
+            [kind.value for kind in types] if types else None,
+        )
+        if rows and embedding is not None and judge is not None:
+            keys = list(dict.fromkeys((row["type"], row["name"]) for row in rows))
+            try:
+                relevant = await judge(query, [{"type": kind, "name": name} for kind, name in keys])
+            except Exception:
+                relevant = None
+            if relevant is None:
+                # Provider unavailable: keep only independently supported lexical hits.
+                rows = [row for row in rows if {"text", "fuzzy"} & set(row["matched_by"])]
+            else:
+                allowed = {keys[index] for index in relevant if 0 <= index < len(keys)}
+                rows = [row for row in rows if (row["type"], row["name"]) in allowed]
         return [
             SearchHit(
                 **self._to_event(r).model_dump(exclude={"weekday", "end_at"}),
                 score=round(r["score"], 5),
                 matched_by=list(r["matched_by"]),
             )
-            for r in rows
+            for r in rows[:limit]
         ]
 
     async def backfill_imported_embeddings(

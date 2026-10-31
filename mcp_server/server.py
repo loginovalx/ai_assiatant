@@ -422,6 +422,10 @@ async def update_event(
     """
     if name is None and start_at is None and description is None and duration_minutes is None:
         raise ToolError("Не указано, что менять: нужно хотя бы одно новое значение")
+    if name is not None:
+        name = name.strip()
+        if not name:
+            raise ToolError("Название не должно быть пустым")
 
     now = datetime.now(get_settings().tz).replace(microsecond=0)
     if start_at is not None:

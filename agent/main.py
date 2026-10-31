@@ -93,5 +93,5 @@ async def reset(body: AgentResetRequest, agent: AgentDep) -> None:
         raise HTTPException(
             status_code=409, detail="Дождитесь завершения текущего запроса"
         ) from exc
-    except RedisError as exc:
+    except (RedisError, TimeoutError) as exc:
         raise HTTPException(status_code=503, detail="Контекст временно недоступен") from exc

@@ -64,6 +64,7 @@ async def test_same_user_serialized_and_reset_cannot_overtake_request(redis):
     pending = asyncio.create_task(first_service.handle("u", "First"))
     await agent.entered.wait()
     try:
+        assert 0 < await redis.ttl("agent:lock:u") <= 300
         assert (await second_service.handle("u", "Second")).status == "error"
         with pytest.raises(AgentBusy):
             await second_service.reset("u")
@@ -117,8 +118,31 @@ async def test_same_request_waits_and_replays_inflight_result(redis):
 async def test_deadline_releases_user_for_retry(redis):
     agent = FakeAgent()
     agent.release = asyncio.Event()
-    service = AgentService(agent, redis, timeout_seconds=0.01)
+    service = AgentService(agent, redis, timeout_seconds=0.25)
     result = await service.handle("u", "Slow")
     assert result.status == "error"
+    assert agent.entered.is_set()
     agent.release.set()
     assert (await service.handle("u", "Next")).status == "done"
+
+
+async def test_deadline_includes_dependency_lock_wait():
+    class SlowLock:
+        async def acquire(self, **kwargs):
+            await asyncio.sleep(0.03)
+            return True
+
+        async def release(self):
+            pass
+
+    class SlowRedis:
+        def lock(self, *args, **kwargs):
+            return SlowLock()
+
+    class SlowAgent(FakeAgent):
+        async def handle(self, *args, **kwargs):
+            await asyncio.sleep(0.03)
+            return AgentResponse(status="done", reply_text="Готово")
+
+    result = await AgentService(SlowAgent(), SlowRedis(), timeout_seconds=0.05).handle("u", "Slow")
+    assert result.status == "error"

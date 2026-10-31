@@ -34,7 +34,13 @@ from common.schemas import (
     SearchHit,
     check_duration,
 )
-from common.timeutils import WEEKDAYS_RU, ensure_aware, mentions_time, named_weekday
+from common.timeutils import (
+    WEEKDAYS_RU,
+    ensure_aware,
+    mentions_time,
+    named_weekday,
+    resolve_weekday_mismatch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +183,12 @@ async def create_event(
         and not mentions_time(source_text)
     ):
         raise ToolError("В исходном запросе нет времени, только день. Спроси точное время.")
+    if data.start_at is not None:
+        resolved = resolve_weekday_mismatch(
+            source_text, data.start_at.astimezone(get_settings().tz), now
+        )
+        if resolved is not None:
+            data = data.model_copy(update={"start_at": resolved})
     if data.start_at is not None and data.start_at < now - PAST_TOLERANCE:
         raise ToolError(
             f"Время {data.start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "

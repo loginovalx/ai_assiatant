@@ -135,14 +135,48 @@ async def test_named_weekday_mismatch_is_not_saved(client, tz, pool):
         "user_id": USER,
         "event_type": "reminder",
         "name": "Оплатить интернет",
-        "user_text": "Напомни в понедельник в девять утра оплатить интернет",
+        "user_text": (
+            f"Напомни в понедельник {(monday + timedelta(days=1)).date().isoformat()} "
+            "в девять утра оплатить интернет"
+        ),
         "start_at": (monday + timedelta(days=1)).isoformat(),
     }
     rejected = await client.call_tool("create_event", args, raise_on_error=False)
     assert rejected.is_error
     assert await pool.fetchval("SELECT count(*) FROM events") == 0
-    accepted = await client.call_tool("create_event", {**args, "start_at": monday.isoformat()})
+    accepted = await client.call_tool(
+        "create_event",
+        {
+            **args,
+            "start_at": monday.isoformat(),
+            "user_text": (
+                f"Напомни в понедельник {monday.date().isoformat()} в девять утра оплатить интернет"
+            ),
+        },
+    )
     assert accepted.structured_content["start_at"] == monday.isoformat()
+
+
+async def test_weekday_only_date_is_calculated_from_server_calendar(client, tz):
+    now = datetime.now(tz)
+    monday = (now + timedelta(days=(0 - now.weekday()) % 7)).replace(
+        hour=9, minute=0, second=0, microsecond=0
+    )
+    if monday < now:
+        monday += timedelta(days=7)
+    result = await client.call_tool(
+        "create_event",
+        {
+            "user_id": USER,
+            "event_type": "reminder",
+            "name": "Оплатить интернет",
+            "user_text": "Напомни в понедельник в девять утра оплатить интернет",
+            "start_at": (monday + timedelta(days=1)).isoformat(),
+        },
+        raise_on_error=False,
+    )
+    assert not result.is_error
+    assert result.structured_content["start_at"] == monday.isoformat()
 
 
 async def test_full_clarification_flow_through_agent(make_agent, tz, pool):

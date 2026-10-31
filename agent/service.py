@@ -35,7 +35,7 @@ class AgentService:
     @asynccontextmanager
     async def _locked(self, user_id: str, wait: bool = False) -> AsyncIterator[None]:
         lock = self._redis.lock(
-            f"agent:lock:{user_id}", timeout=max(900, self._timeout + 60), thread_local=False
+            f"agent:lock:{user_id}", timeout=max(90, self._timeout + 30), thread_local=False
         )
         if not await lock.acquire(blocking=wait, blocking_timeout=self._timeout if wait else None):
             raise AgentBusy
@@ -49,6 +49,22 @@ class AgentService:
                 logger.exception("Не удалось освободить блокировку агента")
 
     async def _run(
+        self,
+        user_id: str,
+        request_id: UUID | None,
+        payload: dict,
+        operation: Callable[[], Awaitable[AgentResponse]],
+    ) -> AgentResponse:
+        try:
+            async with asyncio.timeout(self._timeout):
+                return await self._execute(user_id, request_id, payload, operation)
+        except TimeoutError:
+            return AgentResponse(
+                status=AgentStatus.ERROR,
+                reply_text="Не успел завершить запрос. Проверьте календарь перед повтором.",
+            )
+
+    async def _execute(
         self,
         user_id: str,
         request_id: UUID | None,
@@ -77,8 +93,7 @@ class AgentService:
                             return AgentResponse.model_validate(previous["response"])
                     # Bind the ID before running, including when the operation later fails.
                     await self._redis.set(key, json.dumps(envelope), ex=self._ttl)
-                async with asyncio.timeout(self._timeout):
-                    result = await operation()
+                result = await operation()
                 if key and result.status != AgentStatus.ERROR:
                     envelope["response"] = result.model_dump(mode="json")
                     try:
@@ -136,5 +151,6 @@ class AgentService:
         )
 
     async def reset(self, user_id: str) -> None:
-        async with self._locked(user_id):
-            await self._agent.reset(user_id)
+        async with asyncio.timeout(self._timeout):
+            async with self._locked(user_id):
+                await self._agent.reset(user_id)

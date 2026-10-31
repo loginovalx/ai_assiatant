@@ -1,5 +1,5 @@
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 WEEKDAYS_RU = (
@@ -58,3 +58,31 @@ def named_weekday(text: str) -> int | None:
     prefix = r"\b(?:в|на|до|к|ко)\s+(?:(?:эт|следующ|ближайш)\w*\s+)?"
     found = {day for day, form in enumerate(forms) if re.search(prefix + form + r"\b", text, re.I)}
     return next(iter(found)) if len(found) == 1 else None
+
+
+def resolve_weekday_mismatch(text: str, start: datetime, now: datetime) -> datetime | None:
+    """Resolve an unqualified weekday from the server calendar, never an explicit date."""
+    weekday = named_weekday(text)
+    if weekday is None or start.weekday() == weekday:
+        return None
+    explicit = (
+        r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[./]\d{1,2}\b|"
+        r"\b(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*|"
+        r"\b(?:сегодня|завтра|послезавтра|через|прошл\w*|кажд\w*|месяц\w*|после|перед)\b|"
+        r"\bследующ\w*\s+(?!недел)"
+    )
+    if re.search(explicit, text, re.I):
+        return None
+    days = (weekday - now.weekday()) % 7
+    next_week = bool(re.search(r"следующ\w*\s+недел", text, re.I))
+    this_week = bool(re.search(r"эт\w*\s+недел", text, re.I))
+    if next_week or this_week:
+        days = weekday - now.weekday() + (7 if next_week else 0)
+    resolved = (now + timedelta(days=days)).replace(
+        hour=start.hour, minute=start.minute, second=start.second, microsecond=start.microsecond
+    )
+    if resolved < now:
+        if this_week:
+            return None
+        resolved += timedelta(days=7)
+    return resolved

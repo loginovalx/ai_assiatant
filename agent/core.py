@@ -204,6 +204,8 @@ class Agent:
             for call in message.tool_calls:
                 name = call.function.name
                 args = _parse_args(call.function.arguments)
+                if name == "create_event" and args is not None:
+                    args["user_text"] = _with_user_turns(args.get("user_text"), messages)
                 logger.info("tool call %s %s", name, args)
 
                 if name == "ask_user":
@@ -315,6 +317,28 @@ def _parse_args(raw: str | None) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _with_user_turns(user_text: Any, messages: list[dict[str, Any]], limit: int = 3) -> str:
+    """Доклеить к user_text последние реплики пользователя.
+
+    Модель регулярно кладёт в user_text исходную фразу и теряет ответ на свой же
+    уточняющий вопрос («Во сколько?» → «В 13:00»), после чего тул отвергает
+    названное пользователем время как выдуманное. Проверка остаётся честной:
+    добавляется только то, что пользователь написал сам, ничего от модели.
+    """
+    spoken = [
+        content
+        for message in messages
+        if message.get("role") == "user" and (content := str(message.get("content") or "").strip())
+    ]
+    parts = [str(user_text).strip()] if user_text else []
+    parts.extend(spoken[-limit:])
+    # Повторы ни к чему: та же фраза часто и в user_text, и в последней реплике.
+    seen: dict[str, None] = {}
+    for part in parts:
+        seen.setdefault(part, None)
+    return "\n".join(seen)
 
 
 def _same_action(

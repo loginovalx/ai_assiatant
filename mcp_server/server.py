@@ -259,10 +259,16 @@ async def get_events(
         bool,
         Field(description="Добавить активные задачи без срока. true для «что мне нужно сделать»"),
     ] = False,
+    include_done: Annotated[
+        bool,
+        Field(description="Добавить уже выполненные. true только для «что я сделал», «что закрыл»"),
+    ] = False,
 ) -> list[Event]:
     """Список событий за период, отсортированный по времени.
 
     Для «что у меня сегодня / завтра / на неделе / в пятницу».
+    Выполненные записи по умолчанию не возвращаются: на вопрос «что у меня сегодня»
+    человек ждёт оставшиеся дела, а не те, что уже закрыл.
     """
     settings = get_settings()
     start = ensure_aware(start_time, settings.tz)
@@ -271,7 +277,10 @@ async def get_events(
         raise ToolError("start_time должен быть раньше end_time")
 
     types = [EventType(t) for t in event_types] if event_types else None
-    return await _repo(ctx).list_by_period(user_id, start, end, types, include_undated_tasks)
+    events = await _repo(ctx).list_by_period(user_id, start, end, types, include_undated_tasks)
+    if not include_done:
+        events = [event for event in events if event.status != EventStatus.DONE]
+    return events
 
 
 @mcp.tool(annotations={"readOnlyHint": True})

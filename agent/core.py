@@ -65,7 +65,7 @@ class Agent:
                 messages,
                 confirm_changes=confirm_changes,
                 request_id=request_id,
-                read_period=_month_to_date_period(text, now),
+                read_period=_read_period(text, now),
                 source_text=source_text,
             )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
@@ -368,15 +368,37 @@ def _user_source(history: list[HistoryMessage], text: str) -> str:
     return (pending + "\n" + text if pending else text)[-6000:]
 
 
-def _month_to_date_period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
-    """Resolve an explicit month-to-date read against the trusted request clock.
+def _read_period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
+    """Resolve explicit inclusive calendar-day windows against the trusted clock.
 
     Multiple periods or explicit dates stay with the normal interpretation path.
     This never changes mutation or semantic-search arguments.
     """
     text = text.casefold()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    rolling = list(
+        re.finditer(
+            r"\b(последни[ех]|следующи[ех])\s+(\d{1,3}|семь|тридцать)\s+"
+            r"(?:календарных\s+)?д(?:ней|ня|ень)\s*[,—-]?\s*включая\s+сегодня\b",
+            text,
+        )
+    )
+    if len(rolling) == 1:
+        match = rolling[0]
+        rest = text[: match.start()] + text[match.end() :]
+        if not re.search(
+            r"\d|\b(?:вчера|завтра|позавчера|послезавтра|сегодня|недел\w*|месяц\w*)\b", rest
+        ):
+            number = match.group(2)
+            days = {"семь": 7, "тридцать": 30}.get(number, int(number) if number.isdigit() else 0)
+            if 1 <= days <= 366:
+                return (
+                    (today - timedelta(days=days - 1), today + timedelta(days=1))
+                    if match.group(1).startswith("послед")
+                    else (today, today + timedelta(days=days))
+                )
     if len(re.findall(r"\bмесяц\w*", text)) != 1 or re.search(
-        r"\d|\b(?:вчера|завтра|недел\w*|прошл\w*|следующ\w*)\b", text
+        r"\d|\b(?:вчера|завтра|позавчера|послезавтра|недел\w*|прошл\w*|следующ\w*)\b", text
     ):
         return None
     if not re.search(
@@ -385,7 +407,6 @@ def _month_to_date_period(text: str, now: datetime) -> tuple[datetime, datetime]
         text,
     ):
         return None
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return today.replace(day=1), today + timedelta(days=1)
 
 

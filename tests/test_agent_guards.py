@@ -318,6 +318,8 @@ async def test_month_to_date_read_uses_server_calendar_even_if_model_chooses_mon
     [
         ("С начала этого месяца по сегодняшний день и за прошлый месяц", "get_events"),
         ("С начала этого месяца по сегодняшний день и за 2025 год", "get_events"),
+        ("Последние 7 дней, включая сегодня, и следующие 7 дней, включая сегодня", "get_events"),
+        ("Последние 7 дней, включая сегодня, и послезавтра", "get_events"),
         ("С начала этого месяца по сегодняшний день", "search_events"),
         ("С начала этого месяца по сегодняшний день", "create_event"),
     ],
@@ -341,6 +343,30 @@ async def test_read_period_guard_preserves_complex_dates_and_other_tools(query, 
     assert [
         {key: value for key, value in actual.items() if key != "user_text"} for actual in calls
     ] == [arguments]
+
+
+@pytest.mark.parametrize(
+    "query,start,end",
+    [
+        ("Последние 7 дней, включая сегодня?", "2026-10-24", "2026-10-31"),
+        ("Следующие 7 дней, включая сегодня?", "2026-10-30", "2026-11-06"),
+        ("Последние 30 дней, включая сегодня?", "2026-10-01", "2026-10-31"),
+        ("Следующие тридцать дней, включая сегодня?", "2026-10-30", "2026-11-29"),
+    ],
+)
+async def test_rolling_calendar_days_use_trusted_exact_bounds(query, start, end):
+    calls = []
+    agent, toolbox = setup_agent(
+        [completion(calls=[("get_events", "{}")]), completion("Нет записей")]
+    )
+
+    async def record(user_id, name, arguments, **kwargs):
+        calls.append(arguments)
+        return ToolResult(ok=True, payload=[], events=[])
+
+    toolbox.call = record
+    await agent.handle("u", query, now=datetime(2026, 10, 30, 9, tzinfo=ZoneInfo("Europe/Moscow")))
+    assert calls == [{"start_time": start + "T00:00:00+03:00", "end_time": end + "T00:00:00+03:00"}]
 
 
 async def test_fallback_keeps_meeting_conflict_warning():

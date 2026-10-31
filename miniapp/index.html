@@ -423,7 +423,7 @@ let loadCounter = 0;
 async function load() {
   if (!state.userId) {
     document.getElementById('userForm').classList.toggle('hidden', !isLocalDev);
-    showState((isLocalDev ? 'Укажите user_id для локальной разработки' : 'Откройте мини-приложение через MAX') + ' [debug hasWebApp=' + (!!window.WebApp) + ' initDataLen=' + initData.length + ' origin=' + location.origin + ']', '', false);
+    showState((isLocalDev ? 'Укажите user_id для локальной разработки' : 'Откройте мини-приложение через MAX'), '', false);
     return;
   }
   const myId = ++loadCounter; // чтобы старый медленный ответ не перетёр новый

@@ -271,7 +271,7 @@ async function fetchPeriod() {
 }
 
 function fetchSearch() {
-  return api('/v1/events/search', { user_id: state.userId, q: state.query });
+  return api('/v1/events/search', { user_id: state.userId, q: state.query, type: [...state.types] });
 }
 
 /* ---------- разбор ответа ---------- */

@@ -7,6 +7,7 @@
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
@@ -47,6 +48,24 @@ logger = logging.getLogger(__name__)
 # Небольшой запас на задержку между репликой пользователя и вызовом тула.
 PAST_TOLERANCE = timedelta(minutes=5)
 DRAFT_EVENT_ID = UUID("00000000-0000-0000-0000-000000000000")
+_WEEK_RANGE = re.compile(r"\b(?:на\s+)?(?:эт\w*|следующ\w*)\s+недел\w*\b", re.I)
+_WEEK_END_DEADLINE = re.compile(r"\bдо\s+конца(?:\s+этой)?\s+недел\w*\b", re.I)
+_EXPLICIT_WEEKDAY_OR_DATE = re.compile(
+    r"\b(?:понедельник\w*|вторник\w*|сред(?:а|у|ы|е|ой|ою)|четверг\w*|"
+    r"пятниц\w*|суббот\w*|воскресень\w*|сегодня|завтра|послезавтра)\b|"
+    r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b|"
+    r"\b\d{1,2}(?:-?(?:го|е|й))?\s+(?:январ\w*|феврал\w*|март\w*|апрел\w*|"
+    r"ма[йя]\w*|июн\w*|июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)\b",
+    re.I,
+)
+_CLOCK_TIME = re.compile(r"\bв\s+\d{1,2}[.:]\d{2}\b", re.I)
+
+
+def _has_explicit_weekday_or_date(text: str) -> bool:
+    # Dot-separated dates are valid, but "в 10.00" is a clock time, not day.month.
+    without_clock_times = _CLOCK_TIME.sub(" ", text)
+    return bool(_EXPLICIT_WEEKDAY_OR_DATE.search(without_clock_times))
+
 
 UserId = Annotated[str, Field(description="ID пользователя MAX. Передавай всегда, как есть.")]
 EventTypeName = Literal["task", "meeting", "reminder"]
@@ -177,6 +196,19 @@ async def create_event(
     # модель кладёт в description только суть, а время — в start_at. Без user_text
     # (HTTP API, старые вызовы) проверяем description как раньше.
     source_text = user_text if user_text else description
+    if source_text and not _has_explicit_weekday_or_date(source_text):
+        if data.type == EventType.TASK and _WEEK_END_DEADLINE.search(source_text):
+            raise ToolError(
+                "Срок «до конца недели» не указывает конкретный день. Спроси, до какого дня недели."
+            )
+        if (
+            data.type in {EventType.MEETING, EventType.REMINDER}
+            and mentions_time(source_text)
+            and _WEEK_RANGE.search(source_text)
+        ):
+            raise ToolError(
+                "Названа неделя, но не конкретный день. Спроси, на какой день недели запланировать."
+            )
     if (
         data.type in {EventType.MEETING, EventType.REMINDER}
         and source_text
@@ -311,8 +343,8 @@ async def search_events(
         datetime | None,
         Field(
             description=(
-                "Конец периода, если пользователь его назвал («по 30 октября» — "
-                "30 октября 23:59). null = без верхней границы."
+                "Конец периода не включительно, если пользователь назвал период: "
+                "«по 30 октября» — 31 октября 00:00. null = без верхней границы."
             )
         ),
     ] = None,
@@ -322,12 +354,15 @@ async def search_events(
 
     Для «найди задачу про презентацию», «когда у меня была встреча с Иваном».
     Результаты отсортированы по релевантности; если список пуст — ничего не найдено.
-    limit=None значит «сам реши»: запрос за период обычно хочет полный список,
-    обычный поиск — короткую выдачу. Вернулось ровно limit — сообщи «как минимум столько».
+    limit=None даёт до 50 результатов для поиска с периодом и до 10 без периода.
+    Максимум — 50, поэтому даже поиск за период не гарантирует полный список.
+    Вернулось ровно limit — сообщи «как минимум столько».
     """
     settings = get_settings()
     start = ensure_aware(start_time, settings.tz) if start_time else None
     end = ensure_aware(end_time, settings.tz) if end_time else None
+    if start is not None and end is not None and start >= end:
+        raise ToolError("start_time должен быть раньше end_time")
     if limit is None:
         limit = 50 if (start is not None or end is not None) else 10
     return await _repo(ctx).search(user_id, query.strip(), start, end, limit)
@@ -387,6 +422,10 @@ async def update_event(
     """
     if name is None and start_at is None and description is None and duration_minutes is None:
         raise ToolError("Не указано, что менять: нужно хотя бы одно новое значение")
+    if name is not None:
+        name = name.strip()
+        if not name:
+            raise ToolError("Название не должно быть пустым")
 
     now = datetime.now(get_settings().tz).replace(microsecond=0)
     if start_at is not None:

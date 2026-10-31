@@ -128,6 +128,7 @@ async def test_tools_hide_user_id_and_have_no_anyof(pool):
     assert "anyOf" not in dumped and "additionalProperties" not in dumped
 
     create = tools[0]["function"]["parameters"]
+    assert "user_text" not in create["properties"]
     assert create["properties"]["event_type"]["enum"] == ["task", "meeting", "reminder"]
     assert set(create["required"]) == {"event_type", "name"}
 
@@ -298,6 +299,57 @@ async def test_meeting_duration_unknown_falls_back_to_hour(make_agent, tz, pool)
     assert second.status == AgentStatus.DONE
     assert second.events[0].duration_minutes == 60
     assert second.events[0].end_at == start + timedelta(hours=1)
+
+
+@pytest.mark.parametrize("preview", [False, True])
+async def test_duration_answer_keeps_original_time_and_ignores_model_source(
+    make_agent, tz, pool, preview
+):
+    start = tomorrow_at(tz, 15)
+    agent, llm = make_agent(
+        tool_call("ask_user", {"question": "Сколько продлится встреча?"}),
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча с командой",
+                "start_at": start.isoformat(),
+                "duration_minutes": 60,
+                "user_text": "Один час",
+            },
+        ),
+        text("Готово"),
+    )
+    assert (
+        await agent.handle(USER, "Встреча с командой завтра в 15")
+    ).status == AgentStatus.NEED_CLARIFICATION
+    result = await agent.handle(USER, "Один час", confirm_changes=preview)
+    if preview:
+        assert result.status == AgentStatus.NEEDS_CONFIRMATION
+        assert result.draft.arguments["user_text"] == "Встреча с командой завтра в 15\nОдин час"
+        result = await agent.execute_draft(USER, result.draft)
+    assert result.status == AgentStatus.DONE
+    assert result.events[0].start_at == start and result.events[0].duration_minutes == 60
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE user_id=$1", USER) == 1
+    assert all(set(message) <= {"role", "content"} for message in llm.requests[1]["messages"])
+
+
+async def test_model_cannot_forge_time_evidence_for_untimed_request(make_agent, tz, pool):
+    agent, _ = make_agent(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "reminder",
+                "name": "Забрать документы",
+                "start_at": tomorrow_at(tz, 10).isoformat(),
+                "user_text": "Напомни завтра в 10 забрать документы",
+            },
+        ),
+        text("Готово"),
+    )
+    result = await agent.handle(USER, "Напомни завтра забрать документы")
+    assert result.status == AgentStatus.NEED_CLARIFICATION
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE user_id=$1", USER) == 0
 
 
 async def test_list_today(make_agent, tz):

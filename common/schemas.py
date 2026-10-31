@@ -85,9 +85,17 @@ class EventCreate(BaseModel):
     start_at: datetime | None = None
     duration_minutes: int | None = DurationMinutes
 
-    @field_validator("name", "description")
+    @field_validator("name")
     @classmethod
-    def strip_text(cls, value: str) -> str:
+    def strip_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("Название не может быть пустым")
+        return value
+
+    @field_validator("description")
+    @classmethod
+    def strip_description(cls, value: str) -> str:
         return value.strip()
 
     @field_validator("start_at")

@@ -18,7 +18,7 @@ from redis.asyncio import Redis
 from bot.agent_client import AgentClient
 from bot.asr import make_asr
 from bot.config import Settings
-from bot.handler import BotHandler
+from bot.handler import BotHandler, UpdateInProgress, is_valid_update
 from bot.max_api import MaxAPI
 from bot.reminders import ReminderSender
 from bot.state import StateStore
@@ -28,8 +28,9 @@ from common.embeddings import build_embedder
 from common.repository import EventRepository
 
 logger = logging.getLogger(__name__)
-_active: set[asyncio.Task[None]] = set()
 _MAX_UPDATE_BYTES = 1_000_000
+_WEBHOOK_PROCESS_TIMEOUT_SECONDS = 25
+_active: set[asyncio.Task[None]] = set()
 
 
 def valid_secret(actual: str | None, expected: str) -> bool:
@@ -38,16 +39,19 @@ def valid_secret(actual: str | None, expected: str) -> bool:
 
 
 def is_message(update: Any) -> bool:
-    return isinstance(update, dict) and isinstance(update.get("update_type"), str)
+    return is_valid_update(update)
 
 
 def _on_task_done(task: asyncio.Task[None]) -> None:
     _active.discard(task)
-    if not task.cancelled():
-        try:
-            task.result()
-        except Exception:
-            logger.exception("MAX webhook update handler failed")
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except UpdateInProgress:
+        logger.info("MAX webhook duplicate arrived while update is in progress")
+    except Exception:
+        logger.exception("MAX webhook update handler failed after request timeout")
 
 
 @asynccontextmanager
@@ -132,7 +136,8 @@ async def webhook(request: Request) -> dict[str, bool]:
     except (ValueError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=400, detail="Invalid JSON") from exc
     if not is_message(update):
-        raise HTTPException(status_code=400, detail="Invalid MAX Update")
+        logger.warning("MAX webhook received malformed update; skipping")
+        return {"ok": True}
 
     if update.get("update_type") == "message_created":
         message = update.get("message")
@@ -143,9 +148,17 @@ async def webhook(request: Request) -> dict[str, bool]:
             types = [a.get("type") for a in body.get("attachments") or [] if isinstance(a, dict)]
             logger.info("MAX webhook received message_created; attachments=%s", types)
 
-    # MAX requires fast HTTP 200. Run ASR/LLM handling asynchronously;
-    # the existing handler deduplicates by message ID in Redis.
+    # MAX requires HTTP 200 within 30 seconds. Keep the work alive after our 25s
+    # deadline so the next MAX retry can observe its completion or pending lease.
     task = asyncio.create_task(request.app.state.handler.handle_update(update))
     _active.add(task)
     task.add_done_callback(_on_task_done)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=_WEBHOOK_PROCESS_TIMEOUT_SECONDS)
+    except UpdateInProgress as exc:
+        raise HTTPException(status_code=503, detail="Update is already processing") from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=503, detail="Update is still processing") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Update processing failed") from exc
     return {"ok": True}

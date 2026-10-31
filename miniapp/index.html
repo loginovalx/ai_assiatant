@@ -164,7 +164,12 @@ const DEFAULT_API = location.protocol === 'file:' ? 'http://localhost:8000' : re
 // A URL parameter must never redirect signed MAX data to an arbitrary server.
 const isLocalDev = !initData && ['localhost', '127.0.0.1', ''].includes(location.hostname);
 const API_BASE = ((isLocalDev && params.get('api')) || DEFAULT_API).replace(/\/$/, '');
-const authHeaders = () => initData ? { 'X-Max-Init-Data': initData } : {};
+const authHeaders = () => ({
+  // ngrok (free) otherwise answers fetch() with its HTML warning page
+  // instead of proxying to the backend; any value disables that.
+  'ngrok-skip-browser-warning': 'true',
+  ...(initData ? { 'X-Max-Init-Data': initData } : {}),
+});
 
 const TYPE_LABELS = { task: 'Задача', meeting: 'Встреча', reminder: 'Напоминание' };
 
@@ -237,7 +242,13 @@ async function api(path, query, method = 'GET') {
     err.status = res.status;
     throw err;
   }
-  return res.json();
+  try {
+    return await res.json();
+  } catch (e) {
+    const err = new Error('Сервер вернул не JSON. Откройте мини-приложение заново через MAX.');
+    err.network = true;
+    throw err;
+  }
 }
 
 async function fetchPeriod() {

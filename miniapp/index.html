@@ -148,10 +148,14 @@
    Адрес бэкенда. Для разработки - локальный. Можно переопределить
    в адресной строке: index.html?user_id=123&api=https://xxxx.ngrok-free.app
    ============================================================ */
-const DEFAULT_API = 'http://localhost:8000';
-
 const params = new URLSearchParams(location.search);
-const API_BASE = (params.get('api') || DEFAULT_API).replace(/\/$/, '');
+const initData = window.WebApp?.initData ||
+  new URLSearchParams(location.hash.slice(1)).get('WebAppData') || '';
+const DEFAULT_API = location.protocol === 'file:' ? 'http://localhost:8000' : location.origin;
+// A URL parameter must never redirect signed MAX data to an arbitrary server.
+const isLocalDev = !initData && ['localhost', '127.0.0.1', ''].includes(location.hostname);
+const API_BASE = ((isLocalDev && params.get('api')) || DEFAULT_API).replace(/\/$/, '');
+const authHeaders = () => initData ? { 'X-Max-Init-Data': initData } : {};
 
 const TYPE_LABELS = { task: 'Задача', meeting: 'Встреча', reminder: 'Напоминание' };
 
@@ -164,21 +168,11 @@ const state = {
 
 /* ---------- user_id ---------- */
 function detectUserId() {
-  // 1) для разработки: ?user_id=...
+  if (initData) return ''; // the backend resolves the signed identity via /v1/me
+  // Browser development requires API_ALLOW_DEV_USER_ID=true on the backend.
   const fromUrl = params.get('user_id');
   if (fromUrl) return fromUrl;
-
-  // 2) внутри MAX: id пользователя из MAX Bridge.
-  // ВНИМАНИЕ: это "небезопасные" данные без проверки подписи.
-  // Для боевого режима бэкенд должен проверять подписанный initData (window.WebApp.initData).
-  try {
-    const wa = window.WebApp;
-    const id = wa && wa.initDataUnsafe && wa.initDataUnsafe.user && wa.initDataUnsafe.user.id;
-    if (id) return String(id);
-  } catch (e) { /* ничего */ }
-
-  // 3) введённый руками ранее
-  try { return localStorage.getItem('user_id') || ''; } catch (e) { return ''; }
+  return '';
 }
 
 /* ---------- работа с датами ---------- */
@@ -207,7 +201,7 @@ function periodRange(period) {
 }
 
 /* ---------- запросы к бэкенду ---------- */
-async function api(path, query) {
+async function api(path, query, method = 'GET') {
   const url = new URL(API_BASE + path);
   Object.entries(query || {}).forEach(([k, v]) => {
     if (v === undefined || v === null || v === '') return;
@@ -216,14 +210,14 @@ async function api(path, query) {
   });
   let res;
   try {
-    res = await fetch(url.toString());
+    res = await fetch(url.toString(), { method, headers: authHeaders(), signal: AbortSignal.timeout(20000) });
   } catch (e) {
     const err = new Error('Нет связи с сервером');
     err.network = true;
     throw err;
   }
   if (!res.ok) {
-    const err = new Error('Ошибка сервера: ' + res.status);
+    const err = new Error(res.status === 401 ? 'Откройте мини-приложение заново через MAX.' : 'Ошибка сервера: ' + res.status);
     err.status = res.status;
     throw err;
   }
@@ -356,8 +350,24 @@ function renderCard(ev) {
 
   if (ev.id !== null && ev.id !== undefined) {
     const b = el('button', 'btn secondary', '📅 В календарь');
+    b.disabled = !ev.when;
+    if (!ev.when) b.title = 'Для экспорта сначала задайте дату в чате с ботом';
     b.addEventListener('click', () => downloadIcs(ev, b));
     card.appendChild(b);
+    if (!ev.done) {
+      const done = el('button', 'btn secondary', '✓ Выполнено');
+      done.addEventListener('click', async () => {
+        done.disabled = true;
+        try {
+          await api('/v1/events/' + encodeURIComponent(ev.id) + '/complete', { user_id: state.userId }, 'POST');
+          await load();
+        } catch (e) {
+          done.textContent = 'Не удалось. Повторить';
+          done.disabled = false;
+        }
+      });
+      card.appendChild(done);
+    }
   }
   return card;
 }
@@ -396,8 +406,8 @@ function render(events) {
 let loadCounter = 0;
 async function load() {
   if (!state.userId) {
-    document.getElementById('userForm').classList.remove('hidden');
-    showState('Укажите user_id, чтобы увидеть задачи', '', false);
+    document.getElementById('userForm').classList.toggle('hidden', !isLocalDev);
+    showState(isLocalDev ? 'Укажите user_id для локальной разработки' : 'Откройте мини-приложение через MAX', '', false);
     return;
   }
   const myId = ++loadCounter; // чтобы старый медленный ответ не перетёр новый
@@ -419,10 +429,11 @@ async function load() {
 async function downloadIcs(ev, btn) {
   const url = API_BASE + '/v1/events/' + encodeURIComponent(ev.id) + '/ics?user_id=' + encodeURIComponent(state.userId);
   const oldText = btn.textContent;
+  let failed = false;
   btn.disabled = true;
   btn.textContent = 'Готовлю файл…';
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { headers: authHeaders(), signal: AbortSignal.timeout(20000) });
     if (!res.ok) throw new Error('bad status');
     const blob = await res.blob();
     const a = document.createElement('a');
@@ -433,11 +444,10 @@ async function downloadIcs(ev, btn) {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 2000);
   } catch (e) {
-    // запасной вариант - просто открыть ссылку
-    window.open(url, '_blank');
+    failed = true;
   } finally {
     btn.disabled = false;
-    btn.textContent = oldText;
+    btn.textContent = failed ? 'Не удалось скачать. Повторить' : oldText;
   }
 }
 
@@ -487,15 +497,25 @@ document.getElementById('userForm').addEventListener('submit', (e) => {
   const v = document.getElementById('userInput').value.trim();
   if (!v) return;
   state.userId = v;
-  try { localStorage.setItem('user_id', v); } catch (err) { /* ничего */ }
   document.getElementById('userForm').classList.add('hidden');
   load();
 });
 
 /* ---------- старт ---------- */
 try { if (window.WebApp && typeof window.WebApp.ready === 'function') window.WebApp.ready(); } catch (e) { /* ничего */ }
-state.userId = detectUserId();
-load();
+async function start() {
+  state.userId = detectUserId();
+  if (initData) {
+    try {
+      state.userId = (await api('/v1/me')).user_id;
+    } catch (e) {
+      showState(e.message, 'error', false);
+      return;
+    }
+  }
+  await load();
+}
+start();
 </script>
 </body>
 </html>

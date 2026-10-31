@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 
-from common.schemas import Event, EventType
+from common.schemas import Event, EventStatus, EventType
 
 # Сколько показывать в календаре, если запись сама время не занимает (end_at пустой):
 # у напоминания и дела без длительности есть только момент, а календарю нужен отрезок.
@@ -30,6 +30,7 @@ def build_ics(event: Event, now: datetime | None = None) -> str:
     )
     alarm_minutes = int(_ALARM_BEFORE[event.type].total_seconds() // 60)
     stamp = (now or datetime.now(UTC)).astimezone(UTC)
+    title = f"✓ Выполнено: {event.name}" if event.status == EventStatus.DONE else event.name
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -42,19 +43,20 @@ def build_ics(event: Event, now: datetime | None = None) -> str:
         f"DTSTAMP:{_fmt(stamp)}",
         f"DTSTART:{_fmt(start)}",
         f"DTEND:{_fmt(end)}",
-        f"SUMMARY:{_escape(event.name)}",
+        f"SUMMARY:{_escape(title)}",
+        "STATUS:CANCELLED" if event.status == EventStatus.CANCELLED else "STATUS:CONFIRMED",
     ]
     if event.description and event.description != event.name:
         lines.append(f"DESCRIPTION:{_escape(event.description)}")
-    lines += [
-        "BEGIN:VALARM",
-        "ACTION:DISPLAY",
-        f"DESCRIPTION:{_escape(event.name)}",
-        f"TRIGGER:-PT{alarm_minutes}M",
-        "END:VALARM",
-        "END:VEVENT",
-        "END:VCALENDAR",
-    ]
+    if event.status == EventStatus.ACTIVE:
+        lines += [
+            "BEGIN:VALARM",
+            "ACTION:DISPLAY",
+            f"DESCRIPTION:{_escape(event.name)}",
+            f"TRIGGER:-PT{alarm_minutes}M",
+            "END:VALARM",
+        ]
+    lines += ["END:VEVENT", "END:VCALENDAR"]
     return "".join(_fold(line) + "\r\n" for line in lines)
 
 

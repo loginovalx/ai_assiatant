@@ -90,7 +90,13 @@ Content-Type: application/json
 {"reply_text":"Уточни время напоминания", "status":"need_clarification", "events":[]}
 ```
 
-`status` может быть `done`, `need_clarification`, `error`. Для бота даже `need_clarification` — обычный текстовый ответ: контекст уточнений живёт на стороне агента (Redis `agent:ctx:<id>`), не в FSM бота. `bot:state:<id>` содержит временную фазу и ID запроса, а не контекст диалога.
+`status` может быть `done`, `need_clarification`, `needs_confirmation`, `error`.
+Для голосового изменения бот передаёт `confirm_changes=true`: агент возвращает
+`needs_confirmation` и `draft`, а запись выполняется через `POST /v1/agent/confirm`
+после кнопки или ответа «да». Повторное подтверждение того же создания использует
+ID черновика и возвращает уже сохранённое событие. При ошибке черновик остаётся для повтора.
+Контекст уточнений живёт в Redis `agent:ctx:<id>`, а `bot:state:<id>` содержит
+временную фазу и ID текущего запроса, а не историю диалога.
 
 ## ASR и голосовые
 

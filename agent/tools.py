@@ -16,7 +16,7 @@ from fastmcp import Client, FastMCP
 
 logger = logging.getLogger(__name__)
 
-HIDDEN_ARGS = frozenset({"user_id", "dry_run"})
+HIDDEN_ARGS = frozenset({"user_id", "dry_run", "idempotency_key"})
 
 # Тул без MCP: им модель сообщает, что ей не хватает данных. Явный сигнал надёжнее,
 # чем угадывать по знаку вопроса в ответе.
@@ -103,12 +103,20 @@ class McpToolbox:
         return [*self._schemas, ASK_USER_TOOL]
 
     async def call(
-        self, user_id: str, name: str, arguments: dict[str, Any], *, dry_run: bool = False
+        self,
+        user_id: str,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        dry_run: bool = False,
+        idempotency_key: str | None = None,
     ) -> ToolResult:
         args = {k: v for k, v in arguments.items() if k not in HIDDEN_ARGS}
         args["user_id"] = user_id  # всегда наш, даже если модель прислала свой
         if dry_run and name in MUTATING_TOOLS:
             args["dry_run"] = True
+        if idempotency_key is not None and name == "create_event":
+            args["idempotency_key"] = idempotency_key
         async with Client(self._target) as client:
             result = await client.call_tool(name, args, raise_on_error=False)
         if result.is_error:

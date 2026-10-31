@@ -6,22 +6,26 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
+from api.auth import get_current_user_id
 from api.ics import build_ics
 from common.calendar_import import CalendarImportError, parse_calendar_csv
 from common.config import get_settings
 from common.db import create_pool
 from common.embeddings import build_embedder
 from common.repository import EventRepository
-from common.schemas import Event, EventType, ImportResult, SearchHit
+from common.schemas import Event, EventStatus, EventType, ImportResult, SearchHit
 from common.timeutils import ensure_aware
 
 MAX_IMPORT_BYTES = 5_000_000
+MINIAPP_INDEX = Path(__file__).resolve().parents[1] / "miniapp" / "index.html"
 
 
 @asynccontextmanager
@@ -51,14 +55,34 @@ def get_repo(request: Request) -> EventRepository:
 
 
 Repo = Annotated[EventRepository, Depends(get_repo)]
-# TODO(безопасность): сейчас user_id приходит параметром и ему верим на слово.
-# В проде Mini App передаёт подписанные initData, и user_id берётся из них после проверки подписи.
-UserId = Annotated[str, Query(min_length=1, max_length=64, description="ID пользователя MAX")]
+UserId = Annotated[str, Depends(get_current_user_id)]
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/v1/me")
+async def me(user_id: UserId) -> dict[str, str]:
+    return {"user_id": user_id, "timezone": get_settings().default_tz}
+
+
+@app.get("/app", include_in_schema=False)
+@app.get("/app/", include_in_schema=False)
+async def miniapp() -> FileResponse:
+    return FileResponse(MINIAPP_INDEX)
+
+
+@app.post("/v1/events/{event_id}/complete", response_model=Event)
+async def complete_event(repo: Repo, event_id: UUID, user_id: UserId) -> Event:
+    current = await repo.get(user_id, event_id)
+    if current is None or current.status == EventStatus.CANCELLED:
+        raise HTTPException(status_code=404, detail="Событие не найдено")
+    result = await repo.set_status(user_id, event_id, EventStatus.DONE)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Событие не найдено")
+    return result
 
 
 @app.get("/v1/events", response_model=list[Event])

@@ -137,6 +137,7 @@ async def create_event(
         ),
     ] = None,
     dry_run: bool = False,
+    idempotency_key: UUID | None = None,
 ) -> EventWithConflicts:
     """Создать задачу, напоминание или встречу.
 
@@ -146,6 +147,13 @@ async def create_event(
     Если время пересекается с другими встречами или делами, запись всё равно сохраняется,
     а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
     """
+    repo = _repo(ctx)
+    if not dry_run and idempotency_key is not None:
+        existing = await repo.get(user_id, repo.creation_id(user_id, idempotency_key))
+        if existing is not None:
+            return EventWithConflicts(
+                **_fields(existing), conflicts=await repo.find_conflicts(existing)
+            )
     try:
         data = EventCreate(
             user_id=user_id,
@@ -195,7 +203,7 @@ async def create_event(
             updated_at=now,
         )
         if dry_run
-        else await repo.create(data)
+        else await repo.create(data, idempotency_key=idempotency_key)
     )
     conflicts = await repo.find_conflicts(event)
     logger.info(
@@ -457,7 +465,7 @@ async def delete_events(
         Field(description="true только после того, как пользователь ответил «да» на вопрос."),
     ] = False,
     dry_run: bool = False,
-) -> list[Event]:
+) -> list[Event] | dict[str, int]:
     """Удалить сразу ВСЕ записи пользователя заданных типов.
 
     Для «удали все мои задачи», «очисти всё». Для одной записи используй delete_event.
@@ -470,6 +478,8 @@ async def delete_events(
         count = await repo.cancel_all(user_id, types, dry_run=True)
         if count == 0:
             raise ToolError("Записей такого типа нет — удалять нечего. Так и скажи пользователю.")
+        if dry_run:
+            return {"count": count}  # no writes; the bot's confirmation button approves this draft
         raise ToolError(
             f"Ничего не удалено: будет удалено записей — {count}. Спроси через ask_user: "
             f"«Удалить все записи ({count} шт.)? Это нельзя отменить.» Ответил «да» — "

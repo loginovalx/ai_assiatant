@@ -3,13 +3,13 @@
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 import asyncpg
 
 from common.calendar_import import IMPORTED_DURATION_MINUTES, CalendarRow
-from common.embeddings import Embedder
+from common.embeddings import EMBEDDING_DIM, Embedder
 from common.schemas import (
     DEFAULT_MEETING_MINUTES,
     MAX_DURATION_MINUTES,
@@ -107,13 +107,19 @@ class EventRepository:
         self._embedder = embedder
         self._tz = tz
 
-    async def create(self, data: EventCreate) -> Event:
+    @staticmethod
+    def creation_id(user_id: str, idempotency_key: UUID) -> UUID:
+        return uuid5(NAMESPACE_URL, f"voice-assistant:{user_id}:{idempotency_key}")
+
+    async def create(self, data: EventCreate, idempotency_key: UUID | None = None) -> Event:
         embedding = await self._embed_one(_embedding_text(data.type, data.name, data.description))
         row = await self._pool.fetchrow(
             f"""
-            INSERT INTO events (user_id, type, name, description, start_at, duration_minutes,
+            INSERT INTO events (id, user_id, type, name, description, start_at, duration_minutes,
                                 embedding)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES ($8, $1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO UPDATE SET id = events.id
+            WHERE events.user_id = EXCLUDED.user_id
             RETURNING {_COLUMNS}
             """,
             data.user_id,
@@ -123,6 +129,7 @@ class EventRepository:
             data.start_at,
             data.duration_minutes,
             embedding,
+            self.creation_id(data.user_id, idempotency_key) if idempotency_key else uuid4(),
         )
         return self._to_event(row)
 
@@ -193,7 +200,12 @@ class EventRepository:
             f"""
             UPDATE events
             SET name = $3, description = $4, type = $5, start_at = $6, duration_minutes = $7,
-                embedding = COALESCE($8, embedding)
+                embedding = COALESCE($8, embedding),
+                notified_at = CASE WHEN start_at IS DISTINCT FROM $6 THEN NULL ELSE notified_at END,
+                notification_claimed_at = CASE WHEN start_at IS DISTINCT FROM $6
+                    THEN NULL ELSE notification_claimed_at END,
+                notification_claim_token = CASE WHEN start_at IS DISTINCT FROM $6
+                    THEN NULL ELSE notification_claim_token END
             WHERE id = $1 AND user_id = $2
             RETURNING {_COLUMNS}
             """,
@@ -252,21 +264,23 @@ class EventRepository:
         return len(inserted)
 
     async def claim_due_events(
-        self, now: datetime, lookback: timedelta, limit: int = 50
+        self,
+        now: datetime,
+        lookback: timedelta,
+        limit: int = 50,
+        *,
+        claim_token: UUID | None = None,
     ) -> list[Event]:
-        """Забрать наступившие события, которые ещё не отправляли, и сразу пометить их.
-
-        Пометка и выборка — один запрос: два процесса бота не отправят одно напоминание
-        дважды. lookback не даёт после простоя вывалить пользователю всё за годы назад
-        (в импортированном календаре даты бывают и прошлогодние).
-        """
+        """Claim unsent events for five minutes; expired claims survive sender crashes."""
         rows = await self._pool.fetch(
             f"""
-            UPDATE events SET notified_at = now()
+            UPDATE events SET notification_claimed_at = $1, notification_claim_token = $4
             WHERE id IN (
                 SELECT id FROM events
                 WHERE status = 'active' AND notified_at IS NULL
                   AND start_at IS NOT NULL AND start_at <= $1 AND start_at > $2
+                  AND (notification_claimed_at IS NULL
+                       OR notification_claimed_at <= $1 - interval '5 minutes')
                 ORDER BY start_at
                 LIMIT $3
                 FOR UPDATE SKIP LOCKED
@@ -276,6 +290,7 @@ class EventRepository:
             now,
             now - lookback,
             limit,
+            claim_token or uuid4(),
         )
         return [self._to_event(r) for r in rows]
 
@@ -287,7 +302,8 @@ class EventRepository:
         """
         row = await self._pool.fetchrow(
             f"""
-            UPDATE events SET start_at = $3, notified_at = NULL
+            UPDATE events SET start_at = $3, notified_at = NULL,
+                notification_claimed_at = NULL, notification_claim_token = NULL
             WHERE id = $1 AND user_id = $2 AND status = 'active'
             RETURNING {_COLUMNS}
             """,
@@ -297,9 +313,23 @@ class EventRepository:
         )
         return None if row is None else self._to_event(row)
 
-    async def unmark_notified(self, event_id: UUID) -> None:
+    async def mark_notified(self, event_id: UUID, claim_token: UUID) -> None:
+        """Acknowledge delivery only while this worker owns the claim."""
+        await self._pool.execute(
+            "UPDATE events SET notified_at = now(), notification_claimed_at = NULL, "
+            "notification_claim_token = NULL WHERE id = $1 AND notification_claim_token = $2",
+            event_id,
+            claim_token,
+        )
+
+    async def unmark_notified(self, event_id: UUID, claim_token: UUID | None = None) -> None:
         """Вернуть событие в очередь: отправка в MAX не удалась, попробуем в следующий тик."""
-        await self._pool.execute("UPDATE events SET notified_at = NULL WHERE id = $1", event_id)
+        await self._pool.execute(
+            "UPDATE events SET notification_claimed_at = NULL, notification_claim_token = NULL "
+            "WHERE id = $1 AND ($2::uuid IS NULL OR notification_claim_token = $2)",
+            event_id,
+            claim_token,
+        )
 
     async def cancel_all(
         self, user_id: str, types: Sequence[EventType] | None = None, dry_run: bool = False
@@ -383,6 +413,74 @@ class EventRepository:
             )
             for r in rows
         ]
+
+    async def backfill_imported_embeddings(
+        self, user_id: str, *, limit: int = 1000, batch_size: int = 16
+    ) -> int:
+        """Index missing embeddings for this user's CSV-imported events only.
+
+        Each provider call is limited to at most 64 distinct texts. Updates are
+        committed per batch and guarded by ``embedding IS NULL`` so retries or
+        concurrent runs never replace a vector that already exists.
+        """
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if not 1 <= batch_size <= 64:
+            raise ValueError("batch_size must be between 1 and 64")
+
+        rows = await self._pool.fetch(
+            """
+            SELECT id, type, name, description FROM events
+            WHERE user_id = $1 AND external_id IS NOT NULL AND embedding IS NULL
+            ORDER BY created_at, id
+            LIMIT $2
+            """,
+            user_id,
+            limit,
+        )
+        if not rows:
+            return 0
+
+        texts = [
+            _embedding_text(EventType(row["type"]), row["name"], row["description"]) for row in rows
+        ]
+        vectors_by_text: dict[str, list[float]] = {}
+        indexed = 0
+
+        for offset in range(0, len(rows), batch_size):
+            batch_rows = rows[offset : offset + batch_size]
+            batch_texts = texts[offset : offset + batch_size]
+            pending_texts = list(
+                dict.fromkeys(text for text in batch_texts if text not in vectors_by_text)
+            )
+            if pending_texts:
+                vectors = await self._embedder.embed(pending_texts)
+                if vectors is None or len(vectors) != len(pending_texts):
+                    raise RuntimeError("Embedding provider failed; current batch was not written")
+                if any(len(vector) != EMBEDDING_DIM for vector in vectors):
+                    raise RuntimeError(
+                        "Embedding provider returned an invalid vector; batch not written"
+                    )
+                vectors_by_text.update(zip(pending_texts, vectors, strict=True))
+
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    for row, text in zip(batch_rows, batch_texts, strict=True):
+                        updated = await conn.fetchval(
+                            """
+                            UPDATE events SET embedding = $3
+                            WHERE id = $1 AND user_id = $2
+                              AND external_id IS NOT NULL AND embedding IS NULL
+                            RETURNING id
+                            """,
+                            row["id"],
+                            user_id,
+                            vectors_by_text[text],
+                        )
+                        if updated is not None:
+                            indexed += 1
+
+        return indexed
 
     async def _embed_one(self, text: str) -> list[float] | None:
         vectors = await self._embedder.embed([text])

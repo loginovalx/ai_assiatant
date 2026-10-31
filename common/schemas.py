@@ -7,7 +7,7 @@
 
 from datetime import datetime, timedelta
 from enum import StrEnum
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
@@ -164,6 +164,7 @@ class AgentStatus(StrEnum):
 
 
 class DraftAction(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
     tool: str
     arguments: dict = Field(default_factory=dict)
     preview: str

@@ -34,10 +34,11 @@ class FakeMax:
 class FakeAgent:
     """Отдаёт заготовленные ответы и запоминает, с какими флагами её звали."""
 
-    def __init__(self, *replies: AgentMessageResponse) -> None:
+    def __init__(self, *replies: AgentMessageResponse, confirm_reply=None) -> None:
         self.replies = list(replies)
         self.asked: list[dict[str, Any]] = []
         self.confirmed: list[DraftAction] = []
+        self.confirm_reply = confirm_reply
 
     async def ask(self, user_id, text, confirm_changes=False) -> AgentMessageResponse:
         self.asked.append({"text": text, "confirm_changes": confirm_changes})
@@ -45,7 +46,9 @@ class FakeAgent:
 
     async def confirm(self, user_id, draft) -> AgentMessageResponse:
         self.confirmed.append(draft)
-        return AgentMessageResponse(reply_text=f"Готово. {draft.preview}", status="done")
+        return self.confirm_reply or AgentMessageResponse(
+            reply_text=f"Готово. {draft.preview}", status="done"
+        )
 
 
 DRAFT = DraftAction(
@@ -128,6 +131,19 @@ async def test_confirm_button_executes_draft(handler, redis_client):
     assert await bot.drafts.load(str(USER)) is None
 
 
+async def test_failed_button_confirmation_keeps_draft_and_reports_failure(handler):
+    failure = AgentMessageResponse(reply_text="Не получилось выполнить.", status="error")
+    agent = FakeAgent(confirm_reply=failure)
+    bot, max_api = handler(agent)
+    await bot.drafts.save(str(USER), DRAFT)
+
+    await bot.handle_update(callback("draft:confirm"))
+
+    assert max_api.answered == [("cb-1", "Не получилось выполнить. Черновик сохранён")]
+    assert max_api.sent[-1]["text"] == failure.reply_text
+    assert await bot.drafts.load(str(USER)) == DRAFT
+
+
 async def test_cancel_button_drops_draft_without_executing(handler):
     agent = FakeAgent()
     bot, max_api = handler(agent)
@@ -160,6 +176,19 @@ async def test_yes_in_words_works_like_the_button(handler):
 
     assert agent.confirmed == [DRAFT]
     assert agent.asked == []  # в агента как новый запрос не ушло
+
+
+async def test_failed_text_confirmation_keeps_draft_for_retry(handler):
+    failure = AgentMessageResponse(reply_text="Временная ошибка.", status="error")
+    agent = FakeAgent(confirm_reply=failure)
+    bot, max_api = handler(agent)
+    await bot.redis.set(f"bot:greeted:{USER}", "1")
+    await bot.drafts.save(str(USER), DRAFT)
+
+    await bot.handle_update(text_message("да"))
+
+    assert max_api.sent[-1]["text"] == failure.reply_text
+    assert await bot.drafts.load(str(USER)) == DRAFT
 
 
 async def test_free_text_while_draft_pending_goes_to_agent_as_edit(handler):

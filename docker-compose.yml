@@ -6,12 +6,15 @@ x-python-service: &python-service
   environment:
     DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
     REDIS_URL: redis://redis:6379/0
+    SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
   restart: unless-stopped
   depends_on:
     postgres:
       condition: service_healthy
     redis:
       condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
 
 services:
   postgres:
@@ -24,7 +27,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./db/migrations:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 3s
@@ -37,12 +40,26 @@ services:
     volumes:
       - redisdata:/data
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "valkey-cli", "ping"]
       interval: 3s
       timeout: 3s
       retries: 20
+
+  migrate:
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    build:
+      context: .
+      dockerfile: infra/Dockerfile
+      args: { GROUP: mcp }
+    command: ["python", "-m", "scripts.migrate"]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   mcp:
     <<: *python-service
@@ -52,7 +69,7 @@ services:
       args: { GROUP: mcp }
     command: ["python", "-m", "mcp_server.server"]
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 5s
@@ -67,7 +84,7 @@ services:
       args: { GROUP: api }
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -88,7 +105,7 @@ services:
       GIGACHAT_MODEL: ${LLM_MODEL:-GigaChat-2-Max}
       GIGACHAT_VERIFY_SSL_CERTS: "False"
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     restart: unless-stopped
 
   agent:
@@ -104,6 +121,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       MCP_URL: http://mcp:8001/mcp
       LLM_BASE_URL: http://gpt2giga:8090/v1
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
     depends_on:
       redis:
         condition: service_healthy
@@ -112,7 +130,7 @@ services:
       gpt2giga:
         condition: service_started
     ports:
-      - "8002:8002"
+      - "127.0.0.1:8002:8002"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 5s
@@ -136,6 +154,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
       AGENT_URL: http://agent:8002
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
     depends_on:
       postgres:
         condition: service_healthy
@@ -144,7 +163,7 @@ services:
       agent:
         condition: service_healthy
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 5s

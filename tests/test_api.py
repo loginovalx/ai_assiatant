@@ -75,6 +75,37 @@ async def test_ics_undated_task_gets_409(client):
     assert response.status_code == 409
 
 
+async def test_complete_event_is_visible_and_owner_scoped(client, tz):
+    event = await seed(tz, EventType.TASK)
+    path = f"/v1/events/{event.id}/complete"
+    assert (await client.post(path, params={"user_id": "other"})).status_code == 404
+    response = await client.post(path, params={"user_id": USER})
+    assert response.status_code == 200 and response.json()["status"] == "done"
+    exported = await client.get(f"/v1/events/{event.id}/ics", params={"user_id": USER})
+    assert "✓ Выполнено:" in exported.text.replace("\r\n ", "")
+    assert "BEGIN:VALARM" not in exported.text
+
+
+async def test_signed_user_cannot_read_another_calendar(client, tz, monkeypatch):
+    from common.config import get_settings
+    from tests.test_api_auth import TOKEN, signed_data
+
+    event = await seed(tz)
+    monkeypatch.setattr(get_settings(), "max_token", TOKEN)
+    monkeypatch.setattr(get_settings(), "api_allow_dev_user_id", False)
+    headers = {"X-Max-Init-Data": signed_data()}
+    assert (await client.get(f"/v1/events/{event.id}/ics", headers=headers)).status_code == 404
+    assert (
+        await client.post(f"/v1/events/{event.id}/complete", headers=headers)
+    ).status_code == 404
+
+
+async def test_miniapp_is_served_from_api(client):
+    response = await client.get("/app/")
+    assert response.status_code == 200
+    assert "max-web-app.js" in response.text
+
+
 def test_ics_format():
     from uuid import uuid4
 

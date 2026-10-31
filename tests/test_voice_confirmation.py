@@ -205,3 +205,30 @@ async def test_stale_draft_fails_cleanly(make_agent, tz, pool):
     response = await agent.execute_draft(USER, draft)
     assert response.status == AgentStatus.ERROR
     assert "Не получилось выполнить" in response.reply_text
+
+
+async def test_repeated_confirmation_creates_only_one_event(make_agent, tz, pool):
+    agent, _ = make_agent()
+    draft = DraftAction(tool="create_event", arguments=reminder_args(tz), preview="Создам")
+    first = await agent.execute_draft(USER, draft)
+    second = await agent.execute_draft(USER, draft)
+    assert first.status == second.status == AgentStatus.DONE
+    assert first.events[0].id == second.events[0].id
+    assert await pool.fetchval("SELECT count(*) FROM events") == 1
+
+
+async def test_bulk_voice_delete_waits_for_confirmation(make_agent, repo, pool):
+    from common.schemas import EventCreate
+
+    await repo.create(EventCreate(user_id=USER, type="task", name="One"))
+    await repo.create(EventCreate(user_id=USER, type="task", name="Two"))
+    await repo.create(EventCreate(user_id="other", type="task", name="Other"))
+    agent, _ = make_agent(
+        tool_call("delete_events", {"event_types": ["task"]}), text("Удалить две задачи?")
+    )
+    result = await agent.handle(USER, "Удали все задачи", confirm_changes=True)
+    assert result.status == AgentStatus.NEEDS_CONFIRMATION
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE status='active'") == 3
+    confirmed = await agent.execute_draft(USER, result.draft)
+    assert confirmed.status == AgentStatus.DONE and len(confirmed.events) == 2
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE status='active'") == 1

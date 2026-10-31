@@ -124,3 +124,44 @@ def test_reminder_text_matches_spec(tz):
         updated_at=now,
     )
     assert format_notification(event) == "Напоминание: позвонить Ивану"
+
+
+async def test_claim_is_recovered_after_sender_crash(repo, pool, sender, tz):
+    now = datetime.now(tz)
+    event = await add(repo, now - timedelta(minutes=1))
+    assert await repo.claim_due_events(now, timedelta(hours=1))
+    assert not await repo.claim_due_events(now, timedelta(hours=1))
+    await pool.execute(
+        "UPDATE events SET notification_claimed_at = $2 WHERE id = $1",
+        event.id,
+        now - timedelta(minutes=6),
+    )
+    api = FakeMax()
+    assert await sender(api).tick(now) == 1
+    assert await sender(api).tick(now) == 0
+
+
+async def test_rescheduling_sent_event_sends_new_reminder(repo, sender, tz):
+    now = datetime.now(tz)
+    event = await add(repo, now - timedelta(minutes=1))
+    api = FakeMax()
+    assert await sender(api).tick(now) == 1
+    await repo.update(USER, event.id, start_at=now + timedelta(minutes=1))
+    assert await sender(api).tick(now + timedelta(minutes=2)) == 1
+
+
+async def test_old_worker_cannot_ack_new_claim(repo, pool, tz):
+    now = datetime.now(tz)
+    event = await add(repo, now - timedelta(minutes=1))
+    old, new = uuid4(), uuid4()
+    await repo.claim_due_events(now, timedelta(hours=1), claim_token=old)
+    await pool.execute(
+        "UPDATE events SET notification_claimed_at = $2 WHERE id = $1",
+        event.id,
+        now - timedelta(minutes=6),
+    )
+    await repo.claim_due_events(now, timedelta(hours=1), claim_token=new)
+    await repo.mark_notified(event.id, old)
+    assert await pool.fetchval("SELECT notified_at FROM events WHERE id=$1", event.id) is None
+    await repo.mark_notified(event.id, new)
+    assert await pool.fetchval("SELECT notified_at FROM events WHERE id=$1", event.id)

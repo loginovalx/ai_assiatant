@@ -219,9 +219,16 @@ class BotHandler:
                 await self.max_api.answer_callback(callback_id)
             elif payload == "draft:confirm" and draft:
                 result = await self.agent.confirm(user_id, draft)
-                await self.drafts.drop(user_id)
+                succeeded = result.status == "done"
+                if succeeded:
+                    await self.drafts.drop(user_id)
                 await self._result(user_id, int(user), result)
-                await self.max_api.answer_callback(callback_id, "✅ Подтверждено")
+                await self.max_api.answer_callback(
+                    callback_id,
+                    "✅ Подтверждено"
+                    if succeeded
+                    else "Не получилось выполнить. Черновик сохранён",
+                )
             else:
                 await self.max_api.answer_callback(callback_id, "Черновик устарел")
         finally:
@@ -427,7 +434,8 @@ class BotHandler:
             pending = await self.drafts.load(user_id)
             if pending and text.casefold().strip(" .!") in {"да", "подтвердить", "подтверждаю"}:
                 result = await self.agent.confirm(user_id, pending)
-                await self.drafts.drop(user_id)
+                if result.status == "done":
+                    await self.drafts.drop(user_id)
             elif pending and text.casefold().strip(" .!") in {"нет", "отмена", "отмени"}:
                 await self.drafts.drop(user_id)
                 await reply("Отменил действие.")

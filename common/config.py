@@ -1,6 +1,7 @@
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,7 +18,7 @@ class Settings(BaseSettings):
 
     # GigaChat: ключ авторизации из личного кабинета developers.sber.ru.
     # Пусто — эмбеддинги выключены, поиск работает только по тексту.
-    gigachat_credentials: str | None = None
+    gigachat_credentials: str | None = Field(default=None, repr=False)
     gigachat_scope: str = "GIGACHAT_API_PERS"
     gigachat_verify_ssl: bool = False
     gigachat_embeddings_model: str = "Embeddings"
@@ -27,11 +28,14 @@ class Settings(BaseSettings):
     mcp_path: str = "/mcp"
 
     api_cors_origins: list[str] = ["*"]
+    max_token: str = Field(default="", repr=False)
+    api_allow_dev_user_id: bool = False
+    max_init_data_ttl_seconds: int = Field(default=3600, ge=60, le=86400)
 
     # --- Агент ---
     # LLM через gpt2giga: OpenAI-совместимый прокси к GigaChat.
     llm_base_url: str = "http://localhost:8090/v1"
-    llm_api_key: str = "change-me"  # = GPT2GIGA_API_KEY
+    llm_api_key: str = Field(default="change-me", repr=False)  # = GPT2GIGA_API_KEY
     llm_model: str = "GigaChat-2-Max"
     llm_timeout_seconds: float = 60
     mcp_url: str = "http://localhost:8001/mcp"

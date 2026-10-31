@@ -1,19 +1,21 @@
 """Configuration from environment. MAX token is never baked into source code."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from os import getenv
+
+from dotenv import load_dotenv
 
 
 @dataclass(frozen=True)
 class Settings:
-    max_token: str
+    max_token: str = field(repr=False)
     max_api_base: str = "https://platform-api2.max.ru"
     redis_url: str = "redis://localhost:6379/0"
     agent_url: str = "http://localhost:8002"
     asr_provider: str = "whisper"  # whisper | http | disabled
     whisper_model: str = "base"
     asr_http_url: str = ""
-    asr_http_token: str = ""
+    asr_http_token: str = field(default="", repr=False)
     bot_state_ttl: int = 300
     max_voice_bytes: int = 15_000_000
     polling_timeout: int = 20
@@ -25,6 +27,7 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        load_dotenv(".env", override=False)
         return cls(
             max_token=getenv("MAX_TOKEN", ""),
             max_api_base=getenv("MAX_API_BASE", "https://platform-api2.max.ru").rstrip("/"),

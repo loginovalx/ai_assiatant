@@ -1,6 +1,6 @@
 -- Схема хранения задач, напоминаний и встреч.
 -- Postgres-контейнер выполняет файлы из этой папки один раз, при первом старте на пустом volume.
--- Изменили схему — `docker compose down -v && docker compose up`.
+-- Для существующей базы: `python -m scripts.migrate` (без удаления данных).
 
 CREATE EXTENSION IF NOT EXISTS vector;   -- эмбеддинги для поиска по смыслу
 CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- нечёткий поиск по опечаткам

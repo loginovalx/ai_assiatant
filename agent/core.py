@@ -80,7 +80,15 @@ class Agent:
                 status=AgentStatus.ERROR,
             )
         try:
-            result = await self._toolbox.call(user_id, draft.tool, draft.arguments)
+            if draft.tool == "create_event":
+                result = await self._toolbox.call(
+                    user_id,
+                    draft.tool,
+                    draft.arguments,
+                    idempotency_key=str(draft.id),
+                )
+            else:
+                result = await self._toolbox.call(user_id, draft.tool, draft.arguments)
             if not result.ok:
                 return AgentResponse(
                     reply_text=f"Не получилось выполнить: {result.payload}",
@@ -89,12 +97,29 @@ class Agent:
             events = [Event.model_validate(raw) for raw in result.events]
             if any(event.user_id != user_id for event in events):
                 raise ValueError("Foreign event")
+            confirmed: dict[str, Event] = {}
+            conflict_warnings: dict[str, Event] = {}
+            for raw, event in zip(result.events, events, strict=True):
+                confirmed[str(event.id)] = event
+                for conflict in raw.get("conflicts") or []:
+                    other = Event.model_validate(conflict)
+                    if other.user_id != user_id:
+                        raise ValueError("Foreign conflict event")
+                    conflict_warnings[str(other.id)] = other
+            summary = _confirmed_response(confirmed, conflict_warnings)
             response = AgentResponse(
-                reply_text="Готово. " + draft.preview, events=events, status=AgentStatus.DONE
+                reply_text="Готово.\n" + summary.reply_text,
+                events=summary.events,
+                status=AgentStatus.DONE,
             )
-            await self._memory.append(
-                user_id, HistoryMessage(role="assistant", content=_with_event_refs(response))
-            )
+            try:
+                await self._memory.append(
+                    user_id, HistoryMessage(role="assistant", content=_with_event_refs(response))
+                )
+            except Exception:
+                # The write is committed; a Redis history failure must not tell the
+                # user that confirmation failed and encourage a duplicate retry.
+                logger.exception("Не удалось сохранить подтверждённое действие в историю")
             return response
         except Exception:
             logger.exception("Ошибка подтверждения черновика")
@@ -113,6 +138,7 @@ class Agent:
         conflict_warnings: dict[str, Event] = {}
         last_error: str | None = None
         draft: DraftAction | None = None
+        draft_fingerprint: str | None = None
 
         for _ in range(self._max_steps):
             try:
@@ -170,6 +196,14 @@ class Agent:
 
                 fingerprint = json.dumps([name, args], ensure_ascii=False, sort_keys=True)
                 preview = confirm_changes and name in MUTATING_TOOLS
+                if preview and draft_fingerprint is not None and fingerprint != draft_fingerprint:
+                    return AgentResponse(
+                        reply_text=(
+                            "За один раз можно подтвердить только одно действие. "
+                            "Отправьте команды по одной, пожалуйста."
+                        ),
+                        status=AgentStatus.NEED_CLARIFICATION,
+                    )
                 result = mutations.get(fingerprint) or (
                     (
                         await self._toolbox.call(user_id, name, args, dry_run=True)
@@ -181,7 +215,10 @@ class Agent:
                 )
                 last_error = None if result.ok else str(result.payload)
                 if preview and result.ok:
-                    draft = DraftAction(tool=name, arguments=args, preview="")
+                    draft_args = {**args, "confirmed": True} if name == "delete_events" else args
+                    draft = DraftAction(tool=name, arguments=draft_args, preview="")
+                    draft_fingerprint = fingerprint
+                    mutations[fingerprint] = result
                     messages.append(
                         {"role": "tool", "tool_call_id": call.id, "content": result.for_llm()}
                     )

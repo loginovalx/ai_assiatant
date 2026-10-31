@@ -2,13 +2,13 @@
 
 Источник истины — таблица events, а не память процесса: после перезапуска бота
 уже созданные напоминания никуда не денутся, а отправленные повторно не придут
-(отметка notified_at ставится в том же запросе, которым событие забирается в работу).
+(notified_at ставится после доставки, а незавершённая отправка возвращается через пять минут).
 """
 
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from bot.max_api import MaxAPI, MaxAPIError
@@ -77,7 +77,10 @@ class ReminderSender:
     async def tick(self, now: datetime | None = None) -> int:
         """Один проход: забрать наступившее и отправить. Возвращает число отправленных."""
         now = now or datetime.now(self._tz)
-        due = await self._repo.claim_due_events(now, self._lookback, self._batch)
+        claim_token = uuid4()
+        due = await self._repo.claim_due_events(
+            now, self._lookback, self._batch, claim_token=claim_token
+        )
         sent = 0
         for event in due:
             try:
@@ -88,12 +91,13 @@ class ReminderSender:
                     to_user=True,
                     buttons=event_buttons(event.id),
                 )
+                await self._repo.mark_notified(event.id, claim_token)
                 sent += 1
             except (MaxAPIError, ValueError, OSError) as exc:
                 # Снимаем отметку: пользователь не получил сообщение, пробуем в следующий раз.
                 logger.warning("Не удалось отправить напоминание %s: %s", event.id, exc)
-                await self._repo.unmark_notified(event.id)
+                await self._repo.unmark_notified(event.id, claim_token)
             except Exception:
                 logger.exception("Неожиданная ошибка при отправке напоминания %s", event.id)
-                await self._repo.unmark_notified(event.id)
+                await self._repo.unmark_notified(event.id, claim_token)
         return sent

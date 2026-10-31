@@ -20,6 +20,7 @@ if TEST_DSN:
     os.environ["DATABASE_URL"] = TEST_DSN
 os.environ["GIGACHAT_CREDENTIALS"] = ""
 os.environ["DEFAULT_TZ"] = "Europe/Moscow"
+os.environ["API_ALLOW_DEV_USER_ID"] = "true"  # existing API tests use explicit development IDs
 
 from common.config import get_settings  # noqa: E402
 from common.db import create_pool  # noqa: E402

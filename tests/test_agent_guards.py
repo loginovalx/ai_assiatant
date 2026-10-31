@@ -8,12 +8,21 @@ from openai.types.chat import ChatCompletion
 from agent.core import Agent
 from agent.prompt import build_system_prompt
 from agent.tools import ToolResult
-from common.schemas import AgentStatus, Event
+from common.schemas import AgentStatus, DraftAction, Event
 
 
-def completion(content=None, call=False):
+def completion(content=None, call=False, calls=None):
     message = {"role": "assistant", "content": content}
-    if call:
+    if calls is not None:
+        message["tool_calls"] = [
+            {
+                "id": f"c{i}",
+                "type": "function",
+                "function": {"name": name, "arguments": json_args},
+            }
+            for i, (name, json_args) in enumerate(calls, start=1)
+        ]
+    elif call:
         message["tool_calls"] = [
             {
                 "id": "c1",
@@ -56,7 +65,7 @@ class Toolbox:
     async def openai_tools(self):
         return []
 
-    async def call(self, *args):
+    async def call(self, *args, **kwargs):
         self.calls += 1
         return self.result
 
@@ -132,6 +141,28 @@ async def test_duplicate_mutation_is_not_executed_twice():
     assert toolbox.calls == 1
 
 
+async def test_duplicate_preview_is_deduplicated():
+    agent, toolbox = setup_agent(
+        [completion(call=True), completion(call=True), completion("Создал")], mutation()
+    )
+    result = await agent.handle("u", "Test", confirm_changes=True)
+    assert result.status == AgentStatus.NEEDS_CONFIRMATION
+    assert toolbox.calls == 1
+
+
+async def test_multiple_distinct_previews_require_one_action_at_a_time():
+    calls = [
+        ("create_event", '{"event_type":"task","name":"Первое"}'),
+        ("create_event", '{"event_type":"task","name":"Второе"}'),
+    ]
+    agent, toolbox = setup_agent([completion(calls=calls)], mutation())
+    result = await agent.handle("u", "Создай два дела", confirm_changes=True)
+    assert result.status == AgentStatus.NEED_CLARIFICATION
+    assert "по одной" in result.reply_text
+    assert result.draft is None
+    assert toolbox.calls == 1
+
+
 async def test_empty_model_reply_is_error():
     agent, _ = setup_agent([completion("")])
     assert (await agent.handle("u", "Test")).status == AgentStatus.ERROR
@@ -145,6 +176,20 @@ async def test_fallback_keeps_meeting_conflict_warning():
     result = await agent.handle("u", "Test")
     assert result.status == AgentStatus.DONE
     assert "Other meeting" in result.reply_text
+    assert len(result.events) == 2
+
+
+async def test_confirm_draft_uses_actual_result_and_survives_history_failure():
+    saved = mutation()
+    conflict = {**saved.events[0], "id": str(uuid4()), "name": "Реальная встреча"}
+    saved.events[0]["conflicts"] = [conflict]
+    agent, _ = setup_agent([], saved, Memory(fail_save=True))
+    draft = DraftAction(tool="create_event", arguments={"name": "Test"}, preview="Старый текст")
+    result = await agent.execute_draft("u", draft)
+    assert result.status == AgentStatus.DONE
+    assert "Test" in result.reply_text
+    assert "Реальная встреча" in result.reply_text
+    assert "Старый текст" not in result.reply_text
     assert len(result.events) == 2
 
 

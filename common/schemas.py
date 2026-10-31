@@ -175,6 +175,7 @@ class AgentRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
     text: str = Field(min_length=1, max_length=4000)
     confirm_changes: bool = False
+    request_id: UUID | None = None
 
 
 class AgentResponse(BaseModel):

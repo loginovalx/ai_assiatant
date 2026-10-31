@@ -34,7 +34,7 @@ from common.schemas import (
     SearchHit,
     check_duration,
 )
-from common.timeutils import ensure_aware, mentions_time
+from common.timeutils import WEEKDAYS_RU, ensure_aware, mentions_time, named_weekday
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +182,15 @@ async def create_event(
             f"Время {data.start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "
             "Проверь вычисление даты или уточни у пользователя."
         )
+    weekday = named_weekday(source_text)
+    if data.start_at is not None and weekday is not None:
+        local_start = data.start_at.astimezone(get_settings().tz)
+        if local_start.weekday() != weekday:
+            raise ToolError(
+                f"В запросе назван день {WEEKDAYS_RU[weekday]}, но дата "
+                f"{local_start.date().isoformat()} — {WEEKDAYS_RU[local_start.weekday()]}. "
+                "Проверь календарь в системном промпте; при противоречии уточни дату."
+            )
 
     # Длительность встречи решает, с чем она пересечётся, поэтому не подставляем час молча:
     # пусть агент спросит. «Не знаю» — тоже ответ: тогда агент сам передаст 60 и скажет об этом.
@@ -460,12 +469,21 @@ async def delete_events(
             )
         ),
     ] = None,
+    event_ids: Annotated[
+        list[UUID] | None,
+        Field(
+            description=(
+                "Необязательный точный снимок ID из предпросмотра. При подтверждении удаляются "
+                "только эти записи, если они всё ещё принадлежат пользователю и подходят по типу."
+            )
+        ),
+    ] = None,
     confirmed: Annotated[
         bool,
         Field(description="true только после того, как пользователь ответил «да» на вопрос."),
     ] = False,
     dry_run: bool = False,
-) -> list[Event] | dict[str, int]:
+) -> list[Event] | dict[str, int | list[str]]:
     """Удалить сразу ВСЕ записи пользователя заданных типов.
 
     Для «удали все мои задачи», «очисти всё». Для одной записи используй delete_event.
@@ -475,17 +493,25 @@ async def delete_events(
     types = [EventType(t) for t in event_types] if event_types else None
     repo = _repo(ctx)
     if not confirmed or dry_run:
-        count = await repo.cancel_all(user_id, types, dry_run=True)
-        if count == 0:
+        preview_ids = await repo.preview_cancellation_ids(user_id, types)
+        if not preview_ids:
             raise ToolError("Записей такого типа нет — удалять нечего. Так и скажи пользователю.")
         if dry_run:
-            return {"count": count}  # no writes; the bot's confirmation button approves this draft
+            return {
+                "count": len(preview_ids),
+                "event_ids": [str(event_id) for event_id in preview_ids],
+            }  # no writes; confirmation approves this exact snapshot
         raise ToolError(
-            f"Ничего не удалено: будет удалено записей — {count}. Спроси через ask_user: "
-            f"«Удалить все записи ({count} шт.)? Это нельзя отменить.» Ответил «да» — "
+            f"Ничего не удалено: будет удалено записей — {len(preview_ids)}. "
+            "Спроси через ask_user: "
+            f"«Удалить все записи ({len(preview_ids)} шт.)? Это нельзя отменить.» Ответил «да» — "
             "вызови тул снова с confirmed=true; «нет» — ничего не делай."
         )
-    deleted = await repo.cancel_all(user_id, types)
+    deleted = (
+        await repo.cancel_selected(user_id, event_ids, types)
+        if event_ids is not None
+        else await repo.cancel_all(user_id, types)
+    )
     logger.info("bulk deleted %d events user=%s types=%s", len(deleted), user_id, event_types)
     return deleted
 

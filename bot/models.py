@@ -1,6 +1,7 @@
 """Strict shared Agent API schema (copy into common/ only via its owner)."""
 
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -11,6 +12,7 @@ class AgentMessageRequest(BaseModel):
     user_id: str
     text: str = Field(min_length=1)
     confirm_changes: bool = False
+    request_id: UUID | None = None
 
 
 class AgentMessageResponse(BaseModel):

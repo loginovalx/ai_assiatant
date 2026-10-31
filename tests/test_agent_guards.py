@@ -67,7 +67,10 @@ class Toolbox:
 
     async def call(self, *args, **kwargs):
         self.calls += 1
-        return self.result
+        value = self.result.pop(0) if isinstance(self.result, list) else self.result
+        if isinstance(value, Exception):
+            raise value
+        return value
 
 
 def setup_agent(script, result=None, memory=None):
@@ -115,6 +118,61 @@ async def test_failed_tool_cannot_be_confirmed_by_model():
     result = await agent.handle("u", "Test")
     assert result.status == AgentStatus.NEED_CLARIFICATION
     assert result.reply_text != "Создал"
+
+
+async def test_successful_read_does_not_erase_failed_mutation():
+    agent, _ = setup_agent(
+        [completion(call=True), completion(calls=[("get_events", "{}")]), completion("Создал")],
+        [ToolResult(ok=False, payload="Нужно время"), ToolResult(ok=True, payload=[], events=[])],
+    )
+    result = await agent.handle("u", "Создай встречу")
+    assert result.status == AgentStatus.NEED_CLARIFICATION
+    assert result.reply_text != "Создал" and not result.events
+
+
+async def test_late_tool_failure_preserves_committed_event():
+    agent, _ = setup_agent(
+        [completion(call=True), completion(calls=[("get_events", "{}")]), completion("Готово")],
+        [mutation(), ConnectionError("MCP down")],
+    )
+    result = await agent.handle("u", "Создай и покажи")
+    assert len(result.events) == 1 and result.events[0].name == "Test"
+    assert result.status == AgentStatus.NEED_CLARIFICATION
+
+
+async def test_distinct_create_success_does_not_hide_failed_create_in_batch():
+    agent, _ = setup_agent(
+        [
+            completion(
+                calls=[
+                    ("create_event", '{"event_type":"task","name":"First"}'),
+                    ("create_event", '{"event_type":"task","name":"Second"}'),
+                ]
+            ),
+            completion("Создал оба"),
+        ],
+        [ToolResult(ok=False, payload="First failed"), mutation()],
+    )
+    result = await agent.handle("u", "Создай два дела")
+    assert result.status == AgentStatus.NEED_CLARIFICATION
+    assert "First failed" in result.reply_text and len(result.events) == 1
+
+
+async def test_step_limit_does_not_hide_partial_failure():
+    agent, _ = setup_agent(
+        [completion(call=True)] + [completion(calls=[("get_events", "{}")])] * 5,
+        [mutation()] + [ToolResult(ok=False, payload="Read failed")] * 5,
+    )
+    result = await agent.handle("u", "Создай и покажи")
+    assert result.status == AgentStatus.NEED_CLARIFICATION
+    assert len(result.events) == 1 and "Read failed" in result.reply_text
+
+
+async def test_malformed_completion_after_commit_preserves_result():
+    malformed = completion("bad").model_copy(update={"choices": []})
+    agent, _ = setup_agent([completion(call=True), malformed], mutation())
+    result = await agent.handle("u", "Создай")
+    assert result.status == AgentStatus.DONE and len(result.events) == 1
 
 
 async def test_confirmed_mutation_survives_model_failure():

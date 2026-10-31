@@ -362,6 +362,46 @@ class EventRepository:
         )
         return [self._to_event(r) for r in rows]
 
+    async def preview_cancellation_ids(
+        self, user_id: str, types: Sequence[EventType] | None = None
+    ) -> list[UUID]:
+        """Return the exact active event IDs a confirmed bulk cancellation would target."""
+        type_values = [t.value for t in types] if types else None
+        rows = await self._pool.fetch(
+            """
+            SELECT id FROM events
+            WHERE user_id = $1 AND status <> 'cancelled'
+              AND ($2::text[] IS NULL OR type = ANY($2))
+            ORDER BY id
+            """,
+            user_id,
+            type_values,
+        )
+        return [row["id"] for row in rows]
+
+    async def cancel_selected(
+        self,
+        user_id: str,
+        event_ids: Sequence[UUID],
+        types: Sequence[EventType] | None = None,
+    ) -> list[Event]:
+        """Cancel only previewed IDs that still belong to the user and match the types."""
+        if not event_ids:
+            return []
+        type_values = [t.value for t in types] if types else None
+        rows = await self._pool.fetch(
+            f"""
+            UPDATE events SET status = 'cancelled'
+            WHERE id = ANY($1::uuid[]) AND user_id = $2 AND status <> 'cancelled'
+              AND ($3::text[] IS NULL OR type = ANY($3))
+            RETURNING {_COLUMNS}
+            """,
+            list(event_ids),
+            user_id,
+            type_values,
+        )
+        return [self._to_event(r) for r in rows]
+
     async def list_by_period(
         self,
         user_id: str,

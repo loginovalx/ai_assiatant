@@ -8,6 +8,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Any
+from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
@@ -41,7 +42,13 @@ class Agent:
         self._max_steps = max_steps
 
     async def handle(
-        self, user_id: str, text: str, now: datetime | None = None, *, confirm_changes: bool = False
+        self,
+        user_id: str,
+        text: str,
+        now: datetime | None = None,
+        *,
+        confirm_changes: bool = False,
+        request_id: UUID | None = None,
     ) -> AgentResponse:
         now = now or datetime.now(self._tz)
         try:
@@ -51,7 +58,9 @@ class Agent:
                 *history,
                 {"role": "user", "content": text},
             ]
-            response = await self._run(user_id, messages, confirm_changes=confirm_changes)
+            response = await self._run(
+                user_id, messages, confirm_changes=confirm_changes, request_id=request_id
+            )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
             logger.exception("LLM или MCP недоступны")
             return AgentResponse(reply_text=FALLBACK_ERROR, status=AgentStatus.ERROR)
@@ -86,6 +95,13 @@ class Agent:
                     draft.tool,
                     draft.arguments,
                     idempotency_key=str(draft.id),
+                )
+            elif draft.tool == "delete_events":
+                result = await self._toolbox.call(
+                    user_id,
+                    draft.tool,
+                    draft.arguments,
+                    event_ids=draft.arguments.get("event_ids"),
                 )
             else:
                 result = await self._toolbox.call(user_id, draft.tool, draft.arguments)
@@ -129,36 +145,42 @@ class Agent:
             )
 
     async def _run(
-        self, user_id: str, messages: list[dict[str, Any]], *, confirm_changes: bool = False
+        self,
+        user_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        confirm_changes: bool = False,
+        request_id: UUID | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
         events: dict[str, Event] = {}
         mutations: dict[str, ToolResult] = {}
         confirmed: dict[str, Event] = {}
         conflict_warnings: dict[str, Event] = {}
-        last_error: str | None = None
+        errors: dict[str, tuple[str, dict | None, str, int]] = {}
+        mutation_number = 0
         draft: DraftAction | None = None
         draft_fingerprint: str | None = None
 
-        for _ in range(self._max_steps):
+        for round_number in range(self._max_steps):
             try:
                 completion = await self._llm.chat.completions.create(
                     model=self._model, messages=messages, tools=tools, temperature=0.1
                 )
+                message = completion.choices[0].message
             except Exception:
                 if confirmed:
                     logger.exception("LLM недоступна после подтверждённой записи")
-                    return _confirmed_response(confirmed, conflict_warnings)
+                    return (
+                        _incomplete_response(events, confirmed, conflict_warnings, errors)
+                        if errors
+                        else _confirmed_response(confirmed, conflict_warnings)
+                    )
                 raise
-            message = completion.choices[0].message
 
             if not message.tool_calls:
-                if last_error:
-                    return AgentResponse(
-                        reply_text=f"Не удалось выполнить действие: {last_error}. Уточните запрос.",
-                        status=AgentStatus.NEED_CLARIFICATION,
-                        events=list(events.values()),
-                    )
+                if errors:
+                    return _incomplete_response(events, confirmed, conflict_warnings, errors)
                 reply = (message.content or "").strip()
                 if draft and reply:
                     draft.preview = reply
@@ -204,18 +226,46 @@ class Agent:
                         ),
                         status=AgentStatus.NEED_CLARIFICATION,
                     )
-                result = mutations.get(fingerprint) or (
-                    (
-                        await self._toolbox.call(user_id, name, args, dry_run=True)
-                        if preview
-                        else await self._toolbox.call(user_id, name, args)
-                    )
-                    if args is not None
-                    else ToolResult(ok=False, payload="Аргументы не являются корректным JSON")
-                )
-                last_error = None if result.ok else str(result.payload)
+                result = mutations.get(fingerprint)
+                if result is None:
+                    try:
+                        if args is None:
+                            result = ToolResult(
+                                ok=False, payload="Аргументы не являются корректным JSON"
+                            )
+                        elif preview:
+                            result = await self._toolbox.call(user_id, name, args, dry_run=True)
+                        elif name == "create_event" and request_id is not None:
+                            result = await self._toolbox.call(
+                                user_id,
+                                name,
+                                args,
+                                idempotency_key=str(uuid5(request_id, f"create:{mutation_number}")),
+                            )
+                        else:
+                            result = await self._toolbox.call(user_id, name, args)
+                    except Exception:
+                        if not confirmed:
+                            raise
+                        logger.exception("MCP недоступен после подтверждённой записи")
+                        result = ToolResult(ok=False, payload="Инструмент временно недоступен")
+                if result.ok:
+                    for failed_key, (failed_name, failed_args, _, failed_round) in list(
+                        errors.items()
+                    ):
+                        if failed_key == fingerprint or (
+                            round_number > failed_round
+                            and _same_action(name, args, failed_name, failed_args)
+                        ):
+                            errors.pop(failed_key)
+                else:
+                    errors[fingerprint] = (name, args, str(result.payload), round_number)
                 if preview and result.ok:
-                    draft_args = {**args, "confirmed": True} if name == "delete_events" else args
+                    draft_args = (
+                        {**args, "confirmed": True, "event_ids": result.payload["event_ids"]}
+                        if name == "delete_events"
+                        else args
+                    )
                     draft = DraftAction(tool=name, arguments=draft_args, preview="")
                     draft_fingerprint = fingerprint
                     mutations[fingerprint] = result
@@ -240,12 +290,16 @@ class Agent:
                     if result.ok and result.is_mutation:
                         confirmed[str(event.id)] = event
                 if result.ok and result.is_mutation:
+                    if fingerprint not in mutations:
+                        mutation_number += 1
                     mutations[fingerprint] = result
                 messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": result.for_llm()}
                 )
 
         logger.warning("agent exceeded %d steps", self._max_steps)
+        if errors:
+            return _incomplete_response(events, confirmed, conflict_warnings, errors)
         if confirmed:
             return _confirmed_response(confirmed, conflict_warnings)
         return AgentResponse(reply_text=TOO_MANY_STEPS, status=AgentStatus.ERROR)
@@ -257,6 +311,33 @@ def _parse_args(raw: str | None) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _same_action(
+    name: str, args: dict | None, previous_name: str, previous_args: dict | None
+) -> bool:
+    if name != previous_name or args is None or previous_args is None:
+        return False
+    if name == "create_event":
+        current = str(args.get("name", "")).casefold().strip()
+        return bool(current) and current == str(previous_args.get("name", "")).casefold().strip()
+    if name in MUTATING_TOOLS:
+        return args.get("event_id") is not None and args.get("event_id") == previous_args.get(
+            "event_id"
+        )
+    return True  # a later round may correct invalid read filters
+
+
+def _incomplete_response(events, confirmed, conflicts, errors) -> AgentResponse:
+    saved = _confirmed_response(confirmed, conflicts).reply_text if confirmed else ""
+    return AgentResponse(
+        reply_text=(saved + "\n" if saved else "")
+        + "Не удалось выполнить действие: "
+        + "; ".join(error[2] for error in errors.values())
+        + ". Уточните запрос.",
+        status=AgentStatus.NEED_CLARIFICATION,
+        events=list(events.values()),
+    )
 
 
 def _with_event_refs(response: AgentResponse) -> str:

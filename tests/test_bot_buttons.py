@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 from redis.asyncio import Redis
 
-from bot.handler import CONFIRM_BUTTONS, QUICK_ACTIONS, BotHandler
+from bot.handler import QUICK_ACTIONS, BotHandler, confirmation_buttons
 from bot.models import AgentMessageResponse, DraftAction
 from bot.state import StateStore
 
@@ -40,7 +40,9 @@ class FakeAgent:
         self.confirmed: list[DraftAction] = []
         self.confirm_reply = confirm_reply
 
-    async def ask(self, user_id, text, confirm_changes=False) -> AgentMessageResponse:
+    async def ask(
+        self, user_id, text, confirm_changes=False, request_id=None
+    ) -> AgentMessageResponse:
         self.asked.append({"text": text, "confirm_changes": confirm_changes})
         return self.replies.pop(0)
 
@@ -99,6 +101,8 @@ def text_message(body_text: str, mid: str = "m1") -> dict[str, Any]:
 
 
 def callback(payload: str) -> dict[str, Any]:
+    if payload.startswith("draft:") and len(payload.split(":")) == 2:
+        payload += ":" + str(DRAFT.id)
     return {
         "update_type": "message_callback",
         "callback": {
@@ -166,6 +170,20 @@ async def test_edit_button_asks_what_to_change_and_keeps_draft(handler):
     assert await bot.drafts.load(str(USER)) is not None  # ждём правку
 
 
+async def test_old_confirmation_button_cannot_execute_replacement_draft(handler):
+    agent = FakeAgent()
+    bot, max_api = handler(agent)
+    await bot._result(str(USER), USER, draft_reply())
+    old_payload = max_api.sent[-1]["buttons"][0][0]["payload"]
+    replacement = DraftAction(tool="delete_events", arguments={"event_ids": []}, preview="Удалить")
+    await bot.drafts.save(str(USER), replacement)
+    update = callback(old_payload)
+    update["callback"]["payload"] = old_payload
+    await bot.handle_update(update)
+    assert agent.confirmed == []
+    assert (await bot.drafts.load(str(USER))).id == replacement.id
+
+
 async def test_yes_in_words_works_like_the_button(handler):
     agent = FakeAgent()
     bot, _ = handler(agent)
@@ -201,7 +219,7 @@ async def test_free_text_while_draft_pending_goes_to_agent_as_edit(handler):
 
     assert agent.asked[0]["text"] == "давай в 12:30"
     assert agent.confirmed == []
-    assert max_api.sent[-1]["buttons"] == CONFIRM_BUTTONS  # снова на подтверждение
+    assert max_api.sent[-1]["buttons"] == confirmation_buttons(DRAFT.id)
 
 
 async def test_quick_action_runs_like_a_typed_question(handler):

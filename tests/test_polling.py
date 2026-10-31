@@ -32,7 +32,7 @@ class FakeAgent:
     def __init__(self):
         self.asked = []
 
-    async def ask(self, user_id, text, confirm_changes=False):
+    async def ask(self, user_id, text, confirm_changes=False, request_id=None):
         self.asked.append((user_id, text, confirm_changes))
         return AgentMessageResponse(reply_text="Отвечаю", status="done")
 

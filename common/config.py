@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     agent_history_messages: int = 10  # сколько последних реплик помнить
     agent_context_ttl_days: int = 7
     agent_max_steps: int = 6  # максимум раундов «LLM → тулы» на один запрос
+    agent_request_timeout_seconds: float = Field(default=65, gt=0, le=600)
 
     @property
     def tz(self) -> ZoneInfo:

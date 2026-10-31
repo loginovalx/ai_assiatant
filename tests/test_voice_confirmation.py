@@ -229,6 +229,38 @@ async def test_bulk_voice_delete_waits_for_confirmation(make_agent, repo, pool):
     result = await agent.handle(USER, "Удали все задачи", confirm_changes=True)
     assert result.status == AgentStatus.NEEDS_CONFIRMATION
     assert await pool.fetchval("SELECT count(*) FROM events WHERE status='active'") == 3
+    later = await repo.create(EventCreate(user_id=USER, type="task", name="Added after preview"))
     confirmed = await agent.execute_draft(USER, result.draft)
     assert confirmed.status == AgentStatus.DONE and len(confirmed.events) == 2
-    assert await pool.fetchval("SELECT count(*) FROM events WHERE status='active'") == 1
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE status='active'") == 2
+    assert (await repo.get(USER, later.id)).status == "active"
+
+
+async def test_message_retry_after_lost_mcp_receipt_does_not_duplicate(
+    make_agent, pool, tz, monkeypatch
+):
+    from uuid import uuid4
+
+    args = reminder_args(tz)
+    agent, _ = make_agent(
+        tool_call("create_event", args), tool_call("create_event", args), text("Сохранено")
+    )
+    actual_call = agent._toolbox.call
+    lose_receipt = True
+
+    async def flaky_call(user_id, name, arguments, **kwargs):
+        nonlocal lose_receipt
+        result = await actual_call(user_id, name, arguments, **kwargs)
+        if name == "create_event" and lose_receipt:
+            lose_receipt = False
+            raise ConnectionError("Committed, but the response was lost")
+        return result
+
+    monkeypatch.setattr(agent._toolbox, "call", flaky_call)
+    request_id = uuid4()
+    first = await agent.handle(USER, "Напомни завтра в 11", request_id=request_id)
+    second = await agent.handle(USER, "Напомни завтра в 11", request_id=request_id)
+    assert first.status == AgentStatus.ERROR
+    assert second.status == AgentStatus.DONE
+    assert len(second.events) == 1
+    assert await pool.fetchval("SELECT count(*) FROM events") == 1

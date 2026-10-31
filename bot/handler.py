@@ -4,7 +4,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from redis.asyncio import Redis
 
@@ -49,6 +49,13 @@ QUICK_ACTIONS = [
         {"type": "callback", "text": "Завтра", "payload": "quick:tomorrow"},
     ]
 ]
+
+
+def confirmation_buttons(draft_id: UUID) -> list[list[dict[str, str]]]:
+    return [
+        [{**button, "payload": f"{button['payload']}:{draft_id}"} for button in row]
+        for row in CONFIRM_BUTTONS
+    ]
 
 
 def _attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -124,7 +131,8 @@ def _untyped_file_present(message: dict[str, Any]) -> bool:
     Такие файлы нельзя различить по самому апдейту — подробности берём у /messages.
     """
     return any(
-        _is_audio_attachment(a)
+        a.get("type") == "file"
+        and _is_audio_attachment(a)
         and not _attachment_filename(a)
         and not str(
             (a.get("payload") or {}).get("mime_type")
@@ -170,7 +178,7 @@ class BotHandler:
         buttons = None
         if result.status == "needs_confirmation" and result.draft:
             await self.drafts.save(user_id, result.draft)
-            buttons = CONFIRM_BUTTONS
+            buttons = confirmation_buttons(result.draft.id)
         await self.max_api.send(
             chat_id, result.reply_text or "Агент не вернул ответ", to_user=to_user, buttons=buttons
         )
@@ -210,14 +218,19 @@ class BotHandler:
                 await self._event_action(user_id, callback_id, payload)
                 return
             draft = await self.drafts.load(user_id)
-            if payload == "draft:cancel":
+            parts = payload.split(":")
+            if len(parts) != 3 or parts[0] != "draft" or not draft or parts[2] != str(draft.id):
+                await self.max_api.answer_callback(callback_id, "Черновик устарел")
+                return
+            action = parts[1]
+            if action == "cancel":
                 await self.drafts.drop(user_id)
                 await self.max_api.send(int(user), "Отменил действие.", to_user=True)
                 await self.max_api.answer_callback(callback_id, "Отменено")
-            elif payload == "draft:edit":
+            elif action == "edit":
                 await self.max_api.send(int(user), "Что поправить?", to_user=True)
                 await self.max_api.answer_callback(callback_id)
-            elif payload == "draft:confirm" and draft:
+            elif action == "confirm":
                 result = await self.agent.confirm(user_id, draft)
                 succeeded = result.status == "done"
                 if succeeded:
@@ -442,7 +455,10 @@ class BotHandler:
                 return
             else:
                 result = await self.agent.ask(
-                    user_id=user_id, text=text, confirm_changes=is_voice or pending is not None
+                    user_id=user_id,
+                    text=text,
+                    confirm_changes=is_voice or pending is not None,
+                    request_id=str(uuid5(NAMESPACE_URL, f"max:{user_id}:{mid}")) if mid else None,
                 )
             await self._result(user_id, chat_id, result, to_user)
         except (SpeechRecognitionError, MaxAPIError) as exc:

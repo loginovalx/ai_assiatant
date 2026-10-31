@@ -37,6 +37,9 @@ def tomorrow(tz, hour: int = 14):
         "Поставь встречу с Марией на пятницу",
         "Напомни про отчёт 15 января",
         "Созвон в понедельник",
+        "завтра утром",
+        "сегодня вечером",
+        "в обед",
         "",
     ],
 )
@@ -49,12 +52,13 @@ def test_day_without_hour_is_not_a_time(phrase):
     [
         "Напомни завтра в 10 позвонить Ивану",
         "в пятницу в 14:00",
-        "завтра утром",
-        "сегодня вечером",
         "через час",
+        "через полчаса",
+        "через полминуты",
+        "через четверть часа",
+        "в четверть седьмого",
         "в три часа дня",
         "в полдень",
-        "в обед",
         "через 20 минут",
         "15 января в 10",
     ],
@@ -95,14 +99,18 @@ async def test_task_deadline_without_hour_still_allowed(client, tz):
             "event_type": "task",
             "name": "Сдать отчёт",
             "description": "Сдать отчёт до пятницы",
-            "start_at": tomorrow(tz, 18).isoformat(),
+            "start_at": (
+                datetime.now(tz) + timedelta(days=(4 - datetime.now(tz).weekday()) % 7 or 7)
+            )
+            .replace(hour=18, minute=0, second=0, microsecond=0)
+            .isoformat(),
         },
     )
     assert created.structured_content["name"] == "Сдать отчёт"
 
 
-async def test_part_of_day_is_enough(client, tz):
-    """«Завтра вечером» — час модель вправе развернуть сама (19:00) и сказать об этом."""
+async def test_part_of_day_requires_exact_time(client, tz, pool):
+    """«Завтра вечером» требует уточнения; произвольные 19:00 не сохраняются."""
     created = await client.call_tool(
         "create_event",
         {
@@ -112,8 +120,29 @@ async def test_part_of_day_is_enough(client, tz):
             "description": "Напомни завтра вечером позвонить Марине",
             "start_at": tomorrow(tz, 19).isoformat(),
         },
+        raise_on_error=False,
     )
-    assert created.structured_content["start_at"].endswith("19:00:00+03:00")
+    assert created.is_error
+    assert await pool.fetchval("SELECT count(*) FROM events") == 0
+
+
+async def test_named_weekday_mismatch_is_not_saved(client, tz, pool):
+    now = datetime.now(tz)
+    monday = (now + timedelta(days=(0 - now.weekday()) % 7 or 7)).replace(
+        hour=9, minute=0, second=0, microsecond=0
+    )
+    args = {
+        "user_id": USER,
+        "event_type": "reminder",
+        "name": "Оплатить интернет",
+        "user_text": "Напомни в понедельник в девять утра оплатить интернет",
+        "start_at": (monday + timedelta(days=1)).isoformat(),
+    }
+    rejected = await client.call_tool("create_event", args, raise_on_error=False)
+    assert rejected.is_error
+    assert await pool.fetchval("SELECT count(*) FROM events") == 0
+    accepted = await client.call_tool("create_event", {**args, "start_at": monday.isoformat()})
+    assert accepted.structured_content["start_at"] == monday.isoformat()
 
 
 async def test_full_clarification_flow_through_agent(make_agent, tz, pool):

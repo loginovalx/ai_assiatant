@@ -1,6 +1,6 @@
 """Системный промпт. Пересобирается на каждый запрос: в нём текущее время."""
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 from common.timeutils import WEEKDAYS_RU
 
@@ -88,6 +88,11 @@ _TEMPLATE = """\
    «что ещё осталось на этой неделе» = от текущего момента до конца этой недели.
    «на следующей неделе» = период следующей недели из таблицы выше.
    Для «что мне нужно сделать» ставь include_undated_tasks = true.
+   Если не ждёшь уточнения для создания записи, короткий вопрос с периодом
+   («прошлый месяц?», «с 1 по 3 октября включительно?») тоже означает просмотр календаря:
+   вызови get_events. Не спрашивай разрешение показать список или тип записи — без
+   явного фильтра нужны все типы. Для просмотра недели/месяца конкретный день не нужен.
+   Границы относительных периодов копируй из таблицы выше, не пересчитывай их сам.
 4. «Найди задачу про …», «когда у меня была встреча с …» — search_events.
    В query передай только суть («договор», «встреча с Иваном»), без «найди» и дат.
    Если дата не названа, не ограничивай поиск текущим или будущим временем.
@@ -141,8 +146,9 @@ _TEMPLATE = """\
 - Подтверждай, что сделано, и называй дату словами: «Напомню в пятницу, 30 октября, в 10:00».
   Час всегда цифрами, из поля start_at: никогда не заменяй его словами «днём», «утром».
 - Список событий — по одному на строку: время (если есть end_at — «с 15:00 до 16:00»), название.
-- «Сколько записей…», «покажи все…» — search_events сам даст полный список, если
-  передан период; считай по факту. Вернулось ровно limit — говори «как минимум N».
+- «Сколько записей…», «покажи все…» — search_events возвращает не больше 50 наиболее
+  релевантных записей даже с периодом. Для точного списка или подсчёта за период используй
+  get_events и считай по факту. Если search_events вернул ровно limit — говори «как минимум N».
 - Если пользователь назвал период («за 2026 год», «в октябре») — обязательно ставь
   start_time и end_time в search_events, иначе найдутся в основном старые записи.
 - Рассказывай только о том, что вернули тулы. Ничего не придумывай.
@@ -156,17 +162,66 @@ _TEMPLATE = """\
 
 
 def build_system_prompt(now: datetime) -> str:
-    if now.tzinfo is None:
+    if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("Текущее время должно содержать часовой пояс")
-    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    monday = today - timedelta(days=today.weekday())
+
+    def midnight(day: date) -> datetime:
+        return datetime.combine(day, time.min, tzinfo=now.tzinfo)
+
+    def month_start(year: int, month: int) -> datetime:
+        return midnight(date(year, month, 1))
+
+    def shift_month(start: datetime, offset: int) -> datetime:
+        index = start.year * 12 + start.month - 1 + offset
+        year, month_index = divmod(index, 12)
+        return month_start(year, month_index + 1)
+
+    today_date = now.date()
+    today = midnight(today_date)
+    tomorrow = midnight(today_date + timedelta(days=1))
+    after_tomorrow = midnight(today_date + timedelta(days=2))
+    monday_date = today_date - timedelta(days=today_date.weekday())
+    monday = midnight(monday_date)
+    next_monday = midnight(monday_date + timedelta(days=7))
+    monday_after_next = midnight(monday_date + timedelta(days=14))
+    month = month_start(today_date.year, today_date.month)
+    previous_month = shift_month(month, -1)
+    next_month = shift_month(month, 1)
+    month_after_next = shift_month(month, 2)
     periods = "\n".join(
         f"- {name}: {start.isoformat()} — {end.isoformat()}"
         for name, start, end in (
-            ("сегодня", today, today + timedelta(days=1)),
-            ("завтра", today + timedelta(days=1), today + timedelta(days=2)),
-            ("эта неделя", monday, monday + timedelta(days=7)),
-            ("следующая неделя", monday + timedelta(days=7), monday + timedelta(days=14)),
+            ("вчера", midnight(today_date - timedelta(days=1)), today),
+            ("сегодня", today, tomorrow),
+            ("завтра", tomorrow, after_tomorrow),
+            ("прошлая календарная неделя", midnight(monday_date - timedelta(days=7)), monday),
+            ("эта неделя", monday, next_monday),
+            ("следующая неделя", next_monday, monday_after_next),
+            (
+                "последние 7 календарных дней, включая сегодня",
+                midnight(today_date - timedelta(days=6)),
+                tomorrow,
+            ),
+            (
+                "следующие 7 календарных дней, включая сегодня",
+                today,
+                midnight(today_date + timedelta(days=7)),
+            ),
+            ("прошлый месяц", previous_month, month),
+            ("этот месяц", month, next_month),
+            ("следующий месяц", next_month, month_after_next),
+            ("месяц по сегодня включительно", month, tomorrow),
+            ("остаток месяца с завтра", tomorrow, next_month),
+            (
+                "последние 30 календарных дней, включая сегодня",
+                midnight(today_date - timedelta(days=29)),
+                tomorrow,
+            ),
+            (
+                "следующие 30 календарных дней, включая сегодня",
+                today,
+                midnight(today_date + timedelta(days=30)),
+            ),
         )
     )
     return _TEMPLATE.format(

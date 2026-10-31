@@ -157,6 +157,7 @@ class Agent:
         mutations: dict[str, ToolResult] = {}
         confirmed: dict[str, Event] = {}
         conflict_warnings: dict[str, Event] = {}
+        read_tools: set[str] = set()
         errors: dict[str, tuple[str, dict | None, str, int]] = {}
         mutation_number = 0
         draft: DraftAction | None = None
@@ -176,6 +177,8 @@ class Agent:
                         if errors
                         else _confirmed_response(confirmed, conflict_warnings)
                     )
+                if read_tools and not errors and draft is None:
+                    return _read_response(events, read_tools)
                 raise
 
             if not message.tool_calls:
@@ -187,6 +190,8 @@ class Agent:
                     return AgentResponse(
                         reply_text=reply, status=AgentStatus.NEEDS_CONFIRMATION, draft=draft
                     )
+                if read_tools and not confirmed and draft is None:
+                    return _read_response(events, read_tools)
                 if not reply:
                     return (
                         _confirmed_response(confirmed, conflict_warnings)
@@ -254,6 +259,8 @@ class Agent:
                         logger.exception("MCP недоступен после подтверждённой записи")
                         result = ToolResult(ok=False, payload="Инструмент временно недоступен")
                 if result.ok:
+                    if name in {"get_events", "search_events"}:
+                        read_tools.add(name)
                     for failed_key, (failed_name, failed_args, _, failed_round) in list(
                         errors.items()
                     ):
@@ -379,3 +386,31 @@ def _confirmed_response(
         status=AgentStatus.DONE,
         events=list({**events, **(conflicts or {})}.values()),
     )
+
+
+def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentResponse:
+    """Render retrieved facts without letting the model rewrite dates or names."""
+    items = list(events.values())
+    search = "search_events" in read_tools
+    if not items:
+        reply = "Подходящих записей не найдено." if search else "За указанный период записей нет."
+        return AgentResponse(reply_text=reply, status=AgentStatus.DONE)
+    lines = [
+        "Подходящие записи (выборка по релевантности):"
+        if search
+        else f"Найдено записей: {len(items)}."
+    ]
+    for event in items:
+        when = "без даты"
+        if event.start_at:
+            when = f"{event.start_at:%d.%m.%Y}, {event.weekday}, {event.start_at:%H:%M}"
+            if event.end_at:
+                end = (
+                    event.end_at.strftime("%H:%M")
+                    if event.end_at.date() == event.start_at.date()
+                    else event.end_at.strftime("%d.%m.%Y %H:%M")
+                )
+                when += f"–{end}"
+        status = " (выполнено)" if event.status == "done" else ""
+        lines.append(f"{when} — {event.name}{status}")
+    return AgentResponse(reply_text="\n".join(lines), status=AgentStatus.DONE, events=items)

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+import pytest
 from openai.types.chat import ChatCompletion
 
 from agent.core import Agent
@@ -224,6 +225,45 @@ async def test_multiple_distinct_previews_require_one_action_at_a_time():
 async def test_empty_model_reply_is_error():
     agent, _ = setup_agent([completion("")])
     assert (await agent.handle("u", "Test")).status == AgentStatus.ERROR
+
+
+@pytest.mark.parametrize("tool_name", ["get_events", "search_events"])
+async def test_read_dates_and_names_are_rendered_from_persisted_fields(tool_name):
+    raw = mutation().events[0]
+    raw.update(name="Точное название", start_at="2026-10-20T18:00:00+03:00", duration_minutes=60)
+    agent, _ = setup_agent(
+        [completion(calls=[(tool_name, "{}")]), completion("Среда, 21 октября, в 19:00: Другое")],
+        ToolResult(ok=True, payload=[raw], events=[raw]),
+    )
+    result = await agent.handle("u", "Покажи записи")
+    assert result.status == AgentStatus.DONE
+    assert "20.10.2026" in result.reply_text and "вторник" in result.reply_text
+    assert "18:00" in result.reply_text and "19:00" in result.reply_text
+    assert "Точное название" in result.reply_text and "21 октября" not in result.reply_text
+    if tool_name == "search_events":
+        assert "выборка" in result.reply_text
+
+
+async def test_successful_empty_read_cannot_be_replaced_with_fictional_event():
+    agent, _ = setup_agent(
+        [completion(calls=[("get_events", "{}")]), completion("Встреча завтра в 10:00")],
+        ToolResult(ok=True, payload=[], events=[]),
+    )
+    result = await agent.handle("u", "Что завтра?")
+    assert result.status == AgentStatus.DONE and not result.events
+    assert "нет" in result.reply_text and "Встреча" not in result.reply_text
+
+
+async def test_successful_read_survives_model_failure_after_tool():
+    raw = mutation().events[0]
+    raw.update(status="done")
+    agent, _ = setup_agent(
+        [completion(calls=[("get_events", "{}")]), ConnectionError("LLM down")],
+        ToolResult(ok=True, payload=[raw], events=[raw]),
+    )
+    result = await agent.handle("u", "Покажи задачи")
+    assert result.status == AgentStatus.DONE and len(result.events) == 1
+    assert "без даты" in result.reply_text and "выполнено" in result.reply_text
 
 
 async def test_fallback_keeps_meeting_conflict_warning():

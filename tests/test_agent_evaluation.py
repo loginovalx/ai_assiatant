@@ -204,6 +204,35 @@ def test_get_events_requires_logical_mappings_and_rejects_failed_tool():
     assert sum("missing logical ID mapping" in reason for reason in reasons) == 2
 
 
+def test_get_events_judge_treats_empty_types_as_all_like_mcp():
+    event = make_event()
+    expected = {
+        "expected_ids": ["E01"],
+        "start_time": "2026-10-30T00:00:00+03:00",
+        "end_time": "2026-10-31T00:00:00+03:00",
+        "event_types": ["task", "meeting", "reminder"],
+    }
+    call = {
+        "name": "get_events",
+        "ok": True,
+        "arguments": {
+            "start_time": expected["start_time"],
+            "end_time": expected["end_time"],
+            "event_types": [],
+        },
+    }
+    assert (
+        judge_case(
+            case("get_events", expected),
+            response(events=[event]),
+            [],
+            {"E01": str(event.id)},
+            [call],
+        )
+        == []
+    )
+
+
 def test_search_requires_expected_real_id_and_explicit_no_results_reply():
     event = make_event(name="Купить билеты")
     expected = {

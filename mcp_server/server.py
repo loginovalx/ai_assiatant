@@ -302,8 +302,8 @@ async def search_events(
         datetime | None,
         Field(
             description=(
-                "Конец периода, если пользователь его назвал («по 30 октября» — "
-                "30 октября 23:59). null = без верхней границы."
+                "Конец периода не включительно, если пользователь назвал период: "
+                "«по 30 октября» — 31 октября 00:00. null = без верхней границы."
             )
         ),
     ] = None,
@@ -313,12 +313,15 @@ async def search_events(
 
     Для «найди задачу про презентацию», «когда у меня была встреча с Иваном».
     Результаты отсортированы по релевантности; если список пуст — ничего не найдено.
-    limit=None значит «сам реши»: запрос за период обычно хочет полный список,
-    обычный поиск — короткую выдачу. Вернулось ровно limit — сообщи «как минимум столько».
+    limit=None даёт до 50 результатов для поиска с периодом и до 10 без периода.
+    Максимум — 50, поэтому даже поиск за период не гарантирует полный список.
+    Вернулось ровно limit — сообщи «как минимум столько».
     """
     settings = get_settings()
     start = ensure_aware(start_time, settings.tz) if start_time else None
     end = ensure_aware(end_time, settings.tz) if end_time else None
+    if start is not None and end is not None and start >= end:
+        raise ToolError("start_time должен быть раньше end_time")
     if limit is None:
         limit = 50 if (start is not None or end is not None) else 10
     return await _repo(ctx).search(user_id, query.strip(), start, end, limit)

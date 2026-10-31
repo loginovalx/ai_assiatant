@@ -67,19 +67,19 @@ by_text AS (
     SELECT b.id, row_number() OVER (ORDER BY ts_rank_cd(b.search_tsv, q.tq) DESC) AS rn
     FROM base b, q
     WHERE numnode(q.tq) > 0 AND b.search_tsv @@ q.tq
-    ORDER BY rn LIMIT 20
+    ORDER BY rn LIMIT GREATEST($6, 20)
 ),
 by_fuzzy AS (
     SELECT b.id, row_number() OVER (ORDER BY word_similarity($2, b.search_text) DESC) AS rn
     FROM base b
     WHERE word_similarity($2, b.search_text) >= 0.4
-    ORDER BY rn LIMIT 20
+    ORDER BY rn LIMIT GREATEST($6, 20)
 ),
 by_meaning AS (
     SELECT b.id, row_number() OVER (ORDER BY b.embedding <=> $5::vector) AS rn
     FROM base b
     WHERE $5::vector IS NOT NULL AND b.embedding IS NOT NULL
-    ORDER BY rn LIMIT 10
+    ORDER BY rn LIMIT GREATEST($6, 10)
 ),
 ranked AS (
     SELECT id, 'text' AS source, rn FROM by_text

@@ -557,8 +557,11 @@ class BotHandler:
                 result = await self.agent.ask(
                     user_id=user_id,
                     text=text,
-                    confirm_changes=is_voice or pending is not None,
+                    # Every model-proposed write is reviewed, even for typed
+                    # messages. User text cannot turn this server policy off.
+                    confirm_changes=True,
                     request_id=str(uuid5(NAMESPACE_URL, f"max:{user_id}:{mid}")) if mid else None,
+                    **({"edit_draft_id": str(pending.id)} if pending is not None else {}),
                 )
             await self._result(user_id, chat_id, result, to_user)
         except (SpeechRecognitionError, MaxAPIError) as exc:

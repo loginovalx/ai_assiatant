@@ -64,7 +64,7 @@ async def test_poll_dispatches_and_advances_marker(redis):
     while polling_mod._active:
         await asyncio.gather(*list(polling_mod._active), return_exceptions=True)
 
-    assert agent.asked == [("555", "Что у меня завтра?", False)]
+    assert agent.asked == [("555", "Что у меня завтра?", True)]
 
 
 async def test_poll_without_marker_keeps_previous():

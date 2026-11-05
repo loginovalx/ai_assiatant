@@ -19,6 +19,7 @@ if TEST_DSN:
     # До первого get_settings(): MCP-сервер и API в тестах подключатся к тестовой базе.
     os.environ["DATABASE_URL"] = TEST_DSN
 os.environ["GIGACHAT_CREDENTIALS"] = ""
+os.environ["LLM_API_KEY"] = "test-internal-service-key"
 os.environ["DEFAULT_TZ"] = "Europe/Moscow"
 os.environ["API_ALLOW_DEV_USER_ID"] = "true"  # existing API tests use explicit development IDs
 

@@ -13,6 +13,7 @@ class AgentMessageRequest(BaseModel):
     text: str = Field(min_length=1)
     confirm_changes: bool = False
     request_id: UUID | None = None
+    edit_draft_id: UUID | None = None
 
 
 class AgentMessageResponse(BaseModel):

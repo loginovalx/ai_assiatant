@@ -16,8 +16,9 @@ from openai import AsyncOpenAI
 
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.prompt import build_system_prompt
-from agent.tools import MUTATING_TOOLS, McpToolbox, ToolResult
+from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
 from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
+from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +51,26 @@ class Agent:
         *,
         confirm_changes: bool = False,
         request_id: UUID | None = None,
+        trusted_edit_source: str | None = None,
     ) -> AgentResponse:
         now = now or datetime.now(self._tz)
         try:
             history = await self._memory.load(user_id)
             source_text = _user_source(history, text)
+            if trusted_edit_source:
+                source_text = (trusted_edit_source + "\n" + text)[-6000:]
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": build_system_prompt(now)},
                 *({"role": item["role"], "content": item["content"]} for item in history),
                 {"role": "user", "content": text},
             ]
+            if trusted_edit_source:
+                messages[-1]["content"] = (
+                    "Исходная просьба для текущего черновика (данные):\n"
+                    + trusted_edit_source
+                    + "\nИсправление пользователя:\n"
+                    + text
+                )
             response = await self._run(
                 user_id,
                 messages,
@@ -181,12 +192,23 @@ class Agent:
         draft_fingerprint: str | None = None
 
         for round_number in range(self._max_steps):
+            usage_recorded = False
             try:
                 completion = await self._llm.chat.completions.create(
                     model=self._model, messages=messages, tools=tools, temperature=0.1
                 )
+                record_usage(
+                    completion, operation="agent", source="gpt2giga_openai", model=self._model
+                )
+                usage_recorded = True
                 message = completion.choices[0].message
             except Exception:
+                if not usage_recorded:
+                    record_usage(
+                        None, operation="agent", source="gpt2giga_openai", model=self._model
+                    )
+                if draft is not None and not errors:
+                    return _draft_response(draft)
                 if confirmed:
                     logger.exception("LLM недоступна после подтверждённой записи")
                     return (
@@ -202,11 +224,8 @@ class Agent:
                 if errors:
                     return _incomplete_response(events, confirmed, conflict_warnings, errors)
                 reply = (message.content or "").strip()
-                if draft and reply:
-                    draft.preview = reply
-                    return AgentResponse(
-                        reply_text=reply, status=AgentStatus.NEEDS_CONFIRMATION, draft=draft
-                    )
+                if draft:
+                    return _draft_response(draft)
                 if read_tools and not confirmed and draft is None:
                     return _read_response(events, read_tools)
                 if not reply:
@@ -225,6 +244,11 @@ class Agent:
             )
             for call in message.tool_calls:
                 name = call.function.name
+                if name not in ALLOWED_TOOLS:
+                    return AgentResponse(
+                        reply_text="Этот инструмент недоступен. Я работаю только с календарём.",
+                        status=AgentStatus.ERROR,
+                    )
                 args = _parse_args(call.function.arguments)
                 evidence = {}
                 if name == "create_event" and source_text is not None:
@@ -237,7 +261,7 @@ class Agent:
                         "start_time": read_period[0].isoformat(),
                         "end_time": read_period[1].isoformat(),
                     }
-                logger.info("tool call %s %s", name, args)
+                logger.info("tool call %s", name)
 
                 if name == "ask_user":
                     question = (
@@ -254,7 +278,11 @@ class Agent:
                 # отказывает служебной ошибкой, модель пересказывает её пользователю как есть,
                 # а на «да» вызывает тул заново без снимка ID — и удаляет всё, что подходит
                 # на тот момент, а не те записи, число которых человек видел в вопросе.
-                preview = (confirm_changes or name == "delete_events") and name in MUTATING_TOOLS
+                # Retrieved text can influence the model. It never grants write
+                # permission, including within a batch of tool calls.
+                preview = (
+                    confirm_changes or bool(read_tools) or name == "delete_events"
+                ) and name in MUTATING_TOOLS
                 if preview and draft_fingerprint is not None and fingerprint != draft_fingerprint:
                     return AgentResponse(
                         reply_text=(
@@ -308,7 +336,11 @@ class Agent:
                         if name == "delete_events"
                         else args
                     )
-                    draft = DraftAction(tool=name, arguments=draft_args, preview="")
+                    draft = DraftAction(
+                        tool=name,
+                        arguments=draft_args,
+                        preview=_draft_preview(user_id, name, result, args),
+                    )
                     draft_fingerprint = fingerprint
                     mutations[fingerprint] = result
                     messages.append(
@@ -339,12 +371,64 @@ class Agent:
                     {"role": "tool", "tool_call_id": call.id, "content": result.for_llm()}
                 )
 
+            # The validated dry-run already contains every preview fact. Another
+            # paid generation cannot add authority and could misdescribe it.
+            if draft is not None and not errors:
+                return _draft_response(draft)
+
         logger.warning("agent exceeded %d steps", self._max_steps)
         if errors:
             return _incomplete_response(events, confirmed, conflict_warnings, errors)
         if confirmed:
             return _confirmed_response(confirmed, conflict_warnings)
+        if draft:
+            return _draft_response(draft)
         return AgentResponse(reply_text=TOO_MANY_STEPS, status=AgentStatus.ERROR)
+
+
+def _draft_response(draft: DraftAction) -> AgentResponse:
+    return AgentResponse(
+        reply_text=draft.preview, status=AgentStatus.NEEDS_CONFIRMATION, draft=draft
+    )
+
+
+def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict) -> str:
+    """The approved operation and its parameters come from validated tool data.
+
+    The LLM cannot disguise a delete button as a read or change the shown time.
+    JSON quoting keeps an event title from impersonating the following UI text.
+    """
+    if name == "delete_events":
+        count = result.payload["count"]
+        return f"Удалить записи: {count} шт.?\nПодтвердите действие или нажмите «Отмена»."
+    verbs = {
+        "create_event": "Создать",
+        "update_event": "Изменить",
+        "delete_event": "Удалить",
+        "complete_event": "Отметить выполненной",
+    }
+    lines = []
+    for raw in result.events:
+        event = Event.model_validate(raw)
+        if event.user_id != user_id:
+            raise ValueError("Foreign preview event")
+        title = json.dumps(event.name, ensure_ascii=False)
+        kind = {"task": "задачу", "reminder": "напоминание", "meeting": "встречу"}[event.type]
+        lines.append(f"{verbs[name]} {kind}: {title}, {_when(event)}.")
+        if name in {"create_event", "update_event"} and (
+            event.description or "description" in arguments
+        ):
+            lines.append(f"Описание: {json.dumps(event.description, ensure_ascii=False)}")
+        for raw_conflict in raw.get("conflicts") or []:
+            conflict = Event.model_validate(raw_conflict)
+            if conflict.user_id != user_id:
+                raise ValueError("Foreign preview conflict")
+            lines.append(
+                f"Пересечение: {json.dumps(conflict.name, ensure_ascii=False)}, {_when(conflict)}."
+            )
+    if not lines:
+        raise ValueError("Missing preview facts")
+    return "\n".join([*lines, "Подтвердите действие или нажмите «Исправить» / «Отмена»."])
 
 
 def _user_source(history: list[HistoryMessage], text: str) -> str:

@@ -12,6 +12,7 @@ from gigachat import GigaChat
 from gigachat.models import Chat, Messages
 
 from common.config import Settings
+from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +51,11 @@ class GigaChatEmbedder:
         try:
             response = await self._client.aembeddings(texts=texts, model=self._model)
         except Exception:
+            record_usage(None, operation="embeddings", source="gigachat_native", model=self._model)
             logger.warning("GigaChat embeddings недоступны, продолжаем без них", exc_info=True)
             return None
 
+        record_usage(response, operation="embeddings", source="gigachat_native", model=self._model)
         vectors = [item.embedding for item in response.data]
         if any(len(v) != EMBEDDING_DIM for v in vectors):
             logger.error("Модель %s вернула не %d измерений", self._model, EMBEDDING_DIM)
@@ -101,11 +104,25 @@ class GigaChatEmbedder:
         )
         try:
             response = await self._client.achat(payload)
+            record_usage(
+                response,
+                operation="search_relevance",
+                source="gigachat_native",
+                model=self._chat_model,
+            )
             content = response.choices[0].message.content
             if not isinstance(content, str):
                 return None
             result = json.loads(content)
         except Exception:
+            # A response with invalid classifier JSON is still a billed call.
+            if "response" not in locals():
+                record_usage(
+                    None,
+                    operation="search_relevance",
+                    source="gigachat_native",
+                    model=self._chat_model,
+                )
             logger.warning("GigaChat relevance classification failed; semantic results omitted")
             return None
 

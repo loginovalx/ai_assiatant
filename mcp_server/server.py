@@ -42,6 +42,7 @@ from common.timeutils import (
     named_weekday,
     resolve_weekday_mismatch,
 )
+from mcp_server.auth import InternalTokenVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,7 @@ async def resources(server: FastMCP):
 
 mcp = FastMCP(
     name="events",
+    auth=InternalTokenVerifier(),
     instructions=(
         "Хранилище задач, напоминаний и встреч пользователя. "
         "Все даты — ISO 8601 со смещением часового пояса. "

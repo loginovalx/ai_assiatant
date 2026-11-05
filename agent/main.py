@@ -18,6 +18,7 @@ from agent.memory import ConversationMemory
 from agent.service import AgentBusy, AgentService
 from agent.tools import McpToolbox
 from common.config import get_settings
+from common.internal_auth import internal_token, valid_internal_token
 from common.schemas import AgentConfirmRequest, AgentRequest, AgentResetRequest, AgentResponse
 
 logging.basicConfig(level=logging.INFO)
@@ -68,24 +69,48 @@ def get_agent(request: Request) -> AgentService:
 AgentDep = Annotated[AgentService, Depends(get_agent)]
 
 
+def require_internal_auth(request: Request) -> None:
+    if not internal_token("agent"):
+        raise HTTPException(status_code=503, detail="Internal service key is not configured")
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if scheme.casefold() != "bearer" or not valid_internal_token(token, "agent"):
+        raise HTTPException(
+            status_code=401,
+            detail="Internal service authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/agent/message", response_model=AgentResponse, response_model_exclude_none=True)
+@app.post(
+    "/v1/agent/message",
+    response_model=AgentResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(require_internal_auth)],
+)
 async def message(body: AgentRequest, agent: AgentDep) -> AgentResponse:
     return await agent.handle(
-        body.user_id, body.text, confirm_changes=body.confirm_changes, request_id=body.request_id
+        body.user_id,
+        body.text,
+        confirm_changes=True,
+        request_id=body.request_id,
+        edit_draft_id=body.edit_draft_id,
     )
 
 
-@app.post("/v1/agent/confirm", response_model=AgentResponse)
+@app.post(
+    "/v1/agent/confirm", response_model=AgentResponse, dependencies=[Depends(require_internal_auth)]
+)
 async def confirm(body: AgentConfirmRequest, agent: AgentDep) -> AgentResponse:
     return await agent.execute_draft(body.user_id, body.draft)
 
 
-@app.post("/v1/agent/reset", status_code=204)
+@app.post("/v1/agent/reset", status_code=204, dependencies=[Depends(require_internal_auth)])
 async def reset(body: AgentResetRequest, agent: AgentDep) -> None:
     try:
         await agent.reset(body.user_id)

@@ -14,6 +14,8 @@ from typing import Any
 
 from fastmcp import Client, FastMCP
 
+from common.internal_auth import internal_token
+
 logger = logging.getLogger(__name__)
 
 HIDDEN_ARGS = frozenset({"user_id", "dry_run", "idempotency_key", "event_ids", "user_text"})
@@ -84,6 +86,7 @@ def _compact(value: Any) -> Any:
 MUTATING_TOOLS = frozenset(
     {"create_event", "update_event", "delete_event", "complete_event", "delete_events"}
 )
+ALLOWED_TOOLS = MUTATING_TOOLS | {"get_events", "search_events", "ask_user"}
 
 
 class McpToolbox:
@@ -93,12 +96,21 @@ class McpToolbox:
         self._target = target
         self._schemas: list[dict[str, Any]] | None = None
 
+    def _client(self) -> Client:
+        return (
+            Client(self._target, auth=internal_token("mcp"))
+            if isinstance(self._target, str)
+            else Client(self._target)
+        )
+
     async def openai_tools(self) -> list[dict[str, Any]]:
         if self._schemas is None:
-            async with Client(self._target) as client:
+            async with self._client() as client:
                 tools = await client.list_tools()
             self._schemas = [
-                to_openai_tool(t.name, t.description or "", t.input_schema) for t in tools
+                to_openai_tool(t.name, t.description or "", t.input_schema)
+                for t in tools
+                if t.name in ALLOWED_TOOLS
             ]
         return [*self._schemas, ASK_USER_TOOL]
 
@@ -113,6 +125,8 @@ class McpToolbox:
         event_ids: list[str] | None = None,
         user_text: str | None = None,
     ) -> ToolResult:
+        if name not in ALLOWED_TOOLS - {"ask_user"}:
+            return ToolResult(ok=False, payload="Недоступный инструмент")
         args = {k: v for k, v in arguments.items() if k not in HIDDEN_ARGS}
         args["user_id"] = user_id  # всегда наш, даже если модель прислала свой
         if user_text is not None and name == "create_event":
@@ -123,7 +137,7 @@ class McpToolbox:
             args["idempotency_key"] = idempotency_key
         if event_ids is not None and name == "delete_events":
             args["event_ids"] = event_ids
-        async with Client(self._target) as client:
+        async with self._client() as client:
             result = await client.call_tool(name, args, raise_on_error=False)
         if result.is_error:
             # Текст ошибки тула (ToolError) написан для LLM: «нужно указать время» и т. п.

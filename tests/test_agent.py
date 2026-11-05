@@ -570,14 +570,20 @@ async def test_reset_and_history_trim(redis):
     assert await memory.load(USER) == []
 
 
-async def test_http_endpoint(make_agent):
+async def test_http_endpoint(make_agent, redis):
     from agent.main import app, get_agent
+    from agent.service import AgentService
+    from common.internal_auth import internal_token
 
     agent, _ = make_agent(text("Привет! Я помогаю с задачами и встречами."))
-    app.dependency_overrides[get_agent] = lambda: agent
+    app.dependency_overrides[get_agent] = lambda: AgentService(agent, redis)
     try:
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://t",
+            headers={"Authorization": f"Bearer {internal_token('agent')}"},
+        ) as client:
             ok = await client.post("/v1/agent/message", json={"user_id": USER, "text": "Привет"})
             bad = await client.post("/v1/agent/message", json={"user_id": USER, "text": ""})
             reset = await client.post("/v1/agent/reset", json={"user_id": USER})

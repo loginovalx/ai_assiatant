@@ -5,6 +5,7 @@ from uuid import uuid4
 import httpx
 
 from bot.models import AgentMessageRequest, AgentMessageResponse, DraftAction
+from common.internal_auth import internal_token
 
 
 class AgentUnavailable(Exception):
@@ -20,7 +21,11 @@ class AgentClient:
             async with httpx.AsyncClient(timeout=75) as client:
                 for attempt in range(2):
                     try:
-                        response = await client.post(f"{self.base_url}{path}", json=payload)
+                        response = await client.post(
+                            f"{self.base_url}{path}",
+                            json=payload,
+                            headers={"Authorization": f"Bearer {internal_token('agent')}"},
+                        )
                     except httpx.TransportError:
                         if attempt:
                             raise
@@ -32,13 +37,19 @@ class AgentClient:
         raise AgentUnavailable("Агент недоступен")
 
     async def ask(
-        self, user_id: str, text: str, confirm_changes: bool = False, request_id: str | None = None
+        self,
+        user_id: str,
+        text: str,
+        confirm_changes: bool = False,
+        request_id: str | None = None,
+        edit_draft_id: str | None = None,
     ) -> AgentMessageResponse:
         request = AgentMessageRequest(
             user_id=user_id,
             text=text,
             confirm_changes=confirm_changes,
             request_id=request_id or str(uuid4()),
+            edit_draft_id=edit_draft_id,
         )
         return await self._post(
             "/v1/agent/message", request.model_dump(mode="json", exclude_none=True)

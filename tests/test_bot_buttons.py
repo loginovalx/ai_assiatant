@@ -41,7 +41,7 @@ class FakeAgent:
         self.confirm_reply = confirm_reply
 
     async def ask(
-        self, user_id, text, confirm_changes=False, request_id=None
+        self, user_id, text, confirm_changes=False, request_id=None, edit_draft_id=None
     ) -> AgentMessageResponse:
         self.asked.append({"text": text, "confirm_changes": confirm_changes})
         return self.replies.pop(0)
@@ -228,18 +228,18 @@ async def test_quick_action_runs_like_a_typed_question(handler):
 
     await bot.handle_update(callback("quick:tomorrow"))
 
-    assert agent.asked == [{"text": "Что у меня завтра?", "confirm_changes": False}]
+    assert agent.asked == [{"text": "Что у меня завтра?", "confirm_changes": True}]
     assert max_api.sent[-1]["text"] == "Завтра ничего нет."
 
 
-async def test_text_command_is_not_deferred(handler):
+async def test_text_command_requests_review_of_model_proposed_writes(handler):
     agent = FakeAgent(AgentMessageResponse(reply_text="Напомню завтра в 11:00.", status="done"))
     bot, max_api = handler(agent)
     await bot.redis.set(f"bot:greeted:{USER}", "1")
 
     await bot.handle_update(text_message("напомни завтра в 11 записаться к врачу"))
 
-    assert agent.asked[0]["confirm_changes"] is False  # текст выполняется сразу
+    assert agent.asked[0]["confirm_changes"] is True
     assert max_api.sent[-1]["buttons"] is None
 
 

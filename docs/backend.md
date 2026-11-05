@@ -39,12 +39,24 @@ tests/         тесты на живом Postgres и Redis: репозитор�
 
 ```python
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from common.internal_auth import internal_token
 
 client = MultiServerMCPClient(
-    {"events": {"url": "http://localhost:8001/mcp", "transport": "streamable_http"}}
+    {
+        "events": {
+            "url": "http://localhost:8001/mcp",
+            "transport": "streamable_http",
+            "headers": {"Authorization": f"Bearer {internal_token('mcp')}"},
+        }
+    }
 )
 tools = await client.get_tools()  # create_event, get_events, search_events
 ```
+
+MCP HTTP требует внутреннюю авторизацию. Токен выводится из `LLM_API_KEY` и отличается
+от токена Agent API; healthcheck открыт. Бот — доверенная граница MAX user_id, сервисные
+ключи подтверждают именно сервис, а не конечного пользователя. Внутренние порты остаются
+в закрытой сети/на localhost; не проксируйте их в публичный интернет.
 
 | Тул | Аргументы | Возвращает |
 | --- | --- | --- |

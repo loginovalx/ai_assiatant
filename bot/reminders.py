@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from bot.max_api import MaxAPI, MaxAPIError
 from common.repository import EventRepository
 from common.schemas import Event, EventType
+from common.timeutils import ensure_aware
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +29,15 @@ def event_buttons(event_id: UUID) -> list[list[dict[str, str]]]:
     ]
 
 
-def format_notification(event: Event) -> str:
+def format_notification(event: Event, tz: ZoneInfo | None = None) -> str:
     """Текст напоминания. Для встреч и дел добавляем время: оно помогает сориентироваться."""
     if event.type == EventType.REMINDER:
         return f"Напоминание: {event.name}"
     kind = "встреча" if event.type == EventType.MEETING else "дело"
-    when = event.start_at.strftime("%H:%M") if event.start_at else ""
+    start_at = event.start_at
+    if start_at is not None and tz is not None:
+        start_at = ensure_aware(start_at, tz).astimezone(tz)
+    when = start_at.strftime("%H:%M") if start_at else ""
     return f"Напоминание: {kind} «{event.name}» в {when}"
 
 
@@ -87,7 +91,7 @@ class ReminderSender:
                 # chat_id у личного диалога с ботом совпадает с user_id отправителя.
                 await self._max_api.send(
                     int(event.user_id),
-                    format_notification(event),
+                    format_notification(event, self._tz),
                     to_user=True,
                     buttons=event_buttons(event.id),
                 )

@@ -16,6 +16,19 @@ from bot.state import StateStore
 USER = 777
 
 
+def scheduled_draft():
+    return DraftAction(
+        tool="create_event",
+        arguments={
+            "event_type": "meeting",
+            "name": "Созвон",
+            "start_at": "2026-11-10T10:00:00+03:00",
+            "duration_minutes": 30,
+        },
+        preview="Создать встречу в 10:00. Пересечение с другой встречей.",
+    )
+
+
 class FakeMax:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
@@ -168,6 +181,83 @@ async def test_edit_button_asks_what_to_change_and_keeps_draft(handler):
 
     assert "Что поправить" in max_api.sent[-1]["text"]
     assert await bot.drafts.load(str(USER)) is not None  # ждём правку
+
+
+async def test_scheduled_preview_offers_another_time_without_saving(handler):
+    agent = FakeAgent()
+    bot, max_api = handler(agent)
+    draft = scheduled_draft()
+    result = AgentMessageResponse(
+        status="needs_confirmation", reply_text=draft.preview, draft=draft
+    )
+    await bot._result(str(USER), USER, result)
+    buttons = [button for row in max_api.sent[-1]["buttons"] for button in row]
+    assert {
+        "type": "callback",
+        "text": "Другое время",
+        "payload": f"draft:time:{draft.id}",
+    } in buttons
+    assert agent.confirmed == []
+
+
+async def test_time_button_asks_current_user_and_preserves_draft(handler):
+    agent = FakeAgent()
+    bot, max_api = handler(agent)
+    draft = scheduled_draft()
+    await bot.drafts.save(str(USER), draft)
+    await bot.handle_update(callback(f"draft:time:{draft.id}"))
+    assert max_api.sent[-1]["chat_id"] == USER
+    assert "день" in max_api.sent[-1]["text"] and "время" in max_api.sent[-1]["text"]
+    assert await bot.drafts.load(str(USER)) == draft
+    assert agent.confirmed == [] and agent.asked == []
+
+
+async def test_another_user_cannot_change_owners_time_even_with_same_draft_id(handler):
+    agent = FakeAgent()
+    bot, max_api = handler(agent)
+    draft = scheduled_draft()
+    await bot.drafts.save(str(USER), draft)
+    update = callback(f"draft:time:{draft.id}")
+    update["callback"]["user"]["user_id"] = 888
+    await bot.handle_update(update)
+    assert max_api.sent == []
+    assert "устарел" in max_api.answered[-1][1]
+    assert await bot.drafts.load(str(USER)) == draft
+    assert agent.confirmed == [] and agent.asked == []
+
+
+async def test_old_time_button_cannot_change_replacement_draft(handler):
+    bot, max_api = handler(FakeAgent())
+    old, current = scheduled_draft(), scheduled_draft()
+    await bot.drafts.save(str(USER), current)
+    await bot.handle_update(callback(f"draft:time:{old.id}"))
+    assert max_api.sent == []
+    assert "устарел" in max_api.answered[-1][1]
+    assert await bot.drafts.load(str(USER)) == current
+
+
+async def test_time_button_rejects_missing_or_expired_draft(handler):
+    agent = FakeAgent()
+    bot, max_api = handler(agent)
+    draft = scheduled_draft()
+    await bot.drafts.save(str(USER), draft)
+    await bot.drafts.drop(str(USER))
+    await bot.handle_update(callback(f"draft:time:{draft.id}"))
+    assert max_api.sent == [] and "устарел" in max_api.answered[-1][1]
+    assert agent.confirmed == [] and agent.asked == []
+
+
+async def test_delete_preview_does_not_offer_time_change(handler):
+    bot, max_api = handler(FakeAgent())
+    draft = DraftAction(tool="delete_event", arguments={"event_id": "x"}, preview="Удалить")
+    await bot._result(
+        str(USER),
+        USER,
+        AgentMessageResponse(status="needs_confirmation", reply_text=draft.preview, draft=draft),
+    )
+    assert all(
+        button["text"] != "Другое время" for row in max_api.sent[-1]["buttons"] for button in row
+    )
 
 
 async def test_old_confirmation_button_cannot_execute_replacement_draft(handler):

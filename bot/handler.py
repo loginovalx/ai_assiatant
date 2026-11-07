@@ -16,7 +16,7 @@ from bot.state import StateStore
 from common.calendar_import import CalendarImportError, parse_calendar_csv
 from common.config import get_settings
 from common.repository import EventRepository
-from common.schemas import EventStatus
+from common.schemas import DraftAction, EventStatus
 
 logger = logging.getLogger(__name__)
 
@@ -119,11 +119,22 @@ QUICK_ACTIONS = [
 ]
 
 
-def confirmation_buttons(draft_id: UUID) -> list[list[dict[str, str]]]:
-    return [
+def confirmation_buttons(
+    draft_id: UUID, *, can_change_time: bool = False
+) -> list[list[dict[str, str]]]:
+    buttons = [
         [{**button, "payload": f"{button['payload']}:{draft_id}"} for button in row]
         for row in CONFIRM_BUTTONS
     ]
+    if can_change_time:
+        buttons.append(
+            [{"type": "callback", "text": "Другое время", "payload": f"draft:time:{draft_id}"}]
+        )
+    return buttons
+
+
+def can_change_draft_time(draft: DraftAction) -> bool:
+    return draft.tool in {"create_event", "update_event"} and bool(draft.arguments.get("start_at"))
 
 
 def _attachments(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -246,7 +257,9 @@ class BotHandler:
         buttons = None
         if result.status == "needs_confirmation" and result.draft:
             await self.drafts.save(user_id, result.draft)
-            buttons = confirmation_buttons(result.draft.id)
+            buttons = confirmation_buttons(
+                result.draft.id, can_change_time=can_change_draft_time(result.draft)
+            )
         await self.max_api.send(
             chat_id, result.reply_text or "Агент не вернул ответ", to_user=to_user, buttons=buttons
         )
@@ -302,6 +315,17 @@ class BotHandler:
                 await self.max_api.answer_callback(callback_id, "Отменено")
             elif action == "edit":
                 await self.max_api.send(int(user), "Что поправить?", to_user=True)
+                await self.max_api.answer_callback(callback_id)
+            elif action == "time":
+                if not can_change_draft_time(draft):
+                    await self.max_api.answer_callback(callback_id, "В этом действии нет времени")
+                    return
+                await self.max_api.send(
+                    int(user),
+                    "Какой день и время выбрать? Напиши, например, «завтра в 15:30». "
+                    "Остальные данные сохраню и покажу новый вариант для подтверждения.",
+                    to_user=True,
+                )
                 await self.max_api.answer_callback(callback_id)
             elif action == "confirm":
                 result = await self.agent.confirm(user_id, draft)

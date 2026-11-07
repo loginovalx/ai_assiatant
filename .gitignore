@@ -12,3 +12,4 @@ dist/
 .certs/
 *.patch
 dump.rdb
+usage*.jsonl

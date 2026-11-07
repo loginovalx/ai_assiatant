@@ -6,7 +6,8 @@
 
 import json
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo
@@ -15,8 +16,9 @@ from openai import AsyncOpenAI
 
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.prompt import build_system_prompt
-from agent.tools import MUTATING_TOOLS, McpToolbox, ToolResult
+from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
 from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
+from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
 
@@ -49,17 +51,33 @@ class Agent:
         *,
         confirm_changes: bool = False,
         request_id: UUID | None = None,
+        trusted_edit_source: str | None = None,
     ) -> AgentResponse:
         now = now or datetime.now(self._tz)
         try:
             history = await self._memory.load(user_id)
+            source_text = _user_source(history, text)
+            if trusted_edit_source:
+                source_text = (trusted_edit_source + "\n" + text)[-6000:]
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": build_system_prompt(now)},
-                *history,
+                *({"role": item["role"], "content": item["content"]} for item in history),
                 {"role": "user", "content": text},
             ]
+            if trusted_edit_source:
+                messages[-1]["content"] = (
+                    "Исходная просьба для текущего черновика (данные):\n"
+                    + trusted_edit_source
+                    + "\nИсправление пользователя:\n"
+                    + text
+                )
             response = await self._run(
-                user_id, messages, confirm_changes=confirm_changes, request_id=request_id
+                user_id,
+                messages,
+                confirm_changes=confirm_changes,
+                request_id=request_id,
+                read_period=_read_period(text, now),
+                source_text=source_text,
             )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
             logger.exception("LLM или MCP недоступны")
@@ -69,10 +87,17 @@ class Agent:
         # начинаться с чистого листа, а не с половины старого запроса.
         if response.status != AgentStatus.ERROR:
             try:
+                assistant = HistoryMessage(
+                    role="assistant",
+                    content=_with_event_refs(response),
+                    clarification_text=(
+                        source_text if response.status == AgentStatus.NEED_CLARIFICATION else ""
+                    ),
+                )
                 await self._memory.append(
                     user_id,
                     HistoryMessage(role="user", content=text),
-                    HistoryMessage(role="assistant", content=_with_event_refs(response)),
+                    assistant,
                 )
             except Exception:
                 # Запись события уже могла завершиться: не заставляем повторять её.
@@ -95,6 +120,7 @@ class Agent:
                     draft.tool,
                     draft.arguments,
                     idempotency_key=str(draft.id),
+                    user_text=draft.arguments.get("user_text"),
                 )
             elif draft.tool == "delete_events":
                 result = await self._toolbox.call(
@@ -151,24 +177,38 @@ class Agent:
         *,
         confirm_changes: bool = False,
         request_id: UUID | None = None,
+        read_period: tuple[datetime, datetime] | None = None,
+        source_text: str | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
         events: dict[str, Event] = {}
         mutations: dict[str, ToolResult] = {}
         confirmed: dict[str, Event] = {}
         conflict_warnings: dict[str, Event] = {}
+        read_tools: set[str] = set()
         errors: dict[str, tuple[str, dict | None, str, int]] = {}
         mutation_number = 0
         draft: DraftAction | None = None
         draft_fingerprint: str | None = None
 
         for round_number in range(self._max_steps):
+            usage_recorded = False
             try:
                 completion = await self._llm.chat.completions.create(
                     model=self._model, messages=messages, tools=tools, temperature=0.1
                 )
+                record_usage(
+                    completion, operation="agent", source="gpt2giga_openai", model=self._model
+                )
+                usage_recorded = True
                 message = completion.choices[0].message
             except Exception:
+                if not usage_recorded:
+                    record_usage(
+                        None, operation="agent", source="gpt2giga_openai", model=self._model
+                    )
+                if draft is not None and not errors:
+                    return _draft_response(draft)
                 if confirmed:
                     logger.exception("LLM недоступна после подтверждённой записи")
                     return (
@@ -176,17 +216,18 @@ class Agent:
                         if errors
                         else _confirmed_response(confirmed, conflict_warnings)
                     )
+                if read_tools and not errors and draft is None:
+                    return _read_response(events, read_tools)
                 raise
 
             if not message.tool_calls:
                 if errors:
                     return _incomplete_response(events, confirmed, conflict_warnings, errors)
                 reply = (message.content or "").strip()
-                if draft and reply:
-                    draft.preview = reply
-                    return AgentResponse(
-                        reply_text=reply, status=AgentStatus.NEEDS_CONFIRMATION, draft=draft
-                    )
+                if draft:
+                    return _draft_response(draft)
+                if read_tools and not confirmed and draft is None:
+                    return _read_response(events, read_tools)
                 if not reply:
                     return (
                         _confirmed_response(confirmed, conflict_warnings)
@@ -203,10 +244,24 @@ class Agent:
             )
             for call in message.tool_calls:
                 name = call.function.name
+                if name not in ALLOWED_TOOLS:
+                    return AgentResponse(
+                        reply_text="Этот инструмент недоступен. Я работаю только с календарём.",
+                        status=AgentStatus.ERROR,
+                    )
                 args = _parse_args(call.function.arguments)
-                if name == "create_event" and args is not None:
-                    args["user_text"] = _with_user_turns(args.get("user_text"), messages)
-                logger.info("tool call %s %s", name, args)
+                evidence = {}
+                if name == "create_event" and source_text is not None:
+                    evidence["user_text"] = source_text
+                    if args is not None:
+                        args = {**args, "user_text": source_text}
+                if name == "get_events" and args is not None and read_period is not None:
+                    args = {
+                        **args,
+                        "start_time": read_period[0].isoformat(),
+                        "end_time": read_period[1].isoformat(),
+                    }
+                logger.info("tool call %s", name)
 
                 if name == "ask_user":
                     question = (
@@ -223,7 +278,11 @@ class Agent:
                 # отказывает служебной ошибкой, модель пересказывает её пользователю как есть,
                 # а на «да» вызывает тул заново без снимка ID — и удаляет всё, что подходит
                 # на тот момент, а не те записи, число которых человек видел в вопросе.
-                preview = (confirm_changes or name == "delete_events") and name in MUTATING_TOOLS
+                # Retrieved text can influence the model. It never grants write
+                # permission, including within a batch of tool calls.
+                preview = (
+                    confirm_changes or bool(read_tools) or name == "delete_events"
+                ) and name in MUTATING_TOOLS
                 if preview and draft_fingerprint is not None and fingerprint != draft_fingerprint:
                     return AgentResponse(
                         reply_text=(
@@ -240,22 +299,27 @@ class Agent:
                                 ok=False, payload="Аргументы не являются корректным JSON"
                             )
                         elif preview:
-                            result = await self._toolbox.call(user_id, name, args, dry_run=True)
+                            result = await self._toolbox.call(
+                                user_id, name, args, dry_run=True, **evidence
+                            )
                         elif name == "create_event" and request_id is not None:
                             result = await self._toolbox.call(
                                 user_id,
                                 name,
                                 args,
                                 idempotency_key=str(uuid5(request_id, f"create:{mutation_number}")),
+                                **evidence,
                             )
                         else:
-                            result = await self._toolbox.call(user_id, name, args)
+                            result = await self._toolbox.call(user_id, name, args, **evidence)
                     except Exception:
                         if not confirmed:
                             raise
                         logger.exception("MCP недоступен после подтверждённой записи")
                         result = ToolResult(ok=False, payload="Инструмент временно недоступен")
                 if result.ok:
+                    if name in {"get_events", "search_events"}:
+                        read_tools.add(name)
                     for failed_key, (failed_name, failed_args, _, failed_round) in list(
                         errors.items()
                     ):
@@ -272,7 +336,11 @@ class Agent:
                         if name == "delete_events"
                         else args
                     )
-                    draft = DraftAction(tool=name, arguments=draft_args, preview="")
+                    draft = DraftAction(
+                        tool=name,
+                        arguments=draft_args,
+                        preview=_draft_preview(user_id, name, result, args),
+                    )
                     draft_fingerprint = fingerprint
                     mutations[fingerprint] = result
                     messages.append(
@@ -303,12 +371,127 @@ class Agent:
                     {"role": "tool", "tool_call_id": call.id, "content": result.for_llm()}
                 )
 
+            # The validated dry-run already contains every preview fact. Another
+            # paid generation cannot add authority and could misdescribe it.
+            if draft is not None and not errors:
+                return _draft_response(draft)
+
         logger.warning("agent exceeded %d steps", self._max_steps)
         if errors:
             return _incomplete_response(events, confirmed, conflict_warnings, errors)
         if confirmed:
             return _confirmed_response(confirmed, conflict_warnings)
+        if draft:
+            return _draft_response(draft)
         return AgentResponse(reply_text=TOO_MANY_STEPS, status=AgentStatus.ERROR)
+
+
+def _draft_response(draft: DraftAction) -> AgentResponse:
+    return AgentResponse(
+        reply_text=draft.preview, status=AgentStatus.NEEDS_CONFIRMATION, draft=draft
+    )
+
+
+def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict) -> str:
+    """The approved operation and its parameters come from validated tool data.
+
+    The LLM cannot disguise a delete button as a read or change the shown time.
+    JSON quoting keeps an event title from impersonating the following UI text.
+    """
+    if name == "delete_events":
+        count = result.payload["count"]
+        return f"Удалить записи: {count} шт.?\nПодтвердите действие или нажмите «Отмена»."
+    verbs = {
+        "create_event": "Создать",
+        "update_event": "Изменить",
+        "delete_event": "Удалить",
+        "complete_event": "Отметить выполненной",
+    }
+    lines = []
+    for raw in result.events:
+        event = Event.model_validate(raw)
+        if event.user_id != user_id:
+            raise ValueError("Foreign preview event")
+        title = json.dumps(event.name, ensure_ascii=False)
+        kind = {"task": "задачу", "reminder": "напоминание", "meeting": "встречу"}[event.type]
+        lines.append(f"{verbs[name]} {kind}: {title}, {_when(event)}.")
+        if name in {"create_event", "update_event"} and (
+            event.description or "description" in arguments
+        ):
+            lines.append(f"Описание: {json.dumps(event.description, ensure_ascii=False)}")
+        for raw_conflict in raw.get("conflicts") or []:
+            conflict = Event.model_validate(raw_conflict)
+            if conflict.user_id != user_id:
+                raise ValueError("Foreign preview conflict")
+            lines.append(
+                f"Пересечение: {json.dumps(conflict.name, ensure_ascii=False)}, {_when(conflict)}."
+            )
+    if not lines:
+        raise ValueError("Missing preview facts")
+    return "\n".join([*lines, "Подтвердите действие или нажмите «Исправить» / «Отмена»."])
+
+
+def _user_source(history: list[HistoryMessage], text: str) -> str:
+    """Keep actual user evidence across a pending clarification, not unrelated turns."""
+    pending = ""
+    if history and history[-1]["role"] == "assistant":
+        last = history[-1]
+        if "clarification_text" in last:
+            pending = last["clarification_text"]
+        elif last["content"].rstrip().endswith("?") and re.search(
+            r"во\s+сколько|на\s+какое\s+время|на\s+какую\s+дату|какой\s+день|"
+            r"о\s+ч[её]м|сколько\s+продлится|длительност|за\s+сколько|сколько\s+заранее",
+            last["content"],
+            re.I,
+        ):
+            # Compatibility with history saved before explicit status metadata.
+            pending = next(
+                (item["content"] for item in reversed(history[:-1]) if item["role"] == "user"),
+                "",
+            )
+    return (pending + "\n" + text if pending else text)[-6000:]
+
+
+def _read_period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
+    """Resolve explicit inclusive calendar-day windows against the trusted clock.
+
+    Multiple periods or explicit dates stay with the normal interpretation path.
+    This never changes mutation or semantic-search arguments.
+    """
+    text = text.casefold()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    rolling = list(
+        re.finditer(
+            r"\b(последни[ех]|следующи[ех])\s+(\d{1,3}|семь|тридцать)\s+"
+            r"(?:календарных\s+)?д(?:ней|ня|ень)\s*[,—-]?\s*включая\s+сегодня\b",
+            text,
+        )
+    )
+    if len(rolling) == 1:
+        match = rolling[0]
+        rest = text[: match.start()] + text[match.end() :]
+        if not re.search(
+            r"\d|\b(?:вчера|завтра|позавчера|послезавтра|сегодня|недел\w*|месяц\w*)\b", rest
+        ):
+            number = match.group(2)
+            days = {"семь": 7, "тридцать": 30}.get(number, int(number) if number.isdigit() else 0)
+            if 1 <= days <= 366:
+                return (
+                    (today - timedelta(days=days - 1), today + timedelta(days=1))
+                    if match.group(1).startswith("послед")
+                    else (today, today + timedelta(days=days))
+                )
+    if len(re.findall(r"\bмесяц\w*", text)) != 1 or re.search(
+        r"\d|\b(?:вчера|завтра|позавчера|послезавтра|недел\w*|прошл\w*|следующ\w*)\b", text
+    ):
+        return None
+    if not re.search(
+        r"(?:с\s+начала\s+(?:этого|текущего)\s+месяца|"
+        r"в\s+(?:этом|текущем)\s+месяце)\s+по\s+сегодняшний\s+день\b",
+        text,
+    ):
+        return None
+    return today.replace(day=1), today + timedelta(days=1)
 
 
 def _parse_args(raw: str | None) -> dict[str, Any] | None:
@@ -317,28 +500,6 @@ def _parse_args(raw: str | None) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
-
-
-def _with_user_turns(user_text: Any, messages: list[dict[str, Any]], limit: int = 3) -> str:
-    """Доклеить к user_text последние реплики пользователя.
-
-    Модель регулярно кладёт в user_text исходную фразу и теряет ответ на свой же
-    уточняющий вопрос («Во сколько?» → «В 13:00»), после чего тул отвергает
-    названное пользователем время как выдуманное. Проверка остаётся честной:
-    добавляется только то, что пользователь написал сам, ничего от модели.
-    """
-    spoken = [
-        content
-        for message in messages
-        if message.get("role") == "user" and (content := str(message.get("content") or "").strip())
-    ]
-    parts = [str(user_text).strip()] if user_text else []
-    parts.extend(spoken[-limit:])
-    # Повторы ни к чему: та же фраза часто и в user_text, и в последней реплике.
-    seen: dict[str, None] = {}
-    for part in parts:
-        seen.setdefault(part, None)
-    return "\n".join(seen)
 
 
 def _same_action(
@@ -403,3 +564,31 @@ def _confirmed_response(
         status=AgentStatus.DONE,
         events=list({**events, **(conflicts or {})}.values()),
     )
+
+
+def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentResponse:
+    """Render retrieved facts without letting the model rewrite dates or names."""
+    items = list(events.values())
+    search = "search_events" in read_tools
+    if not items:
+        reply = "Подходящих записей не найдено." if search else "За указанный период записей нет."
+        return AgentResponse(reply_text=reply, status=AgentStatus.DONE)
+    lines = [
+        "Подходящие записи (выборка по релевантности):"
+        if search
+        else f"Найдено записей: {len(items)}."
+    ]
+    for event in items:
+        when = "без даты"
+        if event.start_at:
+            when = f"{event.start_at:%d.%m.%Y}, {event.weekday}, {event.start_at:%H:%M}"
+            if event.end_at:
+                end = (
+                    event.end_at.strftime("%H:%M")
+                    if event.end_at.date() == event.start_at.date()
+                    else event.end_at.strftime("%d.%m.%Y %H:%M")
+                )
+                when += f"–{end}"
+        status = " (выполнено)" if event.status == "done" else ""
+        lines.append(f"{when} — {event.name}{status}")
+    return AgentResponse(reply_text="\n".join(lines), status=AgentStatus.DONE, events=items)

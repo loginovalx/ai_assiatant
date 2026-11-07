@@ -1,8 +1,9 @@
 """Голосовая команда не меняет данные без подтверждения.
 
-Распознавание ошибается в именах, датах и числах, поэтому голосовое изменение сначала
+Распознавание ошибается в именах, датах и числах, поэтому изменение сначала
 показывается пользователю как черновик и выполняется только после «Подтвердить».
-Текстовые команды выполняются сразу — в них опечатку видно самому пользователю.
+HTTP/бот требуют подтверждения для голоса и текста; прямой Agent.handle остаётся
+низкоуровневым интерфейсом для контролируемых тестов и оценки качества.
 """
 
 from datetime import datetime, timedelta
@@ -116,7 +117,8 @@ async def test_voice_creates_draft_not_record(make_agent, tz, pool):
     )
 
     assert response.status == AgentStatus.NEEDS_CONFIRMATION
-    assert response.reply_text == "Напомню вам записаться к врачу завтра в 11:00."
+    assert "Создать напоминание" in response.reply_text
+    assert "Записаться к врачу" in response.reply_text and "11:00" in response.reply_text
     assert response.draft is not None
     assert response.draft.tool == "create_event"
     assert response.draft.status == "pending_confirmation"
@@ -146,9 +148,13 @@ async def test_draft_can_be_corrected_before_saving(make_agent, tz, pool):
     """Сценарий из ТЗ: распознало 10:00, пользователь пишет «давай в 12:30»."""
     agent, _ = make_agent(
         tool_call("create_event", reminder_args(tz, hour=10)),
-        text("Напомню вам записаться к врачу завтра в 10:00."),
-        tool_call("create_event", reminder_args(tz, hour=12)),
-        text("Напомню вам записаться к врачу завтра в 12:30."),
+        tool_call(
+            "create_event",
+            {
+                **reminder_args(tz, hour=12),
+                "start_at": tomorrow_at(tz, 12).replace(minute=30).isoformat(),
+            },
+        ),
     )
 
     first = await agent.handle(USER, "Напомни завтра в 11 записаться к врачу", confirm_changes=True)
@@ -163,7 +169,7 @@ async def test_draft_can_be_corrected_before_saving(make_agent, tz, pool):
     await agent.execute_draft(USER, second.draft)
     saved = await pool.fetchrow("SELECT name, start_at FROM events")
     assert saved["name"] == "Записаться к врачу"
-    assert saved["start_at"] == tomorrow_at(tz, 12)
+    assert saved["start_at"] == tomorrow_at(tz, 12).replace(minute=30)
 
 
 async def test_questions_by_voice_need_no_confirmation(make_agent, tz, pool):
@@ -182,7 +188,7 @@ async def test_questions_by_voice_need_no_confirmation(make_agent, tz, pool):
     assert response.draft is None
 
 
-async def test_text_commands_still_execute_immediately(make_agent, tz, pool):
+async def test_low_level_agent_can_execute_without_http_review_policy(make_agent, tz, pool):
     agent, _ = make_agent(
         tool_call("create_event", reminder_args(tz)),
         text("Напомню вам записаться к врачу завтра в 11:00."),

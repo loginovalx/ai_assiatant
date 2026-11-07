@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:8090/v1"
     llm_api_key: str = Field(default="change-me", repr=False)  # = GPT2GIGA_API_KEY
     llm_model: str = "GigaChat-2-Max"
+    usage_log_path: str | None = None
     llm_timeout_seconds: float = 60
     mcp_url: str = "http://localhost:8001/mcp"
     agent_host: str = "0.0.0.0"

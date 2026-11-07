@@ -77,9 +77,14 @@ async def test_same_user_serialized_and_reset_cannot_overtake_request(redis):
 
 
 async def test_confirm_retry_uses_recorded_result(redis):
-    agent = FakeAgent()
+    class IssuingAgent(FakeAgent):
+        async def handle(self, user_id, text, **kwargs):
+            return AgentResponse(status="needs_confirmation", reply_text=draft.preview, draft=draft)
+
+    agent = IssuingAgent()
     service = AgentService(agent, redis)
     draft = DraftAction(tool="delete_events", arguments={"event_ids": []}, preview="Удалить")
+    await service.handle("u", "Удалить")
     await service.execute_draft("u", draft)
     await AgentService(agent, redis).execute_draft("u", draft)
     assert agent.calls == 1

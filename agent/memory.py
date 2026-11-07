@@ -6,7 +6,7 @@
 """
 
 import json
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 from redis.asyncio import Redis
 
@@ -14,6 +14,7 @@ from redis.asyncio import Redis
 class HistoryMessage(TypedDict):
     role: Literal["user", "assistant"]
     content: str
+    clarification_text: NotRequired[str]
 
 
 class ConversationMemory:

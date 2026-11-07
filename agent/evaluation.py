@@ -259,7 +259,7 @@ def judge_case(
         expected_types = set(expected.get("event_types", []))
         supplied_types = arguments.get("event_types")
         actual_types = (
-            {"task", "meeting", "reminder"} if supplied_types is None else set(supplied_types)
+            {"task", "meeting", "reminder"} if not supplied_types else set(supplied_types)
         )
         if actual_types != expected_types:
             reasons.append("get_events event_types do not match expected types")

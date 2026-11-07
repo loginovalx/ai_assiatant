@@ -109,8 +109,13 @@ async def search_events(
     user_id: UserId,
     q: Annotated[str, Query(min_length=1, max_length=200)],
     limit: Annotated[int, Query(ge=1, le=20)] = 10,
+    type: Annotated[
+        list[EventType] | None, Query(description="Фильтры типов до ограничения выдачи")
+    ] = None,
 ) -> list[SearchHit]:
-    return await repo.search(user_id, q.strip(), limit=limit)
+    if not q.strip():
+        raise HTTPException(status_code=422, detail="Введите поисковый запрос")
+    return await repo.search(user_id, q.strip(), limit=limit, types=type)
 
 
 @app.post("/v1/events/import", response_model=ImportResult)

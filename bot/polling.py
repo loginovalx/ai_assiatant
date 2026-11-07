@@ -3,9 +3,9 @@
 Вебхук требует домен с доверенным сертификатом; на машине без Docker и туннеля
 бот проще поднимать циклом GET /updates: ``python -m bot.polling``.
 
-Маркер курсора хранится в Redis: после рестарта бот не получит старые обновления
-повторно, а то, что пришло, пока он лежал, — получит. Обновления обрабатываются
-как задачки, чтобы длинный ASR/LLM-запрос не задерживал следующий длинный полл.
+Маркер курсора хранится в Redis и сдвигается только после успешной обработки пачки.
+Обновления внутри пачки обрабатываются параллельно, чтобы один долгий запрос не
+блокировал обработку остальных обновлений из этой пачки.
 """
 
 import asyncio
@@ -18,7 +18,7 @@ from redis.exceptions import RedisError
 from bot.agent_client import AgentClient
 from bot.asr import make_asr
 from bot.config import Settings
-from bot.handler import BotHandler
+from bot.handler import BotHandler, is_valid_update
 from bot.max_api import MaxAPI, MaxAPIError
 from bot.reminders import ReminderSender
 from bot.state import StateStore
@@ -36,10 +36,8 @@ _active: set[asyncio.Task[None]] = set()
 def _on_task_done(task: asyncio.Task[None]) -> None:
     _active.discard(task)
     if not task.cancelled():
-        try:
-            task.result()
-        except Exception:
-            logger.exception("MAX polling update handler failed")
+        # poll_once gathers every task and reports failures before advancing the marker.
+        task.exception()
 
 
 class PollingBot:
@@ -56,7 +54,7 @@ class PollingBot:
         self._timeout = timeout
 
     async def poll_once(self, marker: int | None) -> int | None:
-        """Один запрос /updates: раздать обновления, сохранить курсор. Новый marker → наружу."""
+        """Handle one batch before persisting its cursor, so failures are replayable."""
         data = await self._max_api.updates(marker, timeout=self._timeout)
         updates = data.get("updates") or []
         if updates:
@@ -64,13 +62,22 @@ class PollingBot:
                 "MAX updates batch: %s",
                 [u.get("update_type") for u in updates if isinstance(u, dict)],
             )
+        tasks = []
         for update in updates:
-            if not isinstance(update, dict) or not isinstance(update.get("update_type"), str):
-                logger.warning("MAX polling: пропуск неизвестного обновления")
+            if not is_valid_update(update):
+                logger.warning("MAX polling: пропуск обновления с некорректной структурой")
                 continue
             task = asyncio.create_task(self._handler.handle_update(update))
+            tasks.append(task)
             _active.add(task)
             task.add_done_callback(_on_task_done)
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            failure = next(
+                (result for result in results if isinstance(result, BaseException)), None
+            )
+            if failure is not None:
+                raise RuntimeError("MAX update batch failed; marker was not advanced") from failure
         new_marker = data.get("marker")
         if new_marker is None:
             return marker
@@ -90,9 +97,12 @@ class PollingBot:
                 logger.warning("MAX updates error: %s", exc)
                 await asyncio.sleep(_POLL_BACKOFF_SECONDS)
             except (httpx.HTTPError, ValueError, MaxAPIError, RedisError, OSError) as exc:
-                # Сеть дрогнула (в том числе Redis): не падаем, пробуем снова;
-                # маркер остаётся в памяти, обработчики продолжаются сами.
+                # The cursor stays in memory; retry the same MAX batch after a short delay.
                 logger.warning("MAX polling error: %s", exc)
+                await asyncio.sleep(_POLL_BACKOFF_SECONDS)
+            except Exception:
+                # An update handler failed: leave the cursor unchanged and replay the batch.
+                logger.exception("MAX polling update batch failed")
                 await asyncio.sleep(_POLL_BACKOFF_SECONDS)
 
 

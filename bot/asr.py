@@ -34,6 +34,8 @@ class WhisperASR:
         try:
             async with self._lock:
                 return await asyncio.to_thread(self._transcribe_sync, audio_bytes)
+        except SpeechRecognitionError:
+            raise
         except Exception as exc:
             logger.exception(
                 "Whisper ASR failed, audio_size=%d bytes",
@@ -46,7 +48,9 @@ class WhisperASR:
             from faster_whisper import WhisperModel
 
             self._model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
-        segments, _ = self._model.transcribe(BytesIO(audio_bytes), language="ru", beam_size=5)
+        segments, _ = self._model.transcribe(
+            BytesIO(audio_bytes), language="ru", beam_size=5, vad_filter=True
+        )
         text = " ".join(segment.text.strip() for segment in segments).strip()
         if not text:
             raise SpeechRecognitionError("В сообщении не удалось распознать речь")

@@ -14,6 +14,22 @@ class MaxAPIError(Exception):
 
 # Files are fetched only from the trusted MAX CDN family, not arbitrary hosts.
 _ALLOWED_MEDIA_DOMAINS = ("max.ru", "oneme.ru", "okcdn.ru", "mycdn.me")
+_MAX_MESSAGE_LENGTH = 4000
+
+
+def _message_chunks(text: str) -> list[str]:
+    """Split long MAX messages without changing text or dropping separators."""
+    chunks = []
+    while len(text) > _MAX_MESSAGE_LENGTH:
+        newline = text.rfind("\n", 0, _MAX_MESSAGE_LENGTH)
+        if newline >= _MAX_MESSAGE_LENGTH // 2:
+            boundary = newline + 1  # Keep the newline in the preceding chunk.
+        else:
+            boundary = _MAX_MESSAGE_LENGTH
+        chunks.append(text[:boundary])
+        text = text[boundary:]
+    chunks.append(text)
+    return chunks
 
 
 def _safe_media_url(url: str) -> bool:
@@ -72,33 +88,35 @@ class MaxAPI:
         target = ("user_id" if to_user else "chat_id", chat_id)
         lock = self._send_locks.setdefault(target, asyncio.Lock())
         async with lock:
-            # MAX limits bursts to about two messages/sec per dialog.
-            pause = 0.60 - (time.monotonic() - self._last_sent.get(target, -1e9))
-            if pause > 0:
-                await asyncio.sleep(pause)
-            for attempt in range(3):
-                response = await self.client.post(
-                    "/messages",
-                    params={target[0]: target[1]},
-                    json={
-                        "text": text[:4000],
-                        **(
-                            {
-                                "attachments": [
-                                    {"type": "inline_keyboard", "payload": {"buttons": buttons}}
-                                ]
-                            }
-                            if buttons
-                            else {}
-                        ),
-                    },
-                )
-                if response.status_code == 429 and attempt < 2:
-                    await asyncio.sleep(1.0)
-                    continue
-                response.raise_for_status()
-                self._last_sent[target] = time.monotonic()
-                return
+            chunks = _message_chunks(text)
+            for index, chunk in enumerate(chunks):
+                # MAX limits bursts to about two messages/sec per dialog.
+                pause = 0.60 - (time.monotonic() - self._last_sent.get(target, -1e9))
+                if pause > 0:
+                    await asyncio.sleep(pause)
+                for attempt in range(3):
+                    response = await self.client.post(
+                        "/messages",
+                        params={target[0]: target[1]},
+                        json={
+                            "text": chunk,
+                            **(
+                                {
+                                    "attachments": [
+                                        {"type": "inline_keyboard", "payload": {"buttons": buttons}}
+                                    ]
+                                }
+                                if buttons and index == len(chunks) - 1
+                                else {}
+                            ),
+                        },
+                    )
+                    if response.status_code == 429 and attempt < 2:
+                        await asyncio.sleep(1.0)
+                        continue
+                    response.raise_for_status()
+                    self._last_sent[target] = time.monotonic()
+                    break
 
     async def answer_callback(self, callback_id: str, text: str | None = None) -> None:
         response = await self.client.post(

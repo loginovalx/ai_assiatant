@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid5
@@ -22,6 +23,10 @@ class AgentBusy(Exception):
 
 
 class RequestConflict(Exception):
+    pass
+
+
+class InvalidDraft(Exception):
     pass
 
 
@@ -91,17 +96,42 @@ class AgentService:
                             raise RequestConflict
                         if previous.get("response"):
                             return AgentResponse.model_validate(previous["response"])
+                if payload.get("operation") == "confirm":
+                    issued = await self._redis.get(f"agent:pending:{user_id}")
+                    supplied = json.dumps(payload["draft"], sort_keys=True, ensure_ascii=False)
+                    if not issued or not secrets.compare_digest(issued.encode(), supplied.encode()):
+                        raise InvalidDraft
+                if key:
                     # Bind the ID before running, including when the operation later fails.
                     await self._redis.set(key, json.dumps(envelope), ex=self._ttl)
                 result = await operation()
+                if result.status == AgentStatus.NEEDS_CONFIRMATION and result.draft is not None:
+                    await self._redis.set(
+                        f"agent:pending:{user_id}",
+                        json.dumps(
+                            result.draft.model_dump(mode="json"), sort_keys=True, ensure_ascii=False
+                        ),
+                        ex=300,
+                    )
+                receipt_saved = False
                 if key and result.status != AgentStatus.ERROR:
                     envelope["response"] = result.model_dump(mode="json")
                     try:
                         await self._redis.set(
                             key, json.dumps(envelope, ensure_ascii=False), ex=self._ttl
                         )
+                        receipt_saved = True
                     except RedisError:
                         logger.exception("Не удалось сохранить результат запроса агента")
+                if (
+                    payload.get("operation") == "confirm"
+                    and result.status == AgentStatus.DONE
+                    and receipt_saved
+                ):
+                    try:
+                        await self._redis.delete(f"agent:pending:{user_id}")
+                    except RedisError:
+                        logger.exception("Не удалось очистить подтверждённый черновик")
                 return result
         except AgentBusy:
             return AgentResponse(
@@ -112,6 +142,11 @@ class AgentService:
             return AgentResponse(
                 status=AgentStatus.ERROR,
                 reply_text="Этот request_id уже использован для другого запроса.",
+            )
+        except InvalidDraft:
+            return AgentResponse(
+                status=AgentStatus.ERROR,
+                reply_text="Подтверждение устарело или изменено. Отправьте команду заново.",
             )
         except TimeoutError:
             return AgentResponse(
@@ -132,14 +167,32 @@ class AgentService:
         *,
         confirm_changes: bool = False,
         request_id: UUID | None = None,
+        edit_draft_id: UUID | None = None,
     ) -> AgentResponse:
+        async def operation() -> AgentResponse:
+            kwargs = {}
+            if edit_draft_id is not None:
+                pending = await self._redis.get(f"agent:pending:{user_id}")
+                issued = DraftAction.model_validate_json(pending) if pending else None
+                if issued is None or issued.id != edit_draft_id:
+                    raise InvalidDraft
+                source = issued.arguments.get("user_text")
+                if issued.tool == "create_event" and isinstance(source, str):
+                    kwargs["trusted_edit_source"] = source
+            return await self._agent.handle(
+                user_id, text, confirm_changes=confirm_changes, request_id=request_id, **kwargs
+            )
+
         return await self._run(
             user_id,
             request_id,
-            {"operation": "message", "text": text, "confirm_changes": confirm_changes},
-            lambda: self._agent.handle(
-                user_id, text, confirm_changes=confirm_changes, request_id=request_id
-            ),
+            {
+                "operation": "message",
+                "text": text,
+                "confirm_changes": confirm_changes,
+                "edit_draft_id": str(edit_draft_id) if edit_draft_id else None,
+            },
+            operation,
         )
 
     async def execute_draft(self, user_id: str, draft: DraftAction) -> AgentResponse:
@@ -154,3 +207,4 @@ class AgentService:
         async with asyncio.timeout(self._timeout):
             async with self._locked(user_id):
                 await self._agent.reset(user_id)
+                await self._redis.delete(f"agent:pending:{user_id}")

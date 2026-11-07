@@ -31,7 +31,7 @@ async def test_forged_unissued_confirmation_cannot_execute(redis):
 async def test_issued_confirmation_is_bound_to_owner_and_exact_payload(redis, tamper):
     agent = DraftAgent()
     service = AgentService(agent, redis)
-    issued = (await service.handle("u", "Создай Approved")).draft
+    issued = (await service.handle("u", "Создай Approved", confirm_changes=True)).draft
     changes = {
         "arguments": {"name": "Injected"},
         "tool": "delete_events",
@@ -48,9 +48,9 @@ async def test_issued_confirmation_is_bound_to_owner_and_exact_payload(redis, ta
 async def test_expired_and_superseded_drafts_are_rejected(redis):
     agent = DraftAgent()
     service = AgentService(agent, redis)
-    first = (await service.handle("u", "One")).draft
+    first = (await service.handle("u", "One", confirm_changes=True)).draft
     agent.draft = agent.draft.model_copy(update={"id": uuid4()})
-    second = (await service.handle("u", "Two")).draft
+    second = (await service.handle("u", "Two", confirm_changes=True)).draft
     assert (await service.execute_draft("u", first)).status == "error"
     await redis.delete("agent:pending:u")
     assert (await service.execute_draft("u", second)).status == "error"
@@ -60,7 +60,7 @@ async def test_expired_and_superseded_drafts_are_rejected(redis):
 async def test_issued_draft_replay_recovers_receipt_without_second_commit(redis):
     agent = DraftAgent()
     service = AgentService(agent, redis)
-    issued = (await service.handle("u", "Create")).draft
+    issued = (await service.handle("u", "Create", confirm_changes=True)).draft
     first = await service.execute_draft("u", issued)
     second = await AgentService(agent, redis).execute_draft("u", issued)
     assert first == second and first.status == "done"

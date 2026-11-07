@@ -84,7 +84,7 @@ async def test_confirm_retry_uses_recorded_result(redis):
     agent = IssuingAgent()
     service = AgentService(agent, redis)
     draft = DraftAction(tool="delete_events", arguments={"event_ids": []}, preview="Удалить")
-    await service.handle("u", "Удалить")
+    await service.handle("u", "Удалить", confirm_changes=True)
     await service.execute_draft("u", draft)
     await AgentService(agent, redis).execute_draft("u", draft)
     assert agent.calls == 1
@@ -141,6 +141,9 @@ async def test_deadline_includes_dependency_lock_wait():
             pass
 
     class SlowRedis:
+        async def get(self, key):
+            return None
+
         def lock(self, *args, **kwargs):
             return SlowLock()
 

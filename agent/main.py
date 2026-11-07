@@ -97,7 +97,7 @@ async def message(body: AgentRequest, agent: AgentDep) -> AgentResponse:
     return await agent.handle(
         body.user_id,
         body.text,
-        confirm_changes=True,
+        confirm_changes=body.confirm_changes,
         request_id=body.request_id,
         edit_draft_id=body.edit_draft_id,
     )

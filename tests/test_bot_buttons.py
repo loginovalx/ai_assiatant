@@ -65,6 +65,9 @@ class FakeAgent:
             reply_text=f"Готово. {draft.preview}", status="done"
         )
 
+    async def reset(self, user_id):
+        pass
+
 
 DRAFT = DraftAction(
     tool="create_event",
@@ -318,18 +321,18 @@ async def test_quick_action_runs_like_a_typed_question(handler):
 
     await bot.handle_update(callback("quick:tomorrow"))
 
-    assert agent.asked == [{"text": "Что у меня завтра?", "confirm_changes": True}]
+    assert agent.asked == [{"text": "Что у меня завтра?", "confirm_changes": False}]
     assert max_api.sent[-1]["text"] == "Завтра ничего нет."
 
 
-async def test_text_command_requests_review_of_model_proposed_writes(handler):
+async def test_text_command_requests_immediate_execution(handler):
     agent = FakeAgent(AgentMessageResponse(reply_text="Напомню завтра в 11:00.", status="done"))
     bot, max_api = handler(agent)
     await bot.redis.set(f"bot:greeted:{USER}", "1")
 
     await bot.handle_update(text_message("напомни завтра в 11 записаться к врачу"))
 
-    assert agent.asked[0]["confirm_changes"] is True
+    assert agent.asked[0]["confirm_changes"] is False
     assert max_api.sent[-1]["buttons"] is None
 
 

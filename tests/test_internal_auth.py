@@ -45,7 +45,7 @@ async def test_valid_agent_token_reaches_payload_validation(key, monkeypatch):
         assert (await c.get("/health")).status_code == 200
 
 
-async def test_http_client_cannot_disable_mutation_review(key, monkeypatch):
+async def test_authorized_bot_can_choose_text_execution_policy(key, monkeypatch):
     from common.schemas import AgentResponse
 
     received = []
@@ -65,7 +65,7 @@ async def test_http_client_cannot_disable_mutation_review(key, monkeypatch):
             headers={"Authorization": f"Bearer {key}"},
         )
     assert response.status_code == 200
-    assert received[0]["confirm_changes"] is True
+    assert received[0]["confirm_changes"] is False
 
 
 async def test_mcp_token_is_domain_separated_and_rejects_wrong_tokens(key):

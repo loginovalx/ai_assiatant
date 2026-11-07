@@ -113,6 +113,7 @@ class AgentService:
                         ),
                         ex=300,
                     )
+                    await self._redis.delete(f"agent:voice-review:{user_id}")
                 receipt_saved = False
                 if key and result.status != AgentStatus.ERROR:
                     envelope["response"] = result.model_dump(mode="json")
@@ -170,6 +171,18 @@ class AgentService:
         edit_draft_id: UUID | None = None,
     ) -> AgentResponse:
         async def operation() -> AgentResponse:
+            review_key = f"agent:voice-review:{user_id}"
+            auto_key = f"agent:auto-draft:{user_id}:{request_id}" if request_id else None
+            staged = await self._redis.get(auto_key) if auto_key else None
+            if staged:
+                # The previous text request may have committed before its receipt
+                # was saved. Replay its exact snapshot instead of invoking the model.
+                return await self._agent.execute_draft(
+                    user_id, DraftAction.model_validate_json(staged)
+                )
+            review = bool(
+                confirm_changes or edit_draft_id is not None or await self._redis.get(review_key)
+            )
             kwargs = {}
             if edit_draft_id is not None:
                 pending = await self._redis.get(f"agent:pending:{user_id}")
@@ -179,9 +192,25 @@ class AgentService:
                 source = issued.arguments.get("user_text")
                 if issued.tool == "create_event" and isinstance(source, str):
                     kwargs["trusted_edit_source"] = source
-            return await self._agent.handle(
-                user_id, text, confirm_changes=confirm_changes, request_id=request_id, **kwargs
+            result = await self._agent.handle(
+                user_id, text, confirm_changes=review, request_id=request_id, **kwargs
             )
+            if review and result.status in {
+                AgentStatus.NEED_CLARIFICATION,
+                AgentStatus.NEEDS_CONFIRMATION,
+            }:
+                # Persist only an unfinished voice dialogue; standalone failed voice
+                # requests must not make the next ordinary text require confirmation.
+                await self._redis.set(review_key, "1", ex=self._ttl)
+            if not review and result.status == AgentStatus.NEEDS_CONFIRMATION and result.draft:
+                # Bulk deletion and writes after lookup still validate a snapshot.
+                # Typed commands approve it immediately without an extra user step.
+                if auto_key:
+                    await self._redis.set(auto_key, result.draft.model_dump_json(), ex=self._ttl)
+                result = await self._agent.execute_draft(user_id, result.draft)
+            if result.status == AgentStatus.DONE:
+                await self._redis.delete(review_key)
+            return result
 
         return await self._run(
             user_id,
@@ -207,4 +236,6 @@ class AgentService:
         async with asyncio.timeout(self._timeout):
             async with self._locked(user_id):
                 await self._agent.reset(user_id)
-                await self._redis.delete(f"agent:pending:{user_id}")
+                await self._redis.delete(
+                    f"agent:pending:{user_id}", f"agent:voice-review:{user_id}"
+                )

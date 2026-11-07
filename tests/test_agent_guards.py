@@ -254,7 +254,7 @@ async def test_read_dates_and_names_are_rendered_from_persisted_fields(tool_name
     )
     result = await agent.handle("u", "Покажи записи")
     assert result.status == AgentStatus.DONE
-    assert "20.10.2026" in result.reply_text and "вторник" in result.reply_text
+    assert "20 октября 2026" in result.reply_text and "вторник" in result.reply_text
     assert "18:00" in result.reply_text and "19:00" in result.reply_text
     assert "Точное название" in result.reply_text and "21 октября" not in result.reply_text
     if tool_name == "search_events":

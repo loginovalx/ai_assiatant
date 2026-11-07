@@ -75,6 +75,9 @@ class FakeAgent:
         self.confirmed.append(draft)
         return AgentMessageResponse(reply_text="Готово.", status="done")
 
+    async def reset(self, user_id):
+        pass
+
 
 def draft() -> DraftAction:
     return DraftAction(

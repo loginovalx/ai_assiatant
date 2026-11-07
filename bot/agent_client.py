@@ -16,7 +16,9 @@ class AgentClient:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
 
-    async def _post(self, path: str, payload: dict) -> AgentMessageResponse:
+    async def _post(
+        self, path: str, payload: dict, *, allow_empty: bool = False
+    ) -> AgentMessageResponse:
         try:
             async with httpx.AsyncClient(timeout=75) as client:
                 for attempt in range(2):
@@ -31,6 +33,8 @@ class AgentClient:
                             raise
                         continue  # same request/draft ID makes a lost receipt safe to retry
                     response.raise_for_status()
+                    if allow_empty and response.status_code == 204:
+                        return AgentMessageResponse(reply_text="", status="done")
                     return AgentMessageResponse.model_validate(response.json())
         except (httpx.HTTPError, ValueError) as exc:
             raise AgentUnavailable("Агент недоступен или вернул некорректный ответ") from exc
@@ -59,3 +63,6 @@ class AgentClient:
         return await self._post(
             "/v1/agent/confirm", {"user_id": user_id, "draft": draft.model_dump(mode="json")}
         )
+
+    async def reset(self, user_id: str) -> None:
+        await self._post("/v1/agent/reset", {"user_id": user_id}, allow_empty=True)

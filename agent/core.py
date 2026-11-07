@@ -15,8 +15,10 @@ from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 
 from agent.memory import ConversationMemory, HistoryMessage
+from agent.policy import asks_to_read, explicitly_requests_change
 from agent.prompt import build_system_prompt
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
+from common.display import format_calendar_time
 from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
 from common.usage import record_usage
 
@@ -297,10 +299,22 @@ class Agent:
                     )
 
                 fingerprint = json.dumps([name, args], ensure_ascii=False, sort_keys=True)
-                # Массовое удаление подтверждаем всегда, даже в текстовом режиме. Иначе тул
-                # отказывает служебной ошибкой, модель пересказывает её пользователю как есть,
-                # а на «да» вызывает тул заново без снимка ID — и удаляет всё, что подходит
-                # на тот момент, а не те записи, число которых человек видел в вопросе.
+                if (
+                    name in MUTATING_TOOLS
+                    and not confirm_changes
+                    and (read_tools or name == "delete_events" or asks_to_read(source_text or ""))
+                    and not explicitly_requests_change(source_text or "", name)
+                ):
+                    return (
+                        _read_response(events, read_tools)
+                        if read_tools
+                        else AgentResponse(
+                            status=AgentStatus.ERROR,
+                            reply_text="Не получилось выполнить запрос. Календарь не изменён.",
+                        )
+                    )
+                # Массовое удаление всегда получает снимок ID. Для текста сервис
+                # применяет его сразу; голосовой вариант ждёт кнопки пользователя.
                 # Retrieved text can influence the model. It never grants write
                 # permission, including within a batch of tool calls.
                 preview = (
@@ -612,11 +626,7 @@ def _with_event_refs(response: AgentResponse) -> str:
 
 
 def _when(event: Event) -> str:
-    if event.start_at is None:
-        return "без даты"
-    if event.end_at is None:
-        return event.start_at.isoformat()
-    return f"{event.start_at.isoformat()}–{event.end_at.strftime('%H:%M')}"
+    return format_calendar_time(event.start_at, event.end_at)
 
 
 def _confirmed_response(
@@ -625,8 +635,7 @@ def _confirmed_response(
     lines = []
     for event in events.values():
         action = {"done": "Выполнено", "cancelled": "Отменено"}.get(event.status, "Сохранено")
-        when = event.start_at.strftime("%d.%m.%Y в %H:%M") if event.start_at else "без даты"
-        lines.append(f"{action}: {event.name}, {when}.")
+        lines.append(f"{action}: {event.name}, {_when(event)}.")
     for event in (conflicts or {}).values():
         lines.append(f"Учтите: пересечение с «{event.name}», {_when(event)}.")
     response = AgentResponse(
@@ -651,16 +660,7 @@ def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentRespo
         else f"Найдено записей: {len(items)}."
     ]
     for event in items:
-        when = "без даты"
-        if event.start_at:
-            when = f"{event.start_at:%d.%m.%Y}, {event.weekday}, {event.start_at:%H:%M}"
-            if event.end_at:
-                end = (
-                    event.end_at.strftime("%H:%M")
-                    if event.end_at.date() == event.start_at.date()
-                    else event.end_at.strftime("%d.%m.%Y %H:%M")
-                )
-                when += f"–{end}"
+        when = _when(event)
         status = " (выполнено)" if event.status == "done" else ""
         lines.append(f"{when} — {event.name}{status}")
     return AgentResponse(reply_text="\n".join(lines), status=AgentStatus.DONE, events=items)

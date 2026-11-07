@@ -64,14 +64,21 @@ async def test_another_time_button_edits_owners_conflicting_draft_then_confirms(
     monkeypatch.setattr(client, "ask", traced_ask)
     bot = BotHandler(max_api, None, client, StateStore(redis), redis)
 
-    async def message(text, mid):
+    async def message(text, mid, *, voice=False):
         await bot.handle_update(
             {
                 "update_type": "message_created",
                 "message": {
                     "sender": {"user_id": int(owner)},
                     "recipient": {"chat_type": "dialog"},
-                    "body": {"mid": mid, "text": text},
+                    "body": {
+                        "mid": mid,
+                        **(
+                            {"attachments": [{"type": "audio", "payload": {"transcription": text}}]}
+                            if voice
+                            else {"text": text}
+                        ),
+                    },
                 },
             }
         )
@@ -88,7 +95,7 @@ async def test_another_time_button_edits_owners_conflicting_draft_then_confirms(
             }
         )
 
-    await message("Встреча новый созвон завтра в 10 на полчаса", "create-meeting")
+    await message("Встреча новый созвон завтра в 10 на полчаса", "create-meeting", voice=True)
     assert "Пересечение" in max_api.sent[-1]["text"]
     first = await bot.drafts.load(owner)
     button = next(

@@ -494,7 +494,7 @@ async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool)
 
     history = await agent._memory.load(USER)
     assert ivan_id in history[-1]["content"]  # id пересекающейся встречи есть в сводке
-    assert "–16:00" in history[-1]["content"]  # и время окончания
+    assert "до 16:00" in history[-1]["content"]  # и время окончания
 
 
 async def test_complete_and_delete_event(make_agent, tz, pool):

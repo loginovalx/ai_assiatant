@@ -12,6 +12,7 @@ from bot.agent_client import AgentClient, AgentUnavailable
 from bot.asr import SpeechRecognitionError, SpeechRecognizer
 from bot.drafts import DraftStore
 from bot.max_api import MaxAPI, MaxAPIError
+from bot.models import AgentMessageResponse
 from bot.state import StateStore
 from bot.time_choices import (
     TimeChoiceStore,
@@ -372,6 +373,7 @@ class BotHandler:
                     return
                 action = parts[1]
                 if action == "cancel":
+                    await self.agent.reset(user_id)
                     await self.drafts.drop(user_id)
                     await self.time_choices.clear(user_id)
                     await self.max_api.send(int(user), "Отменил действие.", to_user=True)
@@ -654,16 +656,30 @@ class BotHandler:
             pending = await self.drafts.load(user_id)
             keep_phrase = pending is not None and is_explicit_keep_confirmation(text)
             if keep_phrase and not can_change_draft_time(pending):
+                await self.agent.reset(user_id)
                 await self.drafts.drop(user_id)
                 await reply("Оставил календарь без изменений.")
                 return
             if pending and (
                 text.casefold().strip(" .!") in {"да", "подтвердить", "подтверждаю"} or keep_phrase
             ):
+                if is_voice:
+                    await self._result(
+                        user_id,
+                        chat_id,
+                        AgentMessageResponse(
+                            reply_text=pending.preview,
+                            status="needs_confirmation",
+                            draft=pending,
+                        ),
+                        to_user,
+                    )
+                    return
                 result = await self.agent.confirm(user_id, pending)
                 if result.status == "done":
                     await self.drafts.drop(user_id)
             elif pending and text.casefold().strip(" .!") in {"нет", "отмена", "отмени"}:
+                await self.agent.reset(user_id)
                 await self.drafts.drop(user_id)
                 await reply("Отменил действие.")
                 return
@@ -671,9 +687,9 @@ class BotHandler:
                 result = await self.agent.ask(
                     user_id=user_id,
                     text=text,
-                    # Every model-proposed write is reviewed, even for typed
-                    # messages. User text cannot turn this server policy off.
-                    confirm_changes=True,
+                    # Voice and corrections of its pending draft always need review.
+                    # AgentService retains this rule across clarification replies.
+                    confirm_changes=is_voice or pending is not None,
                     request_id=str(uuid5(NAMESPACE_URL, f"max:{user_id}:{mid}")) if mid else None,
                     **({"edit_draft_id": str(pending.id)} if pending is not None else {}),
                 )

@@ -412,6 +412,17 @@ class Agent:
             # paid generation cannot add authority and could misdescribe it.
             if draft is not None and not errors:
                 return _draft_response(draft)
+            if (
+                read_tools
+                and not errors
+                and not confirmed
+                and not any(
+                    explicitly_requests_change(source_text or "", tool) for tool in MUTATING_TOOLS
+                )
+            ):
+                # Successful list/search results already contain every display fact.
+                # Only explicit write requests need another interpretation step.
+                return _read_response(events, read_tools)
 
         logger.warning("agent exceeded %d steps", self._max_steps)
         if errors:

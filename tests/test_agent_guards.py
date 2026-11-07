@@ -283,6 +283,80 @@ async def test_successful_read_survives_model_failure_after_tool():
     assert "без даты" in result.reply_text and "выполнено" in result.reply_text
 
 
+@pytest.mark.parametrize("tool_name", ["get_events", "search_events"])
+@pytest.mark.parametrize("empty", [False, True])
+async def test_read_list_is_formatted_without_a_second_model_request(tool_name, empty):
+    raw = mutation().events[0]
+    rows = [] if empty else [raw]
+    agent, toolbox = setup_agent(
+        [completion(calls=[(tool_name, "{}")]), completion("Unused formatting pass")],
+        ToolResult(ok=True, payload=rows, events=rows),
+    )
+    create = agent._llm.chat.completions.create
+    requests = 0
+
+    async def counted(**kwargs):
+        nonlocal requests
+        requests += 1
+        return await create(**kwargs)
+
+    agent._llm.chat.completions.create = counted
+    response = await agent.handle("u", "Покажи мои записи")
+    assert response.status == AgentStatus.DONE
+    assert requests == 1
+    assert toolbox.calls == 1
+    assert len(response.events) == len(rows)
+    assert "Unused formatting pass" not in response.reply_text
+    if empty:
+        assert any(phrase in response.reply_text.casefold() for phrase in ["нет", "не найдено"])
+    else:
+        assert raw["name"] in response.reply_text
+
+
+async def test_all_reads_in_one_batch_are_formatted_with_one_model_request():
+    first, second = mutation().events[0], mutation().events[0]
+    second["name"] = "Вторая запись"
+    agent, _ = setup_agent(
+        [
+            completion(calls=[("get_events", "{}"), ("search_events", "{}")]),
+            completion("Unused formatting pass"),
+        ],
+        [ToolResult(ok=True, payload=[row], events=[row]) for row in [first, second]],
+    )
+    create = agent._llm.chat.completions.create
+    requests = 0
+
+    async def counted(**kwargs):
+        nonlocal requests
+        requests += 1
+        return await create(**kwargs)
+
+    agent._llm.chat.completions.create = counted
+    response = await agent.handle("u", "Покажи все записи")
+    assert requests == 1
+    assert {str(event.id) for event in response.events} == {first["id"], second["id"]}
+
+
+async def test_failed_read_can_be_repaired_before_code_formats_the_list():
+    raw = mutation().events[0]
+    script = [
+        completion(calls=[("get_events", "{}")]),
+        completion(calls=[("get_events", "{}")]),
+        completion("Unused formatting pass"),
+    ]
+    agent, toolbox = setup_agent(
+        script,
+        [
+            ToolResult(ok=False, payload="Временно недоступно"),
+            ToolResult(ok=True, payload=[raw], events=[raw]),
+        ],
+    )
+    response = await agent.handle("u", "Покажи записи")
+    assert response.status == AgentStatus.DONE and len(response.events) == 1
+    assert toolbox.calls == 2
+    assert len(script) == 1
+
+
 @pytest.mark.parametrize(
     "query",
     [

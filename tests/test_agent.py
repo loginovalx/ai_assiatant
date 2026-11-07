@@ -552,9 +552,10 @@ async def test_broken_json_arguments(make_agent):
 
 async def test_step_limit(make_agent):
     loop = [tool_call("search_events", {"query": "x"}, f"c{i}") for i in range(6)]
-    agent, _ = make_agent(*loop)
-    response = await agent.handle(USER, "Найди")
+    agent, llm = make_agent(*loop)
+    response = await agent.handle(USER, "Найди задачу и перенеси её на завтра")
     assert response.status == AgentStatus.ERROR
+    assert len(llm.requests) == 6
 
 
 async def test_reset_and_history_trim(redis):

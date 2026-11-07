@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, computed_field, field_validator, model_validator
 
 from common.config import get_settings
 from common.timeutils import WEEKDAYS_RU, ensure_aware
@@ -192,6 +192,8 @@ class AgentResponse(BaseModel):
     status: AgentStatus
     events: list[Event] = []
     draft: DraftAction | None = None
+    # Machine-owned history metadata; excluded from the HTTP contract and model context.
+    _conflict_warning: bool = PrivateAttr(default=False)
 
 
 class AgentConfirmRequest(BaseModel):

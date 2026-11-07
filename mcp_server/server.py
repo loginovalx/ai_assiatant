@@ -37,7 +37,9 @@ from common.schemas import (
 )
 from common.timeutils import (
     WEEKDAYS_RU,
+    allows_default_duration,
     ensure_aware,
+    mentions_duration,
     mentions_time,
     named_weekday,
     resolve_weekday_mismatch,
@@ -241,7 +243,16 @@ async def create_event(
     # Длительность встречи решает, с чем она пересечётся, поэтому не подставляем час молча:
     # пусть агент спросит. «Не знаю» — тоже ответ: тогда агент сам передаст 60 и скажет об этом.
     # Проверка только здесь, а не в EventCreate: HTTP API и старые записи живут без длительности.
-    if data.type == EventType.MEETING and data.duration_minutes is None:
+    unsupported_duration = (
+        user_text is not None
+        and not mentions_duration(
+            user_text, data.start_at.astimezone(get_settings().tz) if data.start_at else None
+        )
+        and not (
+            allows_default_duration(user_text) and data.duration_minutes == DEFAULT_MEETING_MINUTES
+        )
+    )
+    if data.type == EventType.MEETING and (data.duration_minutes is None or unsupported_duration):
         raise ToolError(
             "Не указана длительность встречи. Запись не создана: спроси пользователя, "
             "сколько продлится встреча. Если он не знает — вызови тул снова с "

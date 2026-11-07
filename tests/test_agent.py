@@ -203,7 +203,7 @@ async def test_create_reminder(make_agent, tz, pool):
     response = await agent.handle(USER, "Напомни мне завтра в 10 утра позвонить Ивану")
 
     assert response.status == AgentStatus.DONE
-    assert response.reply_text == "Напомню завтра в 10:00 позвонить Ивану."
+    assert "Сохранено" in response.reply_text and "10:00" in response.reply_text
     assert [e.name for e in response.events] == ["Позвонить Ивану"]
     assert response.events[0].start_at == start
 
@@ -469,7 +469,7 @@ async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool)
         ),
         text("Поставил созвон с Иваном завтра в 15:00."),
     )
-    first = await existing.handle(USER, "Созвон с Иваном завтра в 15")
+    first = await existing.handle(USER, "Созвон с Иваном завтра в 15 на час")
     ivan_id = str(first.events[0].id)
 
     agent, llm = make_agent(

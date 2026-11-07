@@ -15,6 +15,7 @@ class HistoryMessage(TypedDict):
     role: Literal["user", "assistant"]
     content: str
     clarification_text: NotRequired[str]
+    conflict_warning: NotRequired[bool]
 
 
 class ConversationMemory:

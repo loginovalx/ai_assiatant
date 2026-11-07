@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 
 import httpx
+import pytest
 
 from agent.main import app, get_agent
 from agent.service import AgentService
@@ -12,14 +13,15 @@ from tests.scripted_llm import tool_call
 from tests.test_agent_bot_flow import LocalMax
 
 
+@pytest.mark.parametrize("correction", ["text", "preset"])
 async def test_another_time_button_edits_owners_conflicting_draft_then_confirms(
-    make_agent, pool, repo, redis, tz, monkeypatch
+    make_agent, pool, repo, redis, tz, monkeypatch, correction
 ):
     owner, other = "777", "888"
     initial_time = (datetime.now(tz) + timedelta(days=1)).replace(
         hour=10, minute=0, second=0, microsecond=0
     )
-    changed_time = (initial_time + timedelta(days=1)).replace(hour=12)
+    changed_time = (initial_time + timedelta(days=correction == "text")).replace(hour=12)
     busy = await repo.create(
         EventCreate(
             user_id=owner,
@@ -96,7 +98,11 @@ async def test_another_time_button_edits_owners_conflicting_draft_then_confirms(
     assert "день" in max_api.sent[-1]["text"] and "время" in max_api.sent[-1]["text"]
     assert await pool.fetchval("SELECT count(*) FROM events") == 2
 
-    await message("Послезавтра в 12:00", "edit-time")
+    if correction == "text":
+        await message("Послезавтра в 12:00", "edit-time")
+    else:
+        preset = next(b for row in max_api.sent[-1]["buttons"] for b in row if b["text"] == "12:00")
+        await click(preset["payload"], "choose-noon")
     assert edit_sources == [None, str(first.id)]
     replacement = await bot.drafts.load(owner)
     assert replacement.id != first.id

@@ -13,6 +13,13 @@ from bot.asr import SpeechRecognitionError, SpeechRecognizer
 from bot.drafts import DraftStore
 from bot.max_api import MaxAPI, MaxAPIError
 from bot.state import StateStore
+from bot.time_choices import (
+    TimeChoiceStore,
+    asks_for_clock_time,
+    is_explicit_keep_confirmation,
+    parse_time_choice_payload,
+    time_choice_buttons,
+)
 from common.calendar_import import CalendarImportError, parse_calendar_csv
 from common.config import get_settings
 from common.repository import EventRepository
@@ -252,17 +259,33 @@ class BotHandler:
         self.redis = redis
         self.repo = repo
         self.drafts = DraftStore(redis)
+        self.time_choices = TimeChoiceStore(redis)
 
     async def _result(self, user_id, chat_id, result, to_user=True):
         buttons = None
+        choice_id = None
+        pending = None
         if result.status == "needs_confirmation" and result.draft:
-            await self.drafts.save(user_id, result.draft)
             buttons = confirmation_buttons(
                 result.draft.id, can_change_time=can_change_draft_time(result.draft)
             )
+        elif result.status == "need_clarification" and asks_for_clock_time(result.reply_text):
+            pending = await self.drafts.load(user_id)
+            choice_id = uuid4()
+            buttons = time_choice_buttons(choice_id)
         await self.max_api.send(
             chat_id, result.reply_text or "Агент не вернул ответ", to_user=to_user, buttons=buttons
         )
+        # Keep the previous draft/chooser usable if delivery fails. The user's state
+        # lock prevents callbacks from racing the state publication after send.
+        if result.status == "needs_confirmation" and result.draft:
+            await self.drafts.save(user_id, result.draft)
+        if choice_id is not None:
+            await self.time_choices.issue(
+                user_id, pending.id if pending is not None else None, choice_id=choice_id
+            )
+        else:
+            await self.time_choices.clear(user_id)
 
     async def _callback(self, update):
         callback = update.get("callback") or {}
@@ -303,44 +326,89 @@ class BotHandler:
             if payload.startswith("event:"):
                 await self._event_action(user_id, callback_id, payload)
                 return
-            draft = await self.drafts.load(user_id)
-            parts = payload.split(":")
-            if len(parts) != 3 or parts[0] != "draft" or not draft or parts[2] != str(draft.id):
-                await self.max_api.answer_callback(callback_id, "Черновик устарел")
-                return
-            action = parts[1]
-            if action == "cancel":
-                await self.drafts.drop(user_id)
-                await self.max_api.send(int(user), "Отменил действие.", to_user=True)
-                await self.max_api.answer_callback(callback_id, "Отменено")
-            elif action == "edit":
-                await self.max_api.send(int(user), "Что поправить?", to_user=True)
-                await self.max_api.answer_callback(callback_id)
-            elif action == "time":
-                if not can_change_draft_time(draft):
-                    await self.max_api.answer_callback(callback_id, "В этом действии нет времени")
+            elif payload.startswith("time-choice:"):
+                parsed_choice = parse_time_choice_payload(payload)
+                if parsed_choice is None:
+                    await self.max_api.answer_callback(callback_id, "Выбор времени устарел")
                     return
-                await self.max_api.send(
-                    int(user),
-                    "Какой день и время выбрать? Напиши, например, «завтра в 15:30». "
-                    "Остальные данные сохраню и покажу новый вариант для подтверждения.",
-                    to_user=True,
-                )
-                await self.max_api.answer_callback(callback_id)
-            elif action == "confirm":
-                result = await self.agent.confirm(user_id, draft)
-                succeeded = result.status == "done"
-                if succeeded:
-                    await self.drafts.drop(user_id)
-                await self._result(user_id, int(user), result)
-                await self.max_api.answer_callback(
-                    callback_id,
-                    "✅ Подтверждено"
-                    if succeeded
-                    else "Не получилось выполнить. Черновик сохранён",
-                )
+                draft = await self.drafts.load(user_id)
+                current_draft_id = draft.id if draft is not None else None
+                choice_id, selection = parsed_choice
+                if not await self.time_choices.matches(user_id, choice_id, current_draft_id):
+                    await self.max_api.answer_callback(callback_id, "Выбор времени устарел")
+                    return
+                if selection == "manual":
+                    await self.max_api.send(
+                        int(user),
+                        "Напиши или скажи голосом новое время. Остальные данные сохраню "
+                        "и покажу новый вариант для подтверждения.",
+                        to_user=True,
+                    )
+                    await self.time_choices.consume(user_id, choice_id, current_draft_id)
+                    await self.max_api.answer_callback(callback_id)
+                else:
+                    clock_time = {"0900": "09:00", "1200": "12:00", "1800": "18:00"}[selection]
+                    await self.max_api.answer_callback(callback_id, f"Выбрано {clock_time}")
+                    await self.handle_update(
+                        {
+                            "update_type": "message_created",
+                            "message": {
+                                "sender": {"user_id": user},
+                                "recipient": {"chat_type": "dialog"},
+                                "body": {
+                                    "mid": "callback:" + callback_id,
+                                    "text": f"В {clock_time}",
+                                },
+                            },
+                        },
+                        _state_request_id=request_id,
+                    )
+                    await self.time_choices.consume(user_id, choice_id, current_draft_id)
             else:
-                await self.max_api.answer_callback(callback_id, "Черновик устарел")
+                draft = await self.drafts.load(user_id)
+                parts = payload.split(":")
+                if len(parts) != 3 or parts[0] != "draft" or not draft or parts[2] != str(draft.id):
+                    await self.max_api.answer_callback(callback_id, "Черновик устарел")
+                    return
+                action = parts[1]
+                if action == "cancel":
+                    await self.drafts.drop(user_id)
+                    await self.time_choices.clear(user_id)
+                    await self.max_api.send(int(user), "Отменил действие.", to_user=True)
+                    await self.max_api.answer_callback(callback_id, "Отменено")
+                elif action == "edit":
+                    await self.max_api.send(int(user), "Что поправить?", to_user=True)
+                    await self.max_api.answer_callback(callback_id)
+                elif action == "time":
+                    if not can_change_draft_time(draft):
+                        await self.max_api.answer_callback(
+                            callback_id, "В этом действии нет времени"
+                        )
+                        return
+                    choice_id = await self.time_choices.issue(user_id, draft.id)
+                    await self.max_api.send(
+                        int(user),
+                        "Какой день и время выбрать? Нажми на один из вариантов ниже или "
+                        "выбери «Другое время», чтобы написать или сказать его голосом. "
+                        "Остальные данные сохраню и покажу новый вариант для подтверждения.",
+                        to_user=True,
+                        buttons=time_choice_buttons(choice_id),
+                    )
+                    await self.max_api.answer_callback(callback_id)
+                elif action == "confirm":
+                    result = await self.agent.confirm(user_id, draft)
+                    succeeded = result.status == "done"
+                    if succeeded:
+                        await self.drafts.drop(user_id)
+                    await self._result(user_id, int(user), result)
+                    await self.max_api.answer_callback(
+                        callback_id,
+                        "✅ Подтверждено"
+                        if succeeded
+                        else "Не получилось выполнить. Черновик сохранён",
+                    )
+                else:
+                    await self.max_api.answer_callback(callback_id, "Черновик устарел")
         finally:
             await self.state.release(user_id, request_id)
 
@@ -404,7 +472,9 @@ class BotHandler:
         parts.append("Теперь спрашивай: «что у меня завтра?»")
         await reply(" ".join(parts))
 
-    async def handle_update(self, update: dict[str, Any]) -> None:
+    async def handle_update(
+        self, update: dict[str, Any], *, _state_request_id: str | None = None
+    ) -> None:
         """Handle an update and persist message dedupe only after successful work.
 
         Redis distinguishes a leased in-progress delivery from a completed one.
@@ -415,7 +485,10 @@ class BotHandler:
         message = update.get("message") or {}
         mid = (message.get("body") or {}).get("mid")
         if update.get("update_type") != "message_created" or mid is None:
-            await self._handle_update(update)
+            if _state_request_id is None:
+                await self._handle_update(update)
+            else:
+                await self._handle_update(update, _state_request_id=_state_request_id)
             return
 
         mid = str(mid)
@@ -431,12 +504,17 @@ class BotHandler:
             # Close the race where another worker completed after the first read.
             if await self.redis.get(done_key):
                 return
-            await self._handle_update(update)
+            if _state_request_id is None:
+                await self._handle_update(update)
+            else:
+                await self._handle_update(update, _state_request_id=_state_request_id)
             await self.redis.set(done_key, "1", ex=86400)
         finally:
             await self.redis.eval(_RELEASE_UPDATE, 1, pending_key, claim)
 
-    async def _handle_update(self, update: dict[str, Any]) -> None:
+    async def _handle_update(
+        self, update: dict[str, Any], *, _state_request_id: str | None = None
+    ) -> None:
         kind = update.get("update_type")
         if kind == "message_callback":
             await self._callback(update)
@@ -475,6 +553,8 @@ class BotHandler:
         to_user = chat_id is None
         chat_id = int(user_id if to_user else chat_id)
         user_id = str(user_id)
+        if _state_request_id is None:
+            await self.time_choices.clear(user_id)
 
         async def reply(message_text: str) -> None:
             await self.max_api.send(chat_id, message_text, to_user=to_user)
@@ -546,7 +626,10 @@ class BotHandler:
             await reply("Пришли текст или голосовое сообщение. Для MP3 выбери отправку файла.")
             return
 
-        request_id = await self.state.acquire(user_id, "recognizing" if is_voice else "thinking")
+        owns_state_lock = _state_request_id is None
+        request_id = _state_request_id or await self.state.acquire(
+            user_id, "recognizing" if is_voice else "thinking"
+        )
         if request_id is None:
             await reply(_BUSY)
             return
@@ -569,7 +652,14 @@ class BotHandler:
                 await reply("⏳ Думаю над запросом…")
 
             pending = await self.drafts.load(user_id)
-            if pending and text.casefold().strip(" .!") in {"да", "подтвердить", "подтверждаю"}:
+            keep_phrase = pending is not None and is_explicit_keep_confirmation(text)
+            if keep_phrase and not can_change_draft_time(pending):
+                await self.drafts.drop(user_id)
+                await reply("Оставил календарь без изменений.")
+                return
+            if pending and (
+                text.casefold().strip(" .!") in {"да", "подтвердить", "подтверждаю"} or keep_phrase
+            ):
                 result = await self.agent.confirm(user_id, pending)
                 if result.status == "done":
                     await self.drafts.drop(user_id)
@@ -595,4 +685,5 @@ class BotHandler:
             logger.exception("Agent request failed for user %s", user_id)
             await reply("Агент временно недоступен. Попробуй ещё раз позже.")
         finally:
-            await self.state.release(user_id, request_id)
+            if owns_state_lock:
+                await self.state.release(user_id, request_id)

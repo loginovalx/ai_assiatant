@@ -57,6 +57,17 @@ class Agent:
         try:
             history = await self._memory.load(user_id)
             source_text = _user_source(history, text)
+            if _keeps_conflicting_time(history, text):
+                response = AgentResponse(
+                    reply_text="Хорошо, оставляю события на выбранное время.",
+                    status=AgentStatus.DONE,
+                )
+                await self._memory.append(
+                    user_id,
+                    HistoryMessage(role="user", content=text),
+                    HistoryMessage(role="assistant", content=response.reply_text),
+                )
+                return response
             if trusted_edit_source:
                 source_text = (trusted_edit_source + "\n" + text)[-6000:]
             messages: list[dict[str, Any]] = [
@@ -93,6 +104,7 @@ class Agent:
                     clarification_text=(
                         source_text if response.status == AgentStatus.NEED_CLARIFICATION else ""
                     ),
+                    conflict_warning=response._conflict_warning,
                 )
                 await self._memory.append(
                     user_id,
@@ -133,7 +145,8 @@ class Agent:
                 result = await self._toolbox.call(user_id, draft.tool, draft.arguments)
             if not result.ok:
                 return AgentResponse(
-                    reply_text=f"Не получилось выполнить: {result.payload}",
+                    reply_text="Не получилось выполнить: "
+                    + _public_tool_error(str(result.payload)),
                     status=AgentStatus.ERROR,
                 )
             events = [Event.model_validate(raw) for raw in result.events]
@@ -154,9 +167,15 @@ class Agent:
                 events=summary.events,
                 status=AgentStatus.DONE,
             )
+            response._conflict_warning = bool(conflict_warnings)
             try:
                 await self._memory.append(
-                    user_id, HistoryMessage(role="assistant", content=_with_event_refs(response))
+                    user_id,
+                    HistoryMessage(
+                        role="assistant",
+                        content=_with_event_refs(response),
+                        conflict_warning=response._conflict_warning,
+                    ),
                 )
             except Exception:
                 # The write is committed; a Redis history failure must not tell the
@@ -218,16 +237,20 @@ class Agent:
                     )
                 if read_tools and not errors and draft is None:
                     return _read_response(events, read_tools)
+                if errors:
+                    return _incomplete_response(events, confirmed, conflict_warnings, errors)
                 raise
 
             if not message.tool_calls:
                 if errors:
                     return _incomplete_response(events, confirmed, conflict_warnings, errors)
-                reply = (message.content or "").strip()
+                reply = _safe_model_reply((message.content or "").strip())
                 if draft:
                     return _draft_response(draft)
                 if read_tools and not confirmed and draft is None:
                     return _read_response(events, read_tools)
+                if confirmed:
+                    return _confirmed_response(confirmed, conflict_warnings)
                 if not reply:
                     return (
                         _confirmed_response(confirmed, conflict_warnings)
@@ -264,7 +287,7 @@ class Agent:
                 logger.info("tool call %s", name)
 
                 if name == "ask_user":
-                    question = (
+                    question = _safe_model_reply(
                         str((args or {}).get("question") or "").strip() or "Уточните, пожалуйста."
                     )
                     return AgentResponse(
@@ -521,12 +544,59 @@ def _incomplete_response(events, confirmed, conflicts, errors) -> AgentResponse:
     saved = _confirmed_response(confirmed, conflicts).reply_text if confirmed else ""
     return AgentResponse(
         reply_text=(saved + "\n" if saved else "")
-        + "Не удалось выполнить действие: "
-        + "; ".join(error[2] for error in errors.values())
-        + ". Уточните запрос.",
+        + " ".join(dict.fromkeys(_public_tool_error(error[2]) for error in errors.values())),
         status=AgentStatus.NEED_CLARIFICATION,
         events=list(events.values()),
     )
+
+
+def _public_tool_error(message: str) -> str:
+    if "длительност" in message.casefold() or "duration_minutes" in message:
+        return "Сколько продлится встреча?"
+    if "нет времени, только день" in message:
+        return "Во сколько запланировать событие?"
+    if re.search(
+        r"create_event|update_event|delete_event|user_text|ToolError|Traceback|"
+        r"вызови\s+тул|системн\w*\s+промпт",
+        message,
+        re.I,
+    ):
+        return "Не удалось выполнить действие. Уточните, что нужно сделать с календарём."
+    return message
+
+
+def _safe_model_reply(message: str) -> str:
+    if re.search(
+        r"create_event|update_event|delete_event|duration_minutes|user_text|"
+        r"ты\s*[—-]\s*голосовой\s+ассистент|системный\s+промпт\s*[:=]",
+        message,
+        re.I,
+    ):
+        return (
+            _public_tool_error(message)
+            if "duration_minutes" in message
+            else ("Я помогаю с задачами, встречами и напоминаниями. Что запланировать или найти?")
+        )
+    return message
+
+
+def _keeps_conflicting_time(history: list[HistoryMessage], text: str) -> bool:
+    if not history or history[-1]["role"] != "assistant":
+        return False
+    normalized = re.sub(r"[^\w\s]", "", text.casefold()).strip()
+    return history[-1].get("conflict_warning") is True and normalized in {
+        "нет",
+        "нет спасибо",
+        "не надо",
+        "оставь как есть",
+        "оставь так",
+        "ничего не меняй",
+        "не переноси",
+        "всё равно на пересечение",
+        "все равно на пересечение",
+        "время подходит",
+        "нет время подходит",
+    }
 
 
 def _with_event_refs(response: AgentResponse) -> str:
@@ -559,11 +629,13 @@ def _confirmed_response(
         lines.append(f"{action}: {event.name}, {when}.")
     for event in (conflicts or {}).values():
         lines.append(f"Учтите: пересечение с «{event.name}», {_when(event)}.")
-    return AgentResponse(
+    response = AgentResponse(
         reply_text="\n".join(lines),
         status=AgentStatus.DONE,
         events=list({**events, **(conflicts or {})}.values()),
     )
+    response._conflict_warning = bool(conflicts)
+    return response
 
 
 def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentResponse:

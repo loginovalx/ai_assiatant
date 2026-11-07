@@ -22,6 +22,40 @@ def ensure_aware(dt: datetime, tz: ZoneInfo) -> datetime:
     return dt.replace(tzinfo=tz) if dt.tzinfo is None else dt
 
 
+def mentions_duration(text: str, start_at: datetime | None = None) -> bool:
+    """Recognize length without interpreting 'в три часа' as duration."""
+    amount = (
+        r"(?:\d+(?:[,.]\d+)?|один|одну|два|две|три|четыре|пять|шесть|семь|восемь|"
+        r"девять|десять|одиннадцать|двенадцать|пятнадцать|двадцать|тридцать|сорок|"
+        r"пятьдесят|шестьдесят|полтора|полторы)"
+    )
+    length = rf"(?:{amount}\s+(?:час\w*|мин\w*)|час(?:а)?|полчаса|четверть\s+часа)"
+    if re.search(
+        rf"\b(?:на|длится|продлится|длительность|продолжительность)\s+(?:около\s+)?{length}\b|"
+        rf"(?:^|\n)\s*{length}\s*[.!]?\s*(?:$|\n)",
+        text,
+        re.I,
+    ):
+        return True
+    # A range for a different existing meeting is not evidence for this meeting's length.
+    return any(
+        start_at is None or (int(match[1]), int(match[2] or 0)) == (start_at.hour, start_at.minute)
+        for match in re.finditer(
+            r"\bс\s+(\d{1,2})(?::(\d{2}))?\s+до\s+\d{1,2}(?::\d{2})?\b", text, re.I
+        )
+    )
+
+
+def allows_default_duration(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?:^|\n)\s*(?:не\s+знаю|не\s*важно|как\s+обычно|сам\s+реши)\s*[.!]?\s*(?:$|\n)",
+            text,
+            re.I,
+        )
+    )
+
+
 def mentions_time(text: str) -> bool:
     # Проверяем слова-времени, включая прописные формы: «без четверти три»,
     # «половине шестого», «шестнадцать сорок пять», «восемь утра» — иначе гейт
@@ -29,6 +63,7 @@ def mentions_time(text: str) -> bool:
     return bool(
         re.search(
             r"\b\d{1,2}[:.]\d{2}\b|\bв\s+\d{1,2}\b|"
+            r"\bс\s+\d{1,2}(?::\d{2})?\s+до\s+\d{1,2}(?::\d{2})?\b|"
             r"\bчерез\s+(?:полчаса|полминуты|четверть\s+часа)\b|"
             r"\bчерез\s+(?:(?:\d+|два|две|три|четыре|пять|полтора|полчаса)\s+)?(?:час|минут)|"
             r"\b(?:полдень|полночь)\b|"

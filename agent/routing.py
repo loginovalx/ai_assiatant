@@ -79,7 +79,7 @@ def select_model(
     if re.match(r"^(?:создай|добавь|запиши|поставь)(?:\s+мне)?\s+задачу\s+\S", value):
         if not re.search(r"\d|\b(?:сегодня|завтра|послезавтра|недел\w*|месяц\w*|в\s+\w+)\b", value):
             return ModelRoute(simple_model, "simple_undated_task", "create_event")
-    if re.match(r"^(?:(?:создай|добавь|поставь|запланируй)\s+)?(?:встреч[ау]|созвон)\s+", value):
+    if re.match(rf"^(?:(?:создай|добавь|поставь|запланируй)\s+)?(?:на\s+)?(?:{_DAY}\s+)?(?:встреч[ау]|созвон)\s+", value):
         if len(re.findall(rf"\b{_DAY}\b", value)) == len(
             re.findall(_CLOCK, value)
         ) == 1 and mentions_duration(value):

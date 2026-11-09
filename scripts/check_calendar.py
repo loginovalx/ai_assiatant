@@ -136,7 +136,14 @@ async def run(args) -> dict:
             case = replace(original, user_id=owner)
             await memory.reset(owner)
             toolbox = TracedToolbox(mcp)
-            agent = Agent(llm, settings.llm_model, toolbox, memory, settings.tz)
+            agent = Agent(
+                llm,
+                settings.llm_model,
+                toolbox,
+                memory,
+                settings.tz,
+                simple_model=settings.llm_simple_model if settings.llm_routing_enabled else None,
+            )
             result = {"id": case.id, "query": case.text, "expected": case.expected}
             try:
                 with patch("mcp_server.server.datetime", wraps=datetime) as clock:

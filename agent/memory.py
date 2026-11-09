@@ -16,6 +16,8 @@ class HistoryMessage(TypedDict):
     content: str
     clarification_text: NotRequired[str]
     conflict_warning: NotRequired[bool]
+    pending_model: NotRequired[str]
+    pending_tool: NotRequired[str]
 
 
 class ConversationMemory:

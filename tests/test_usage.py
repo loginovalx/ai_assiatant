@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from common.usage import record_usage, summarize_usage
 
 
@@ -81,3 +83,51 @@ def test_usage_file_failure_does_not_break_successful_call(tmp_path, monkeypatch
         {"usage": {"total_tokens": 10}}, operation="agent", source="gpt2giga_openai"
     )
     assert record["billable_tokens"] == 10
+
+
+def test_mixed_models_are_priced_with_their_own_rates():
+    records = [
+        {"operation": "agent", "model": "GigaChat-2-Max", "billable_tokens": 1000},
+        {"operation": "agent", "model": "GigaChat-2-Pro:version", "billable_tokens": 1000},
+        {"operation": "search_relevance", "model": "GigaChat-2-Pro", "billable_tokens": 500},
+        {"operation": "embeddings", "model": "Embeddings", "billable_tokens": 1000},
+    ]
+    report = summarize_usage(
+        records, chat_rates={"GigaChat-2-Max": 650, "GigaChat-2-Pro": 500}, embedding_rate=14
+    )
+    assert report["measured_cost_rub"] == 1.414
+    assert report["complete"] and report["billable_tokens"] == 3500
+    assert {row["rub_per_million"] for row in report["by_operation"]} == {650, 500, 14}
+
+
+def test_missing_model_tariff_never_silently_uses_another_models_price():
+    records = [{"operation": "agent", "model": "GigaChat-2-Pro", "billable_tokens": 1000}]
+    with pytest.raises(ValueError, match="Missing chat tariff"):
+        summarize_usage(records, chat_rates={"GigaChat-2-Max": 650}, embedding_rate=14)
+
+
+def test_flat_rate_still_rejects_a_mixed_model_log():
+    records = [
+        {"operation": "agent", "model": name, "billable_tokens": 1000}
+        for name in ("GigaChat-2-Max", "GigaChat-2-Pro")
+    ]
+    with pytest.raises(ValueError, match="single tariff"):
+        summarize_usage(records, chat_rate=650, embedding_rate=14)
+
+
+@pytest.mark.parametrize("rate", [-1, float("nan"), float("inf")])
+def test_invalid_per_model_prices_are_rejected(rate):
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        summarize_usage([], chat_rates={"GigaChat-2-Pro": rate}, embedding_rate=14)
+
+
+def test_mixed_model_unknown_usage_stays_incomplete():
+    records = [
+        {"operation": "agent", "model": "GigaChat-2-Max", "billable_tokens": None},
+        {"operation": "agent", "model": "GigaChat-2-Pro", "billable_tokens": 1000},
+    ]
+    report = summarize_usage(
+        records, chat_rates={"GigaChat-2-Max": 650, "GigaChat-2-Pro": 500}, embedding_rate=14
+    )
+    assert not report["complete"] and report["unmeasured_calls"] == 1
+    assert report["measured_cost_rub"] == 0.5

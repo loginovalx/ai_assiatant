@@ -92,7 +92,14 @@ async def evaluate_case(case: EvalCase, seeds, pool, redis, llm, settings, mcp) 
     repo = EventRepository(pool, embedder, settings.tz)
     logical_ids = {}
     toolbox = TracedToolbox(mcp)
-    agent = Agent(llm, settings.llm_model, toolbox, memory, settings.tz)
+    agent = Agent(
+        llm,
+        settings.llm_model,
+        toolbox,
+        memory,
+        settings.tz,
+        simple_model=settings.llm_simple_model if settings.llm_routing_enabled else None,
+    )
     try:
         for row in seeds:
             data = {k: v for k, v in row.items() if k not in {"id", "status"}}

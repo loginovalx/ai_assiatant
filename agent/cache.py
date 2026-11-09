@@ -6,11 +6,11 @@ import hmac
 from common.config import get_settings
 
 
-def prompt_cache_session_id(user_id: str) -> str:
+def prompt_cache_session_id(user_id: str, *, model: str | None = None) -> str:
     # gpt2giga forwards X-Session-ID to GigaChat. This is only a cache hint,
     # never an authorization credential or a substitute for conversation history.
     return hmac.new(
         get_settings().llm_api_key.encode(),
-        f"voice-assistant:prompt-cache:v1:{user_id}".encode(),
+        f"voice-assistant:prompt-cache:v1:{user_id}{':' + model if model else ''}".encode(),
         hashlib.sha256,
     ).hexdigest()

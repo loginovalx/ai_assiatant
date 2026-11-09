@@ -73,14 +73,23 @@ def record_usage(
 
 
 def summarize_usage(
-    records: list[dict[str, Any]], *, chat_rate: float, embedding_rate: float
+    records: list[dict[str, Any]],
+    *,
+    chat_rate: float | None = None,
+    embedding_rate: float,
+    chat_rates: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Rates in RUB per million tokens, supplied explicitly for the active contract.
 
-    Mixed chat models are rejected: the caller must split logs or provide the
-    matching single-model tariff instead of pricing all models as Max.
+    A flat tariff remains supported for single-model logs. Mixed-model logs
+    require an explicit rate for every model; unknown tariffs are never guessed.
     """
-    if any(not Decimal(str(rate)).is_finite() or rate < 0 for rate in (chat_rate, embedding_rate)):
+    if chat_rates is not None and chat_rate is not None:
+        raise ValueError("Choose either chat_rate or per-model chat_rates")
+    rates = [embedding_rate, *(chat_rates or {}).values()]
+    if chat_rate is not None:
+        rates.append(chat_rate)
+    if any(not Decimal(str(rate)).is_finite() or rate < 0 for rate in rates):
         raise ValueError("Rates must be finite and nonnegative")
     groups: dict[tuple[str, str], dict[str, Any]] = defaultdict(
         lambda: {"calls": 0, "billable_tokens": 0, "unmeasured_calls": 0}
@@ -97,15 +106,34 @@ def summarize_usage(
             group["unmeasured_calls"] += 1
         else:
             group["billable_tokens"] += tokens
-    if len(chat_models) > 1:
+    if len(chat_models) > 1 and chat_rates is None:
         raise ValueError("Split usage by chat model before applying a single tariff")
     rows, cost = [], Decimal(0)
     for (operation, model), group in sorted(groups.items()):
-        rate = embedding_rate if operation == "embeddings" else chat_rate
+        if operation == "embeddings":
+            rate = embedding_rate
+        elif chat_rates is not None:
+            base_model = model.split(":", 1)[0]
+            if model in chat_rates:
+                rate = chat_rates[model]
+            elif base_model in chat_rates:
+                rate = chat_rates[base_model]
+            else:
+                raise ValueError(f"Missing chat tariff for model {model}")
+        elif chat_rate is not None:
+            rate = chat_rate
+        else:
+            raise ValueError(f"Missing chat tariff for model {model}")
         value = Decimal(group["billable_tokens"]) * Decimal(str(rate)) / 1_000_000
         cost += value
         rows.append(
-            {"operation": operation, "model": model, **group, "measured_cost_rub": float(value)}
+            {
+                "operation": operation,
+                "model": model,
+                **group,
+                "rub_per_million": rate,
+                "measured_cost_rub": float(value),
+            }
         )
     missing = sum(row["unmeasured_calls"] for row in rows)
     return {

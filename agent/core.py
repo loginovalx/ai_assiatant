@@ -19,6 +19,7 @@ from agent.dialogue import direct_reply, starts_new_request
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.policy import asks_to_read, explicitly_requests_change, is_single_action_request
 from agent.prompt import build_system_prompt
+from agent.routing import ModelRoute, completion_problem, select_model
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
 from common.display import format_calendar_time
 from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
@@ -39,9 +40,12 @@ class Agent:
         memory: ConversationMemory,
         tz: ZoneInfo,
         max_steps: int = 6,
+        *,
+        simple_model: str | None = None,
     ) -> None:
         self._llm = llm
         self._model = model
+        self._simple_model = simple_model
         self._toolbox = toolbox
         self._memory = memory
         self._tz = tz
@@ -92,6 +96,14 @@ class Agent:
                 return response
             if trusted_edit_source:
                 source_text = (trusted_edit_source + "\n" + text)[-6000:]
+            route = select_model(
+                text,
+                history,
+                primary_model=self._model,
+                simple_model=self._simple_model,
+                editing_draft=trusted_edit_source is not None,
+            )
+            logger.info("model_route model=%s reason=%s", route.model, route.reason)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": build_system_prompt(now)},
                 *({"role": item["role"], "content": item["content"]} for item in history),
@@ -112,6 +124,7 @@ class Agent:
                 read_period=_read_period(text, now),
                 source_text=source_text,
                 deletion_period=_deletion_period(source_text, now),
+                route=route,
             )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
             logger.exception("LLM или MCP недоступны")
@@ -129,6 +142,13 @@ class Agent:
                     ),
                     conflict_warning=response._conflict_warning,
                 )
+                if response.status in {
+                    AgentStatus.NEED_CLARIFICATION,
+                    AgentStatus.NEEDS_CONFIRMATION,
+                }:
+                    assistant["pending_model"] = route.model
+                    if route.expected_tool:
+                        assistant["pending_tool"] = route.expected_tool
                 await self._memory.append(
                     user_id,
                     HistoryMessage(role="user", content=text),
@@ -212,6 +232,52 @@ class Agent:
                 status=AgentStatus.ERROR,
             )
 
+    async def _generate(
+        self,
+        user_id: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        route: ModelRoute,
+        *,
+        allow_fallback: bool,
+    ) -> Any:
+        # Only one upgrade is possible: after switching to the primary model,
+        # subsequent rounds stay there. No fallback may follow a write attempt.
+        while True:
+            usage_recorded = False
+            try:
+                completion = await self._llm.chat.completions.create(
+                    model=route.model,
+                    messages=messages,
+                    tools=tools,
+                    temperature=0.1,
+                    extra_headers={
+                        "X-Session-ID": prompt_cache_session_id(user_id, model=route.model)
+                    },
+                )
+                record_usage(
+                    completion, operation="agent", source="gpt2giga_openai", model=route.model
+                )
+                usage_recorded = True
+                message = completion.choices[0].message
+                problem = (
+                    completion_problem(message, tools, route.expected_tool)
+                    if allow_fallback and route.model != self._model
+                    else None
+                )
+            except Exception:
+                if not usage_recorded:
+                    record_usage(
+                        None, operation="agent", source="gpt2giga_openai", model=route.model
+                    )
+                if not allow_fallback or route.model == self._model:
+                    raise
+                problem = "generation_failed"
+            if not problem:
+                return message
+            route.model, route.reason = self._model, "fallback_" + problem
+            logger.info("model_route model=%s reason=%s", route.model, route.reason)
+
     async def _run(
         self,
         user_id: str,
@@ -222,6 +288,7 @@ class Agent:
         read_period: tuple[datetime, datetime] | None = None,
         source_text: str | None = None,
         deletion_period: tuple[datetime, datetime] | None = None,
+        route: ModelRoute | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
         events: dict[str, Event] = {}
@@ -234,28 +301,19 @@ class Agent:
         confirmed_tool = ""
         draft: DraftAction | None = None
         draft_fingerprint: str | None = None
-        cache_headers = {"X-Session-ID": prompt_cache_session_id(user_id)}
+        route = route or ModelRoute(self._model, "routing_disabled")
+        mutation_attempted = False
 
         for round_number in range(self._max_steps):
-            usage_recorded = False
             try:
-                completion = await self._llm.chat.completions.create(
-                    model=self._model,
-                    messages=messages,
-                    tools=tools,
-                    temperature=0.1,
-                    extra_headers=cache_headers,
+                message = await self._generate(
+                    user_id,
+                    messages,
+                    tools,
+                    route,
+                    allow_fallback=not mutation_attempted and not confirmed and draft is None,
                 )
-                record_usage(
-                    completion, operation="agent", source="gpt2giga_openai", model=self._model
-                )
-                usage_recorded = True
-                message = completion.choices[0].message
             except Exception:
-                if not usage_recorded:
-                    record_usage(
-                        None, operation="agent", source="gpt2giga_openai", model=self._model
-                    )
                 if draft is not None and not errors:
                     return _draft_response(draft)
                 if confirmed:
@@ -385,6 +443,7 @@ class Agent:
                                 user_id, name, args, dry_run=True, **evidence
                             )
                         elif name == "create_event" and request_id is not None:
+                            mutation_attempted = True
                             result = await self._toolbox.call(
                                 user_id,
                                 name,
@@ -393,6 +452,8 @@ class Agent:
                                 **evidence,
                             )
                         else:
+                            if name in MUTATING_TOOLS:
+                                mutation_attempted = True
                             result = await self._toolbox.call(user_id, name, args, **evidence)
                     except Exception:
                         if not confirmed:

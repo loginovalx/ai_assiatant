@@ -45,6 +45,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         tz=settings.tz,
         max_steps=settings.agent_max_steps,
+        simple_model=settings.llm_simple_model if settings.llm_routing_enabled else None,
     )
     app.state.agent = AgentService(
         agent,

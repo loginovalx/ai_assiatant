@@ -39,7 +39,7 @@ class NullEmbedder:
 class GigaChatEmbedder:
     def __init__(self, settings: Settings) -> None:
         self._model = settings.gigachat_embeddings_model
-        self._chat_model = settings.llm_model
+        self._chat_model = settings.llm_search_model or settings.llm_model
         self._client = GigaChat(
             credentials=settings.gigachat_credentials,
             scope=settings.gigachat_scope,

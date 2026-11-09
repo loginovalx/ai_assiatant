@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:8090/v1"
     llm_api_key: str = Field(default="change-me", repr=False)  # = GPT2GIGA_API_KEY
     llm_model: str = "GigaChat-2-Max"
+    llm_simple_model: str = "GigaChat-2-Pro"
+    llm_routing_enabled: bool = True
+    # None keeps the search judge on the primary model until separately evaluated.
+    llm_search_model: str | None = None
     usage_log_path: str | None = None
     llm_timeout_seconds: float = 60
     mcp_url: str = "http://localhost:8001/mcp"

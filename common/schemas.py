@@ -194,7 +194,6 @@ class AgentResponse(BaseModel):
     draft: DraftAction | None = None
     # Machine-owned history metadata; excluded from the HTTP contract and model context.
     _conflict_warning: bool = PrivateAttr(default=False)
-    _focused_event_id: str | None = PrivateAttr(default=None)
 
 
 class AgentConfirmRequest(BaseModel):

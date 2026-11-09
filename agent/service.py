@@ -31,14 +31,6 @@ class InvalidDraft(Exception):
     pass
 
 
-def _replayed_response(envelope: dict) -> AgentResponse:
-    response = AgentResponse.model_validate(envelope["response"])
-    metadata = envelope.get("response_metadata") or {}
-    response._focused_event_id = metadata.get("focused_event_id")
-    response._conflict_warning = metadata.get("conflict_warning") is True
-    return response
-
-
 class AgentService:
     def __init__(
         self, agent: Agent, redis: Redis, ttl_seconds: int = 7 * 86400, timeout_seconds: float = 65
@@ -94,7 +86,7 @@ class AgentService:
             if previous and previous["fingerprint"] != fingerprint:
                 raise RequestConflict
             if previous and previous.get("response"):
-                return _replayed_response(previous)
+                return AgentResponse.model_validate(previous["response"])
             async with self._locked(user_id, wait=previous is not None):
                 envelope = {"fingerprint": fingerprint, "response": None}
                 if key:
@@ -104,7 +96,7 @@ class AgentService:
                         if previous["fingerprint"] != fingerprint:
                             raise RequestConflict
                         if previous.get("response"):
-                            return _replayed_response(previous)
+                            return AgentResponse.model_validate(previous["response"])
                 if payload.get("operation") == "confirm":
                     issued = await self._redis.get(f"agent:pending:{user_id}")
                     supplied = json.dumps(payload["draft"], sort_keys=True, ensure_ascii=False)
@@ -126,10 +118,6 @@ class AgentService:
                 receipt_saved = False
                 if key and result.status != AgentStatus.ERROR:
                     envelope["response"] = result.model_dump(mode="json")
-                    envelope["response_metadata"] = {
-                        "focused_event_id": result._focused_event_id,
-                        "conflict_warning": result._conflict_warning,
-                    }
                     try:
                         await self._redis.set(
                             key, json.dumps(envelope, ensure_ascii=False), ex=self._ttl
@@ -205,7 +193,7 @@ class AgentService:
                 if issued is None or issued.id != edit_draft_id:
                     raise InvalidDraft
                 source = issued.arguments.get("user_text")
-                if issued.tool in {"create_event", "update_event"} and isinstance(source, str):
+                if issued.tool == "create_event" and isinstance(source, str):
                     kwargs["trusted_edit_source"] = source
             result = await self._agent.handle(
                 user_id, text, confirm_changes=review, request_id=request_id, **kwargs

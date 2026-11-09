@@ -1,4 +1,4 @@
-"""Provider-reported accounting without prompts, names, user identities or keys."""
+"""Provider-reported token accounting; never stores prompts, names, IDs or keys."""
 
 import json
 import logging
@@ -22,13 +22,7 @@ def _count(value: Any) -> int | None:
 
 
 def record_usage(
-    response: Any,
-    *,
-    operation: str,
-    source: str,
-    model: str = "unknown",
-    context_profile: str | None = None,
-    request_id: str | None = None,
+    response: Any, *, operation: str, source: str, model: str = "unknown"
 ) -> dict[str, Any]:
     """Native GigaChat total is billable; gpt2giga adds cached tokens back to it.
 
@@ -62,10 +56,6 @@ def record_usage(
         "reported_total_tokens": total,
         "billable_tokens": billable,
     }
-    if context_profile is not None:
-        record["context_profile"] = context_profile
-    if request_id is not None:
-        record["request_id"] = request_id
     line = json.dumps(record, ensure_ascii=False)
     logger.info("token_usage %s", line)
     path = os.getenv("USAGE_LOG_PATH") or get_settings().usage_log_path

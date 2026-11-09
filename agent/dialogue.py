@@ -2,9 +2,6 @@
 
 import re
 
-from agent.policy import asks_to_read, explicitly_requests_change
-from common.timeutils import RECURRENCE_UNSUPPORTED, mentions_recurrence
-
 
 def starts_new_request(text: str) -> bool:
     text = text.casefold().strip()
@@ -29,14 +26,6 @@ def direct_reply(text: str) -> tuple[str, bool] | None:
     value = text.casefold().strip(" .!?")
     if value in {"забей", "не надо", "отмена", "отмени", "забыли"}:
         return "Отменил текущую просьбу. Календарь не изменён.", True
-    if (
-        mentions_recurrence(text)
-        and not asks_to_read(text)
-        and not any(
-            explicitly_requests_change(text, tool) for tool in ("delete_event", "complete_event")
-        )
-    ):
-        return RECURRENCE_UNSUPPORTED, True
     if re.search(r"(?:миллион|миллиард|тысяч)\w*\s+лет", value):
         return "Укажите реальную дату и время напоминания.", False
     numeric_date = re.search(r"\bна\s+(\d{1,2})\s+(\d{1,2})\b", value)

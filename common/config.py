@@ -39,7 +39,6 @@ class Settings(BaseSettings):
     llm_model: str = "GigaChat-2-Max"
     llm_simple_model: str = "GigaChat-2-Pro"
     llm_routing_enabled: bool = True
-    agent_economy_enabled: bool = True
     # None keeps the search judge on the primary model until separately evaluated.
     llm_search_model: str | None = None
     usage_log_path: str | None = None

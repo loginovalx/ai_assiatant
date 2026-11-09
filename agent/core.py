@@ -13,16 +13,8 @@ from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletionMessage
 
 from agent.cache import prompt_cache_session_id
-from agent.compact import CompactRequest, clarification_question, plan_request
-from agent.details import (
-    is_event_details_question,
-    is_single_event_time_question,
-    read_event_details,
-    single_event_read_response,
-)
 from agent.dialogue import direct_reply, starts_new_request
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.policy import asks_to_read, explicitly_requests_change, is_single_action_request
@@ -31,7 +23,6 @@ from agent.routing import ModelRoute, completion_problem, select_model
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
 from common.display import format_calendar_time
 from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
-from common.timeutils import RECURRENCE_UNSUPPORTED, mentions_recurrence
 from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -51,7 +42,6 @@ class Agent:
         max_steps: int = 6,
         *,
         simple_model: str | None = None,
-        economy_enabled: bool = False,
     ) -> None:
         self._llm = llm
         self._model = model
@@ -60,7 +50,6 @@ class Agent:
         self._memory = memory
         self._tz = tz
         self._max_steps = max_steps
-        self._economy_enabled = economy_enabled
 
     async def handle(
         self,
@@ -102,25 +91,11 @@ class Agent:
                 await self._memory.append(
                     user_id,
                     HistoryMessage(role="user", content=text),
-                    HistoryMessage(
-                        role="assistant",
-                        content=response.reply_text,
-                        focused_event_id=history[-1].get("focused_event_id"),
-                    ),
+                    HistoryMessage(role="assistant", content=response.reply_text),
                 )
                 return response
             if trusted_edit_source:
                 source_text = (trusted_edit_source + "\n" + text)[-6000:]
-            if (
-                mentions_recurrence(source_text)
-                and not asks_to_read(source_text)
-                and not any(
-                    explicitly_requests_change(source_text, tool)
-                    for tool in ("delete_event", "complete_event")
-                )
-            ):
-                await self._memory.reset(user_id)
-                return AgentResponse(reply_text=RECURRENCE_UNSUPPORTED, status=AgentStatus.DONE)
             route = select_model(
                 text,
                 history,
@@ -128,6 +103,7 @@ class Agent:
                 simple_model=self._simple_model,
                 editing_draft=trusted_edit_source is not None,
             )
+            logger.info("model_route model=%s reason=%s", route.model, route.reason)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": build_system_prompt(now)},
                 *({"role": item["role"], "content": item["content"]} for item in history),
@@ -140,38 +116,16 @@ class Agent:
                     + "\nИсправление пользователя:\n"
                     + text
                 )
-            question = clarification_question(source_text) if self._economy_enabled else None
-            if is_event_details_question(text):
-                logger.info(
-                    "agent_context profile=event_details model_calls=0 request_id=%s", request_id
-                )
-                response = await read_event_details(self._toolbox, user_id, history, now, text)
-            elif question:
-                logger.info(
-                    "agent_context profile=clarification model_calls=0 request_id=%s", request_id
-                )
-                response = AgentResponse(reply_text=question, status=AgentStatus.NEED_CLARIFICATION)
-            else:
-                compact = (
-                    plan_request(text, now)
-                    if self._economy_enabled
-                    and not trusted_edit_source
-                    and (starts_new_request(text) or not history)
-                    else None
-                )
-                logger.info("model_route model=%s reason=%s", route.model, route.reason)
-                response = await self._run(
-                    user_id,
-                    messages,
-                    confirm_changes=confirm_changes,
-                    request_id=request_id,
-                    read_period=_read_period(text, now),
-                    source_text=source_text,
-                    deletion_period=_deletion_period(source_text, now),
-                    route=route,
-                    date_reference=now.isoformat(),
-                    compact=compact,
-                )
+            response = await self._run(
+                user_id,
+                messages,
+                confirm_changes=confirm_changes,
+                request_id=request_id,
+                read_period=_read_period(text, now),
+                source_text=source_text,
+                deletion_period=_deletion_period(source_text, now),
+                route=route,
+            )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
             logger.exception("LLM или MCP недоступны")
             return AgentResponse(reply_text=FALLBACK_ERROR, status=AgentStatus.ERROR)
@@ -187,7 +141,6 @@ class Agent:
                         source_text if response.status == AgentStatus.NEED_CLARIFICATION else ""
                     ),
                     conflict_warning=response._conflict_warning,
-                    focused_event_id=response._focused_event_id,
                 )
                 if response.status in {
                     AgentStatus.NEED_CLARIFICATION,
@@ -223,15 +176,6 @@ class Agent:
                     draft.arguments,
                     idempotency_key=str(draft.id),
                     user_text=draft.arguments.get("user_text"),
-                    date_reference=draft.arguments.get("date_reference"),
-                )
-            elif draft.tool == "update_event":
-                result = await self._toolbox.call(
-                    user_id,
-                    draft.tool,
-                    draft.arguments,
-                    user_text=draft.arguments.get("user_text"),
-                    date_reference=draft.arguments.get("date_reference"),
                 )
             elif draft.tool == "delete_events":
                 result = await self._toolbox.call(
@@ -267,7 +211,6 @@ class Agent:
                 status=AgentStatus.DONE,
             )
             response._conflict_warning = bool(conflict_warnings)
-            response._focused_event_id = summary._focused_event_id
             try:
                 await self._memory.append(
                     user_id,
@@ -275,7 +218,6 @@ class Agent:
                         role="assistant",
                         content=_with_event_refs(response),
                         conflict_warning=response._conflict_warning,
-                        focused_event_id=response._focused_event_id,
                     ),
                 )
             except Exception:
@@ -298,68 +240,41 @@ class Agent:
         route: ModelRoute,
         *,
         allow_fallback: bool,
-        compact: CompactRequest | None = None,
-        request_id: UUID | None = None,
     ) -> Any:
         # Only one upgrade is possible: after switching to the primary model,
         # subsequent rounds stay there. No fallback may follow a write attempt.
         while True:
             usage_recorded = False
-            short = compact is not None and compact.active
-            sent_messages = compact.messages if short else messages
-            sent_tools = compact.tools if short else tools
-            profile = "compact_create" if short else "full"
-            logger.info(
-                "agent_context profile=%s input_chars=%d schema_chars=%d request_id=%s",
-                profile,
-                len(json.dumps(sent_messages, ensure_ascii=False)),
-                len(json.dumps(sent_tools, ensure_ascii=False)),
-                request_id,
-            )
             try:
                 completion = await self._llm.chat.completions.create(
                     model=route.model,
-                    messages=sent_messages,
-                    tools=sent_tools,
+                    messages=messages,
+                    tools=tools,
                     temperature=0.1,
                     extra_headers={
                         "X-Session-ID": prompt_cache_session_id(user_id, model=route.model)
                     },
                 )
                 record_usage(
-                    completion,
-                    operation="agent",
-                    source="gpt2giga_openai",
-                    model=route.model,
-                    context_profile=profile,
-                    request_id=str(request_id) if request_id else None,
+                    completion, operation="agent", source="gpt2giga_openai", model=route.model
                 )
                 usage_recorded = True
                 message = completion.choices[0].message
                 problem = (
-                    completion_problem(
-                        message, sent_tools, "create_event" if short else route.expected_tool
-                    )
-                    if allow_fallback and (short or route.model != self._model)
+                    completion_problem(message, tools, route.expected_tool)
+                    if allow_fallback and route.model != self._model
                     else None
                 )
             except Exception:
                 if not usage_recorded:
                     record_usage(
-                        None,
-                        operation="agent",
-                        source="gpt2giga_openai",
-                        model=route.model,
-                        context_profile=profile,
-                        request_id=str(request_id) if request_id else None,
+                        None, operation="agent", source="gpt2giga_openai", model=route.model
                     )
-                if not allow_fallback or (route.model == self._model and not short):
+                if not allow_fallback or route.model == self._model:
                     raise
                 problem = "generation_failed"
             if not problem:
                 return message
-            if compact:
-                compact.active = False
             route.model, route.reason = self._model, "fallback_" + problem
             logger.info("model_route model=%s reason=%s", route.model, route.reason)
 
@@ -374,12 +289,8 @@ class Agent:
         source_text: str | None = None,
         deletion_period: tuple[datetime, datetime] | None = None,
         route: ModelRoute | None = None,
-        date_reference: str | None = None,
-        compact: CompactRequest | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
-        if compact is not None and not compact.direct:
-            compact.prepare(source_text or "", tools)
         events: dict[str, Event] = {}
         mutations: dict[str, ToolResult] = {}
         confirmed: dict[str, Event] = {}
@@ -395,39 +306,13 @@ class Agent:
 
         for round_number in range(self._max_steps):
             try:
-                if compact is not None and compact.direct and round_number == 0:
-                    logger.info(
-                        "agent_context profile=direct_%s model_calls=0 request_id=%s",
-                        compact.tool,
-                        request_id,
-                    )
-                    message = ChatCompletionMessage.model_validate(
-                        {
-                            "role": "assistant",
-                            "tool_calls": [
-                                {
-                                    "id": "server_plan",
-                                    "type": "function",
-                                    "function": {
-                                        "name": compact.tool,
-                                        "arguments": json.dumps(
-                                            compact.arguments, ensure_ascii=False
-                                        ),
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                else:
-                    message = await self._generate(
-                        user_id,
-                        messages,
-                        tools,
-                        route,
-                        allow_fallback=not mutation_attempted and not confirmed and draft is None,
-                        compact=compact,
-                        request_id=request_id,
-                    )
+                message = await self._generate(
+                    user_id,
+                    messages,
+                    tools,
+                    route,
+                    allow_fallback=not mutation_attempted and not confirmed and draft is None,
+                )
             except Exception:
                 if draft is not None and not errors:
                     return _draft_response(draft)
@@ -439,7 +324,7 @@ class Agent:
                         else _confirmed_response(confirmed, conflict_warnings)
                     )
                 if read_tools and not errors and draft is None:
-                    return _read_response(events, read_tools, source_text or "")
+                    return _read_response(events, read_tools)
                 if errors:
                     return _incomplete_response(events, confirmed, conflict_warnings, errors)
                 raise
@@ -451,7 +336,7 @@ class Agent:
                 if draft:
                     return _draft_response(draft)
                 if read_tools and not confirmed and draft is None:
-                    return _read_response(events, read_tools, source_text or "")
+                    return _read_response(events, read_tools)
                 if confirmed:
                     return _confirmed_response(confirmed, conflict_warnings)
                 if not reply:
@@ -476,19 +361,9 @@ class Agent:
                         status=AgentStatus.ERROR,
                     )
                 args = _parse_args(call.function.arguments)
-                if (
-                    compact is not None
-                    and compact.active
-                    and name == compact.tool
-                    and args is not None
-                ):
-                    args = {**args, **compact.arguments}
-                if compact is not None and name == "create_event" and args is not None:
-                    args = compact.preserve_name_prefix(args)
                 evidence = {}
-                if name in {"create_event", "update_event"} and source_text is not None:
+                if name == "create_event" and source_text is not None:
                     evidence["user_text"] = source_text
-                    evidence["date_reference"] = date_reference
                     if args is not None:
                         args = {**args, "user_text": source_text}
                 if name == "get_events" and args is not None and read_period is not None:
@@ -534,7 +409,7 @@ class Agent:
                     and not explicitly_requests_change(source_text or "", name)
                 ):
                     return (
-                        _read_response(events, read_tools, source_text or "")
+                        _read_response(events, read_tools)
                         if read_tools
                         else AgentResponse(
                             status=AgentStatus.ERROR,
@@ -598,20 +473,12 @@ class Agent:
                             errors.pop(failed_key)
                 else:
                     errors[fingerprint] = (name, args, str(result.payload), round_number)
-                    if compact:
-                        # Continue with the actual tool error and full history;
-                        # never upgrade the model after an attempted mutation.
-                        compact.active = False
                 if preview and result.ok:
                     draft_args = (
                         {**args, "confirmed": True, "event_ids": result.payload["event_ids"]}
                         if name == "delete_events"
                         else args
                     )
-                    if name in {"create_event", "update_event"}:
-                        # A confirmation after midnight must preserve the date
-                        # shown in the preview, including relative-day requests.
-                        draft_args = {**draft_args, "date_reference": date_reference}
                     draft = DraftAction(
                         tool=name,
                         arguments=draft_args,
@@ -671,7 +538,7 @@ class Agent:
             ):
                 # Successful list/search results already contain every display fact.
                 # Only explicit write requests need another interpretation step.
-                return _read_response(events, read_tools, source_text or "")
+                return _read_response(events, read_tools)
 
         logger.warning("agent exceeded %d steps", self._max_steps)
         if errors:
@@ -919,18 +786,12 @@ def _confirmed_response(
         events=list({**events, **(conflicts or {})}.values()),
     )
     response._conflict_warning = bool(conflicts)
-    if len(events) == 1:
-        response._focused_event_id = next(iter(events))
     return response
 
 
-def _read_response(
-    events: dict[str, Event], read_tools: set[str], query: str = ""
-) -> AgentResponse:
+def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentResponse:
     """Render retrieved facts without letting the model rewrite dates or names."""
     items = list(events.values())
-    if is_single_event_time_question(query):
-        return single_event_read_response(items, query)
     search = "search_events" in read_tools
     if not items:
         reply = "Подходящих записей не найдено." if search else "За указанный период записей нет."
@@ -944,7 +805,4 @@ def _read_response(
         when = _when(event)
         status = " (выполнено)" if event.status == "done" else ""
         lines.append(f"{when} — {event.name}{status}")
-    response = AgentResponse(reply_text="\n".join(lines), status=AgentStatus.DONE, events=items)
-    if len(items) == 1:
-        response._focused_event_id = str(items[0].id)
-    return response
+    return AgentResponse(reply_text="\n".join(lines), status=AgentStatus.DONE, events=items)

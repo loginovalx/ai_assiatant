@@ -18,9 +18,7 @@ from common.internal_auth import internal_token
 
 logger = logging.getLogger(__name__)
 
-HIDDEN_ARGS = frozenset(
-    {"user_id", "dry_run", "idempotency_key", "event_ids", "user_text", "date_reference"}
-)
+HIDDEN_ARGS = frozenset({"user_id", "dry_run", "idempotency_key", "event_ids", "user_text"})
 
 # Тул без MCP: им модель сообщает, что ей не хватает данных. Явный сигнал надёжнее,
 # чем угадывать по знаку вопроса в ответе.
@@ -126,21 +124,18 @@ class McpToolbox:
         idempotency_key: str | None = None,
         event_ids: list[str] | None = None,
         user_text: str | None = None,
-        date_reference: str | None = None,
     ) -> ToolResult:
         if name not in ALLOWED_TOOLS - {"ask_user"}:
             return ToolResult(ok=False, payload="Недоступный инструмент")
         args = {k: v for k, v in arguments.items() if k not in HIDDEN_ARGS}
         args["user_id"] = user_id  # всегда наш, даже если модель прислала свой
-        if user_text is not None and name in {"create_event", "update_event"}:
+        if user_text is not None and name == "create_event":
             args["user_text"] = user_text
-        if date_reference is not None and name in {"create_event", "update_event"}:
-            args["date_reference"] = date_reference
         if dry_run and name in MUTATING_TOOLS:
             args["dry_run"] = True
         if idempotency_key is not None and name == "create_event":
             args["idempotency_key"] = idempotency_key
-        if event_ids is not None and name in {"delete_events", "get_events"}:
+        if event_ids is not None and name == "delete_events":
             args["event_ids"] = event_ids
         async with self._client() as client:
             result = await client.call_tool(name, args, raise_on_error=False)

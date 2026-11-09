@@ -143,7 +143,6 @@ async def run(args) -> dict:
                 memory,
                 settings.tz,
                 simple_model=settings.llm_simple_model if settings.llm_routing_enabled else None,
-                economy_enabled=settings.agent_economy_enabled,
             )
             result = {"id": case.id, "query": case.text, "expected": case.expected}
             try:

@@ -99,7 +99,6 @@ async def evaluate_case(case: EvalCase, seeds, pool, redis, llm, settings, mcp) 
         memory,
         settings.tz,
         simple_model=settings.llm_simple_model if settings.llm_routing_enabled else None,
-        economy_enabled=settings.agent_economy_enabled,
     )
     try:
         for row in seeds:

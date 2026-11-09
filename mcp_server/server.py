@@ -36,13 +36,15 @@ from common.schemas import (
     check_duration,
 )
 from common.timeutils import (
+    RECURRENCE_UNSUPPORTED,
     WEEKDAYS_RU,
     allows_default_duration,
     ensure_aware,
     mentions_duration,
+    mentions_recurrence,
     mentions_time,
     named_weekday,
-    resolve_weekday_mismatch,
+    resolve_calendar_start,
 )
 from mcp_server.auth import InternalTokenVerifier
 
@@ -125,6 +127,26 @@ def _validation_message(error: ValidationError) -> str:
     return "; ".join(e["msg"].removeprefix("Value error, ") for e in error.errors())
 
 
+def _calendar_start(start: datetime, source: str, reference: datetime) -> datetime:
+    tz = get_settings().tz
+    start = ensure_aware(start, tz).astimezone(tz)
+    try:
+        start = (
+            resolve_calendar_start(source, start, ensure_aware(reference, tz).astimezone(tz))
+            or start
+        )
+    except ValueError as error:
+        raise ToolError(str(error)) from error
+    weekday = named_weekday(source)
+    if weekday is not None and start.weekday() != weekday:
+        raise ToolError(
+            f"В запросе назван день {WEEKDAYS_RU[weekday]}, но дата "
+            f"{start.date().isoformat()} — {WEEKDAYS_RU[start.weekday()]}. "
+            "При противоречии уточни дату у пользователя."
+        )
+    return start
+
+
 @mcp.tool
 async def create_event(
     user_id: UserId,
@@ -165,6 +187,7 @@ async def create_event(
             )
         ),
     ] = None,
+    date_reference: datetime | None = None,
     dry_run: bool = False,
     idempotency_key: UUID | None = None,
 ) -> EventWithConflicts:
@@ -176,6 +199,9 @@ async def create_event(
     Если время пересекается с другими встречами или делами, запись всё равно сохраняется,
     а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
     """
+    source_text = user_text if user_text else description
+    if mentions_recurrence(source_text):
+        raise ToolError(RECURRENCE_UNSUPPORTED)
     repo = _repo(ctx)
     if not dry_run and idempotency_key is not None:
         existing = await repo.get(user_id, repo.creation_id(user_id, idempotency_key))
@@ -199,7 +225,6 @@ async def create_event(
     # Время проверяем по дословной реплике пользователя (user_text), а не по description:
     # модель кладёт в description только суть, а время — в start_at. Без user_text
     # (HTTP API, старые вызовы) проверяем description как раньше.
-    source_text = user_text if user_text else description
     if source_text and not _has_explicit_weekday_or_date(source_text):
         if data.type == EventType.TASK and _WEEK_END_DEADLINE.search(source_text):
             raise ToolError(
@@ -220,25 +245,14 @@ async def create_event(
     ):
         raise ToolError("В исходном запросе нет времени, только день. Спроси точное время.")
     if data.start_at is not None:
-        resolved = resolve_weekday_mismatch(
-            source_text, data.start_at.astimezone(get_settings().tz), now
+        data = data.model_copy(
+            update={"start_at": _calendar_start(data.start_at, source_text, date_reference or now)}
         )
-        if resolved is not None:
-            data = data.model_copy(update={"start_at": resolved})
     if data.start_at is not None and data.start_at < now - PAST_TOLERANCE:
         raise ToolError(
             f"Время {data.start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "
             "Проверь вычисление даты или уточни у пользователя."
         )
-    weekday = named_weekday(source_text)
-    if data.start_at is not None and weekday is not None:
-        local_start = data.start_at.astimezone(get_settings().tz)
-        if local_start.weekday() != weekday:
-            raise ToolError(
-                f"В запросе назван день {WEEKDAYS_RU[weekday]}, но дата "
-                f"{local_start.date().isoformat()} — {WEEKDAYS_RU[local_start.weekday()]}. "
-                "Проверь календарь в системном промпте; при противоречии уточни дату."
-            )
 
     # Длительность встречи решает, с чем она пересечётся, поэтому не подставляем час молча:
     # пусть агент спросит. «Не знаю» — тоже ответ: тогда агент сам передаст 60 и скажет об этом.
@@ -423,6 +437,8 @@ async def update_event(
             le=MAX_DURATION_MINUTES,
         ),
     ] = None,
+    user_text: str | None = None,
+    date_reference: datetime | None = None,
     dry_run: bool = False,
 ) -> EventWithConflicts:
     """Изменить существующую задачу, напоминание или встречу: перенести время, переименовать,
@@ -433,6 +449,8 @@ async def update_event(
     Если новое время пересекается с другими встречами или делами, изменение всё равно
     сохраняется, а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
     """
+    if mentions_recurrence(user_text or ""):
+        raise ToolError(RECURRENCE_UNSUPPORTED)
     if name is None and start_at is None and description is None and duration_minutes is None:
         raise ToolError("Не указано, что менять: нужно хотя бы одно новое значение")
     if name is not None:
@@ -442,7 +460,7 @@ async def update_event(
 
     now = datetime.now(get_settings().tz).replace(microsecond=0)
     if start_at is not None:
-        start_at = ensure_aware(start_at, get_settings().tz)
+        start_at = _calendar_start(start_at, user_text or "", date_reference or now)
     if start_at is not None and start_at < now - PAST_TOLERANCE:
         raise ToolError(
             f"Время {start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "

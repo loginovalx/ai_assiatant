@@ -64,6 +64,19 @@ def test_missing_usage_is_unknown_not_free():
     assert summary["complete"] is False
 
 
+def test_context_profile_and_request_id_do_not_change_billable_counts():
+    record = record_usage(
+        {"usage": {"total_tokens": 10}},
+        operation="agent",
+        source="gpt2giga_openai",
+        context_profile="compact_create",
+        request_id="qa-request-1",
+    )
+    assert record["billable_tokens"] == 10
+    assert record["context_profile"] == "compact_create"
+    assert record["request_id"] == "qa-request-1"
+
+
 def test_cost_includes_relevance_and_embeddings_and_flags_malformed():
     records = [
         {"operation": "agent", "model": "GigaChat-2-Max", "billable_tokens": 2000},

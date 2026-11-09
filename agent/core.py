@@ -13,8 +13,10 @@ from uuid import UUID, uuid5
 from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionMessage
 
 from agent.cache import prompt_cache_session_id
+from agent.compact import CompactRequest, clarification_question, plan_request
 from agent.dialogue import direct_reply, starts_new_request
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.policy import asks_to_read, explicitly_requests_change, is_single_action_request
@@ -23,6 +25,7 @@ from agent.routing import ModelRoute, completion_problem, select_model
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
 from common.display import format_calendar_time
 from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
+from common.timeutils import RECURRENCE_UNSUPPORTED, mentions_recurrence
 from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,7 @@ class Agent:
         max_steps: int = 6,
         *,
         simple_model: str | None = None,
+        economy_enabled: bool = False,
     ) -> None:
         self._llm = llm
         self._model = model
@@ -50,6 +54,7 @@ class Agent:
         self._memory = memory
         self._tz = tz
         self._max_steps = max_steps
+        self._economy_enabled = economy_enabled
 
     async def handle(
         self,
@@ -96,6 +101,16 @@ class Agent:
                 return response
             if trusted_edit_source:
                 source_text = (trusted_edit_source + "\n" + text)[-6000:]
+            if (
+                mentions_recurrence(source_text)
+                and not asks_to_read(source_text)
+                and not any(
+                    explicitly_requests_change(source_text, tool)
+                    for tool in ("delete_event", "complete_event")
+                )
+            ):
+                await self._memory.reset(user_id)
+                return AgentResponse(reply_text=RECURRENCE_UNSUPPORTED, status=AgentStatus.DONE)
             route = select_model(
                 text,
                 history,
@@ -103,7 +118,6 @@ class Agent:
                 simple_model=self._simple_model,
                 editing_draft=trusted_edit_source is not None,
             )
-            logger.info("model_route model=%s reason=%s", route.model, route.reason)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": build_system_prompt(now)},
                 *({"role": item["role"], "content": item["content"]} for item in history),
@@ -116,16 +130,33 @@ class Agent:
                     + "\nИсправление пользователя:\n"
                     + text
                 )
-            response = await self._run(
-                user_id,
-                messages,
-                confirm_changes=confirm_changes,
-                request_id=request_id,
-                read_period=_read_period(text, now),
-                source_text=source_text,
-                deletion_period=_deletion_period(source_text, now),
-                route=route,
-            )
+            question = clarification_question(source_text) if self._economy_enabled else None
+            if question:
+                logger.info(
+                    "agent_context profile=clarification model_calls=0 request_id=%s", request_id
+                )
+                response = AgentResponse(reply_text=question, status=AgentStatus.NEED_CLARIFICATION)
+            else:
+                compact = (
+                    plan_request(text, now)
+                    if self._economy_enabled
+                    and not trusted_edit_source
+                    and (starts_new_request(text) or not history)
+                    else None
+                )
+                logger.info("model_route model=%s reason=%s", route.model, route.reason)
+                response = await self._run(
+                    user_id,
+                    messages,
+                    confirm_changes=confirm_changes,
+                    request_id=request_id,
+                    read_period=_read_period(text, now),
+                    source_text=source_text,
+                    deletion_period=_deletion_period(source_text, now),
+                    route=route,
+                    date_reference=now.isoformat(),
+                    compact=compact,
+                )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
             logger.exception("LLM или MCP недоступны")
             return AgentResponse(reply_text=FALLBACK_ERROR, status=AgentStatus.ERROR)
@@ -176,6 +207,15 @@ class Agent:
                     draft.arguments,
                     idempotency_key=str(draft.id),
                     user_text=draft.arguments.get("user_text"),
+                    date_reference=draft.arguments.get("date_reference"),
+                )
+            elif draft.tool == "update_event":
+                result = await self._toolbox.call(
+                    user_id,
+                    draft.tool,
+                    draft.arguments,
+                    user_text=draft.arguments.get("user_text"),
+                    date_reference=draft.arguments.get("date_reference"),
                 )
             elif draft.tool == "delete_events":
                 result = await self._toolbox.call(
@@ -240,41 +280,68 @@ class Agent:
         route: ModelRoute,
         *,
         allow_fallback: bool,
+        compact: CompactRequest | None = None,
+        request_id: UUID | None = None,
     ) -> Any:
         # Only one upgrade is possible: after switching to the primary model,
         # subsequent rounds stay there. No fallback may follow a write attempt.
         while True:
             usage_recorded = False
+            short = compact is not None and compact.active
+            sent_messages = compact.messages if short else messages
+            sent_tools = compact.tools if short else tools
+            profile = "compact_create" if short else "full"
+            logger.info(
+                "agent_context profile=%s input_chars=%d schema_chars=%d request_id=%s",
+                profile,
+                len(json.dumps(sent_messages, ensure_ascii=False)),
+                len(json.dumps(sent_tools, ensure_ascii=False)),
+                request_id,
+            )
             try:
                 completion = await self._llm.chat.completions.create(
                     model=route.model,
-                    messages=messages,
-                    tools=tools,
+                    messages=sent_messages,
+                    tools=sent_tools,
                     temperature=0.1,
                     extra_headers={
                         "X-Session-ID": prompt_cache_session_id(user_id, model=route.model)
                     },
                 )
                 record_usage(
-                    completion, operation="agent", source="gpt2giga_openai", model=route.model
+                    completion,
+                    operation="agent",
+                    source="gpt2giga_openai",
+                    model=route.model,
+                    context_profile=profile,
+                    request_id=str(request_id) if request_id else None,
                 )
                 usage_recorded = True
                 message = completion.choices[0].message
                 problem = (
-                    completion_problem(message, tools, route.expected_tool)
-                    if allow_fallback and route.model != self._model
+                    completion_problem(
+                        message, sent_tools, "create_event" if short else route.expected_tool
+                    )
+                    if allow_fallback and (short or route.model != self._model)
                     else None
                 )
             except Exception:
                 if not usage_recorded:
                     record_usage(
-                        None, operation="agent", source="gpt2giga_openai", model=route.model
+                        None,
+                        operation="agent",
+                        source="gpt2giga_openai",
+                        model=route.model,
+                        context_profile=profile,
+                        request_id=str(request_id) if request_id else None,
                     )
-                if not allow_fallback or route.model == self._model:
+                if not allow_fallback or (route.model == self._model and not short):
                     raise
                 problem = "generation_failed"
             if not problem:
                 return message
+            if compact:
+                compact.active = False
             route.model, route.reason = self._model, "fallback_" + problem
             logger.info("model_route model=%s reason=%s", route.model, route.reason)
 
@@ -289,8 +356,12 @@ class Agent:
         source_text: str | None = None,
         deletion_period: tuple[datetime, datetime] | None = None,
         route: ModelRoute | None = None,
+        date_reference: str | None = None,
+        compact: CompactRequest | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
+        if compact is not None and not compact.direct:
+            compact.prepare(source_text or "", tools)
         events: dict[str, Event] = {}
         mutations: dict[str, ToolResult] = {}
         confirmed: dict[str, Event] = {}
@@ -306,13 +377,39 @@ class Agent:
 
         for round_number in range(self._max_steps):
             try:
-                message = await self._generate(
-                    user_id,
-                    messages,
-                    tools,
-                    route,
-                    allow_fallback=not mutation_attempted and not confirmed and draft is None,
-                )
+                if compact is not None and compact.direct and round_number == 0:
+                    logger.info(
+                        "agent_context profile=direct_%s model_calls=0 request_id=%s",
+                        compact.tool,
+                        request_id,
+                    )
+                    message = ChatCompletionMessage.model_validate(
+                        {
+                            "role": "assistant",
+                            "tool_calls": [
+                                {
+                                    "id": "server_plan",
+                                    "type": "function",
+                                    "function": {
+                                        "name": compact.tool,
+                                        "arguments": json.dumps(
+                                            compact.arguments, ensure_ascii=False
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    message = await self._generate(
+                        user_id,
+                        messages,
+                        tools,
+                        route,
+                        allow_fallback=not mutation_attempted and not confirmed and draft is None,
+                        compact=compact,
+                        request_id=request_id,
+                    )
             except Exception:
                 if draft is not None and not errors:
                     return _draft_response(draft)
@@ -361,9 +458,17 @@ class Agent:
                         status=AgentStatus.ERROR,
                     )
                 args = _parse_args(call.function.arguments)
+                if (
+                    compact is not None
+                    and compact.active
+                    and name == compact.tool
+                    and args is not None
+                ):
+                    args = {**args, **compact.arguments}
                 evidence = {}
-                if name == "create_event" and source_text is not None:
+                if name in {"create_event", "update_event"} and source_text is not None:
                     evidence["user_text"] = source_text
+                    evidence["date_reference"] = date_reference
                     if args is not None:
                         args = {**args, "user_text": source_text}
                 if name == "get_events" and args is not None and read_period is not None:
@@ -473,12 +578,20 @@ class Agent:
                             errors.pop(failed_key)
                 else:
                     errors[fingerprint] = (name, args, str(result.payload), round_number)
+                    if compact:
+                        # Continue with the actual tool error and full history;
+                        # never upgrade the model after an attempted mutation.
+                        compact.active = False
                 if preview and result.ok:
                     draft_args = (
                         {**args, "confirmed": True, "event_ids": result.payload["event_ids"]}
                         if name == "delete_events"
                         else args
                     )
+                    if name in {"create_event", "update_event"}:
+                        # A confirmation after midnight must preserve the date
+                        # shown in the preview, including relative-day requests.
+                        draft_args = {**draft_args, "date_reference": date_reference}
                     draft = DraftAction(
                         tool=name,
                         arguments=draft_args,

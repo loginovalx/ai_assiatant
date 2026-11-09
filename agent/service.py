@@ -193,7 +193,7 @@ class AgentService:
                 if issued is None or issued.id != edit_draft_id:
                     raise InvalidDraft
                 source = issued.arguments.get("user_text")
-                if issued.tool == "create_event" and isinstance(source, str):
+                if issued.tool in {"create_event", "update_event"} and isinstance(source, str):
                     kwargs["trusted_edit_source"] = source
             result = await self._agent.handle(
                 user_id, text, confirm_changes=review, request_id=request_id, **kwargs

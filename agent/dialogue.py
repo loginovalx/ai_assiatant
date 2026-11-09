@@ -9,6 +9,10 @@ def starts_new_request(text: str) -> bool:
         return False
     if re.match(r"^(?:поставь|перенеси|измени|поменяй)\s+(?:на|в|е[её]|его|это|другое)\b", text):
         return False
+    if re.search(r"\b(?:встреч[ау]|созвон|задач[ау]|напоминание)\b", text) and re.search(
+        r"\b(?:поставь|создай|добавь|запланируй|перенеси)\b", text
+    ):
+        return True
     return bool(
         re.match(
             r"^(?:(?:ок|хорошо|пожалуйста)[, ]+)?(?:напомни|поставь|создай|добавь|удали|"

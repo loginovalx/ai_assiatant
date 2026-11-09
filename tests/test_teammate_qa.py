@@ -31,6 +31,10 @@ def test_new_command_does_not_inherit_pending_clarification():
         == "Поставь встречу с Иваном завтра"
     )
     assert "Полить цветы" in _user_source(history, "В 16:30")
+    assert (
+        _user_source(history, "чера в 10 встречу с иваном поставь")
+        == "чера в 10 встречу с иваном поставь"
+    )
 
 
 async def test_repeat_uses_actual_last_reply_without_hidden_annotations():

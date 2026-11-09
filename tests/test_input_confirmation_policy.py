@@ -94,6 +94,20 @@ async def test_text_command_saves_immediately_without_confirmation(bot_session, 
     assert "Сохранено" in api.sent[-1]["text"]
 
 
+async def test_new_command_replaces_old_voice_draft_without_reusing_its_subject(
+    bot_session, pool, tz
+):
+    bot, api, message, _ = bot_session(creation(tz), creation(tz, 13), text("Готово"))
+    await message("Напомни завтра в 12:00 позвонить Ивану", voice=True)
+    first = await bot.drafts.load("777")
+    await message("Напомни завтра в 13:00 позвонить Ивану")
+    assert await pool.fetchval("SELECT count(*) FROM events") == 1
+    assert await pool.fetchval("SELECT start_at FROM events") == tomorrow(tz, 13)
+    assert await bot.drafts.load("777") is None
+    assert api.sent[-1].get("buttons") is None
+    assert first is not None
+
+
 async def test_voice_always_shows_buttons_and_spoken_yes_does_not_commit(bot_session, pool, tz):
     bot, api, message, confirm = bot_session(creation(tz))
     await message("Напомни завтра в 12:00 позвонить Ивану", voice=True)

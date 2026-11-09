@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from agent.core import Agent
+from agent.dialogue import starts_new_request
 from common.schemas import AgentResponse, AgentStatus, DraftAction
 
 logger = logging.getLogger(__name__)
@@ -181,7 +182,9 @@ class AgentService:
                     user_id, DraftAction.model_validate_json(staged)
                 )
             review = bool(
-                confirm_changes or edit_draft_id is not None or await self._redis.get(review_key)
+                confirm_changes
+                or edit_draft_id is not None
+                or (not starts_new_request(text) and await self._redis.get(review_key))
             )
             kwargs = {}
             if edit_draft_id is not None:

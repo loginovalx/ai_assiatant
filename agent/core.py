@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
 
+from agent.dialogue import direct_reply, starts_new_request
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.policy import asks_to_read, explicitly_requests_change
 from agent.prompt import build_system_prompt
@@ -57,7 +58,25 @@ class Agent:
     ) -> AgentResponse:
         now = now or datetime.now(self._tz)
         try:
+            direct = direct_reply(text)
+            if direct:
+                reply, clear = direct
+                if clear or starts_new_request(text):
+                    await self._memory.reset(user_id)
+                return AgentResponse(reply_text=reply, status=AgentStatus.DONE)
             history = await self._memory.load(user_id)
+            if re.fullmatch(
+                r"повтори\s+(?:сво[её]\s+)?последнее\s+сообщение[.!?]*", text.strip(), re.I
+            ):
+                previous = next(
+                    (item["content"] for item in reversed(history) if item["role"] == "assistant"),
+                    "Предыдущего ответа пока нет.",
+                )
+                return AgentResponse(
+                    reply_text=_safe_model_reply(previous), status=AgentStatus.DONE
+                )
+            if starts_new_request(text) and history and history[-1].get("clarification_text"):
+                history = []
             source_text = _user_source(history, text)
             if _keeps_conflicting_time(history, text):
                 response = AgentResponse(
@@ -91,6 +110,7 @@ class Agent:
                 request_id=request_id,
                 read_period=_read_period(text, now),
                 source_text=source_text,
+                deletion_period=_deletion_period(source_text, now),
             )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
             logger.exception("LLM или MCP недоступны")
@@ -200,6 +220,7 @@ class Agent:
         request_id: UUID | None = None,
         read_period: tuple[datetime, datetime] | None = None,
         source_text: str | None = None,
+        deletion_period: tuple[datetime, datetime] | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
         events: dict[str, Event] = {}
@@ -287,6 +308,23 @@ class Agent:
                         "end_time": read_period[1].isoformat(),
                     }
                 logger.info("tool call %s", name)
+                if name == "delete_events" and args is not None:
+                    if deletion_period:
+                        args = {
+                            **args,
+                            "start_time": deletion_period[0].isoformat(),
+                            "end_time": deletion_period[1].isoformat(),
+                        }
+                    elif re.search(
+                        r"сегодня|завтра|вчера|недел|месяц|\d|январ|феврал|март|апрел|"
+                        r"июн|июл|август|сентябр|октябр|ноябр|декабр",
+                        source_text or "",
+                        re.I,
+                    ) and not (args.get("start_time") and args.get("end_time")):
+                        return AgentResponse(
+                            status=AgentStatus.NEED_CLARIFICATION,
+                            reply_text="За какой период удалить записи? Укажите даты.",
+                        )
 
                 if name == "ask_user":
                     question = _safe_model_reply(
@@ -481,6 +519,8 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
 
 def _user_source(history: list[HistoryMessage], text: str) -> str:
     """Keep actual user evidence across a pending clarification, not unrelated turns."""
+    if starts_new_request(text):
+        return text
     pending = ""
     if history and history[-1]["role"] == "assistant":
         last = history[-1]
@@ -498,6 +538,16 @@ def _user_source(history: list[HistoryMessage], text: str) -> str:
                 "",
             )
     return (pending + "\n" + text if pending else text)[-6000:]
+
+
+def _deletion_period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
+    words = re.findall(r"\b(сегодня|завтра|послезавтра|вчера)\b", text.casefold())
+    if len(words) == 1:
+        day = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+            days={"сегодня": 0, "завтра": 1, "послезавтра": 2, "вчера": -1}[words[0]]
+        )
+        return day, day + timedelta(days=1)
+    return _read_period(text, now)
 
 
 def _read_period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
@@ -576,13 +626,15 @@ def _incomplete_response(events, confirmed, conflicts, errors) -> AgentResponse:
 
 
 def _public_tool_error(message: str) -> str:
+    if "удалять нечего" in message.casefold():
+        return "Подходящих записей нет — удалять нечего."
     if "длительност" in message.casefold() or "duration_minutes" in message:
         return "Сколько продлится встреча?"
     if "нет времени, только день" in message:
         return "Во сколько запланировать событие?"
     if re.search(
         r"create_event|update_event|delete_event|user_text|ToolError|Traceback|"
-        r"вызови\s+тул|системн\w*\s+промпт",
+        r"вызови\s+тул|системн\w*\s+промпт|скажи\s+пользователю",
         message,
         re.I,
     ):
@@ -591,6 +643,7 @@ def _public_tool_error(message: str) -> str:
 
 
 def _safe_model_reply(message: str) -> str:
+    message = re.split(r"\[(?:черновик|записи в этом ответе):", message, maxsplit=1)[0].strip()
     if re.search(
         r"create_event|update_event|delete_event|duration_minutes|user_text|"
         r"ты\s*[—-]\s*голосовой\s+ассистент|системный\s+промпт\s*[:=]",

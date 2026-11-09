@@ -8,6 +8,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from redis.asyncio import Redis
 
+from agent.dialogue import starts_new_request
 from bot.agent_client import AgentClient, AgentUnavailable
 from bot.asr import SpeechRecognitionError, SpeechRecognizer
 from bot.drafts import DraftStore
@@ -655,6 +656,10 @@ class BotHandler:
 
             pending = await self.drafts.load(user_id)
             keep_phrase = pending is not None and is_explicit_keep_confirmation(text)
+            if pending and starts_new_request(text):
+                await self.agent.reset(user_id)
+                await self.drafts.drop(user_id)
+                pending = None
             if keep_phrase and not can_change_draft_time(pending):
                 await self.agent.reset(user_id)
                 await self.drafts.drop(user_id)
@@ -678,7 +683,14 @@ class BotHandler:
                 result = await self.agent.confirm(user_id, pending)
                 if result.status == "done":
                     await self.drafts.drop(user_id)
-            elif pending and text.casefold().strip(" .!") in {"нет", "отмена", "отмени"}:
+            elif pending and text.casefold().strip(" .!") in {
+                "нет",
+                "отмена",
+                "отмени",
+                "забей",
+                "не надо",
+                "забыли",
+            }:
                 await self.agent.reset(user_id)
                 await self.drafts.drop(user_id)
                 await reply("Отменил действие.")

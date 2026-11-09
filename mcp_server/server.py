@@ -533,6 +533,24 @@ async def delete_event(
 async def delete_events(
     user_id: UserId,
     ctx: Context,
+    start_time: Annotated[
+        datetime | None,
+        Field(
+            description=(
+                "Начало периода для удаления, включительно. Для «сегодня», «завтра» или другого "
+                "названного периода передай вместе с end_time; ISO 8601 со смещением."
+            )
+        ),
+    ] = None,
+    end_time: Annotated[
+        datetime | None,
+        Field(
+            description=(
+                "Конец периода удаления, не включительно. Укажи вместе с start_time; "
+                "без обоих границ удаляются записи за всё время. ISO 8601 со смещением."
+            )
+        ),
+    ] = None,
     event_types: Annotated[
         list[EventTypeName] | None,
         Field(
@@ -547,7 +565,8 @@ async def delete_events(
         Field(
             description=(
                 "Необязательный точный снимок ID из предпросмотра. При подтверждении удаляются "
-                "только эти записи, если они всё ещё принадлежат пользователю и подходят по типу."
+                "только эти записи, если они всё ещё принадлежат пользователю и подходят по типу "
+                "и периоду. Для подтверждения удаления за период обязателен."
             )
         ),
     ] = None,
@@ -557,16 +576,30 @@ async def delete_events(
     ] = False,
     dry_run: bool = False,
 ) -> list[Event] | dict[str, int | list[str]]:
-    """Удалить сразу ВСЕ записи пользователя заданных типов.
+    """Удалить сразу ВСЕ записи пользователя заданных типов и, если указан, периода.
 
-    Для «удали все мои задачи», «очисти всё». Для одной записи используй delete_event.
+    Для «удали все мои задачи», «удали напоминания сегодня», «очисти всё». Удаление за период
+    использует полуинтервал [start_time, end_time) и не включает записи без даты. Если пользователь
+    назвал период, передай обе его границы; для подтверждения за период используй event_ids из
+    предпросмотра. Для одной записи используй delete_event.
     Действие необратимо для пользователя, поэтому без confirmed=true тул ничего не удаляет:
     он ответит, сколько записей будет удалено, а ты спросишь подтверждение через ask_user.
     """
+    if (start_time is None) != (end_time is None):
+        raise ToolError("Для удаления за период укажи start_time и end_time вместе.")
+
+    start = end = None
+    if start_time is not None and end_time is not None:
+        settings = get_settings()
+        start = ensure_aware(start_time, settings.tz)
+        end = ensure_aware(end_time, settings.tz)
+        if start >= end:
+            raise ToolError("start_time должен быть раньше end_time")
+
     types = [EventType(t) for t in event_types] if event_types else None
     repo = _repo(ctx)
     if not confirmed or dry_run:
-        preview_ids = await repo.preview_cancellation_ids(user_id, types)
+        preview_ids = await repo.preview_cancellation_ids(user_id, types, start, end)
         if not preview_ids:
             raise ToolError("Записей такого типа нет — удалять нечего. Так и скажи пользователю.")
         if dry_run:
@@ -580,12 +613,21 @@ async def delete_events(
             f"«Удалить все записи ({len(preview_ids)} шт.)? Это нельзя отменить.» Ответил «да» — "
             "вызови тул снова с confirmed=true; «нет» — ничего не делай."
         )
+    if start is not None and event_ids is None:
+        raise ToolError("Для подтверждения удаления за период передай event_ids из предпросмотра.")
     deleted = (
-        await repo.cancel_selected(user_id, event_ids, types)
+        await repo.cancel_selected(user_id, event_ids, types, start, end)
         if event_ids is not None
-        else await repo.cancel_all(user_id, types)
+        else await repo.cancel_all(user_id, types, start=start, end=end)
     )
-    logger.info("bulk deleted %d events user=%s types=%s", len(deleted), user_id, event_types)
+    logger.info(
+        "bulk deleted %d events user=%s types=%s period=%s..%s",
+        len(deleted),
+        user_id,
+        event_types,
+        start,
+        end,
+    )
     return deleted
 
 

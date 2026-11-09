@@ -26,6 +26,14 @@ _COLUMNS = (
     "created_at, updated_at"
 )
 
+
+def _validate_optional_period(start: datetime | None, end: datetime | None) -> None:
+    if (start is None) != (end is None):
+        raise ValueError("start and end must be provided together")
+    if start is not None and end is not None and start >= end:
+        raise ValueError("start must be earlier than end")
+
+
 # Пересечение полуинтервалов: [a_start, a_end) и [b_start, b_end) пересекаются,
 # если a_start < b_end и b_start < a_end. Встреча 15:00–16:00 и встреча в 16:00 — не конфликт.
 # Какие записи занимают время — те же правила, что busy_interval в schemas.py.
@@ -342,13 +350,21 @@ class EventRepository:
         )
 
     async def cancel_all(
-        self, user_id: str, types: Sequence[EventType] | None = None, dry_run: bool = False
+        self,
+        user_id: str,
+        types: Sequence[EventType] | None = None,
+        dry_run: bool = False,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> list[Event] | int:
         """Мягко удалить все видимые записи пользователя (опционально — только данных типов).
 
         dry_run=True ничего не меняет и возвращает количество: им тул спрашивает подтверждение.
-        Иначе возвращает удалённые записи. Чужие записи не затрагиваются никогда.
+        Иначе возвращает удалённые записи. Если задан период, учитываются только датированные
+        события из полуинтервала [start, end). Чужие записи не затрагиваются никогда.
         """
+        _validate_optional_period(start, end)
         type_values = [t.value for t in types] if types else None
         if dry_run:
             return await self._pool.fetchval(
@@ -356,36 +372,50 @@ class EventRepository:
                 SELECT count(*) FROM events
                 WHERE user_id = $1 AND status <> 'cancelled'
                   AND ($2::text[] IS NULL OR type = ANY($2))
+                  AND ($3::timestamptz IS NULL OR (start_at >= $3 AND start_at < $4))
                 """,
                 user_id,
                 type_values,
+                start,
+                end,
             )
         rows = await self._pool.fetch(
             f"""
             UPDATE events SET status = 'cancelled'
             WHERE user_id = $1 AND status <> 'cancelled'
               AND ($2::text[] IS NULL OR type = ANY($2))
+              AND ($3::timestamptz IS NULL OR (start_at >= $3 AND start_at < $4))
             RETURNING {_COLUMNS}
             """,
             user_id,
             type_values,
+            start,
+            end,
         )
         return [self._to_event(r) for r in rows]
 
     async def preview_cancellation_ids(
-        self, user_id: str, types: Sequence[EventType] | None = None
+        self,
+        user_id: str,
+        types: Sequence[EventType] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> list[UUID]:
-        """Return the exact active event IDs a confirmed bulk cancellation would target."""
+        """Return IDs of active rows matching type and optional [start, end) period."""
+        _validate_optional_period(start, end)
         type_values = [t.value for t in types] if types else None
         rows = await self._pool.fetch(
             """
             SELECT id FROM events
             WHERE user_id = $1 AND status <> 'cancelled'
               AND ($2::text[] IS NULL OR type = ANY($2))
+              AND ($3::timestamptz IS NULL OR (start_at >= $3 AND start_at < $4))
             ORDER BY id
             """,
             user_id,
             type_values,
+            start,
+            end,
         )
         return [row["id"] for row in rows]
 
@@ -394,8 +424,11 @@ class EventRepository:
         user_id: str,
         event_ids: Sequence[UUID],
         types: Sequence[EventType] | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> list[Event]:
-        """Cancel only previewed IDs that still belong to the user and match the types."""
+        """Cancel only previewed IDs still owned by the user and within all given filters."""
+        _validate_optional_period(start, end)
         if not event_ids:
             return []
         type_values = [t.value for t in types] if types else None
@@ -404,11 +437,14 @@ class EventRepository:
             UPDATE events SET status = 'cancelled'
             WHERE id = ANY($1::uuid[]) AND user_id = $2 AND status <> 'cancelled'
               AND ($3::text[] IS NULL OR type = ANY($3))
+              AND ($4::timestamptz IS NULL OR (start_at >= $4 AND start_at < $5))
             RETURNING {_COLUMNS}
             """,
             list(event_ids),
             user_id,
             type_values,
+            start,
+            end,
         )
         return [self._to_event(r) for r in rows]
 

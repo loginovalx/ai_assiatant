@@ -332,3 +332,42 @@ async def test_same_typed_request_id_replays_without_a_second_write(calendar, re
     second = await service.handle("u", "Создай задачу «ТЕСТ Повтор»", request_id=request_id)
     assert first == second and first.status == "done"
     assert repo.writes == 1 and llm.requests == []
+
+
+@pytest.mark.parametrize(
+    "command,model_name,expected",
+    [
+        ("Напомни завтра в 18:20 ЭКО купить молоко", "Купить молоко", "ЭКО Купить молоко"),
+        ("Напомни завтра в 18:20 ЭКО купить молоко", "эко купить молоко", "ЭКО купить молоко"),
+        ("Создай задачу QA подготовить отчёт", "Подготовить отчёт", "QA Подготовить отчёт"),
+        ("Создай задачу CRM обработать лиды", "Обработать лиды", "CRM Обработать лиды"),
+        ("Создай задачу подготовить отчёт", "Подготовить отчёт", "Подготовить отчёт"),
+    ],
+)
+async def test_project_prefix_survives_short_title_extraction_without_extra_call(
+    calendar,
+    command,
+    model_name,
+    expected,
+):
+    repo, toolbox, _ = calendar
+    agent, llm = make_agent(toolbox, tool_call("create_event", {"name": model_name}))
+    result = await agent.handle("u", command, now=NOW)
+    assert result.status == "done" and repo.writes == len(llm.requests) == 1
+    event = next(iter(repo.rows.values()))
+    assert event.name == expected and expected in result.reply_text
+    if event.type == "reminder":
+        assert event.start_at == datetime(2026, 11, 10, 18, 20, tzinfo=TZ)
+
+
+async def test_project_prefix_is_also_kept_after_fallback_to_full_context(calendar):
+    repo, toolbox, _ = calendar
+    agent, llm = make_agent(
+        toolbox,
+        text("Сохранено"),
+        tool_call("create_event", {"event_type": "task", "name": "Подготовить отчёт"}),
+    )
+    result = await agent.handle("u", "Создай задачу QA подготовить отчёт", now=NOW)
+    assert result.status == "done" and repo.writes == 1
+    assert next(iter(repo.rows.values())).name == "QA Подготовить отчёт"
+    assert len(llm.requests) == 2

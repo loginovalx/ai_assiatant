@@ -50,6 +50,16 @@ class CompactRequest:
     active: bool = True
     tools: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
+    name_prefix: str | None = None
+
+    def preserve_name_prefix(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        name = arguments.get("name")
+        if not self.name_prefix or not isinstance(name, str) or not name.strip():
+            return arguments
+        name = name.strip()
+        present = re.match(re.escape(self.name_prefix) + r"(?=\s|$)", name, re.I)
+        name = self.name_prefix + name[present.end() :] if present else f"{self.name_prefix} {name}"
+        return {**arguments, "name": name}
 
     def prepare(self, text: str, all_tools: list[dict[str, Any]]) -> None:
         name = next(
@@ -104,7 +114,15 @@ def _creation(kind: str, body: str, text: str, **arguments: Any) -> CompactReque
     args = {"event_type": kind, "description": text, **arguments}
     if name is not None:
         args["name"] = name
-    return CompactRequest("create_event", args, direct=name is not None)
+    # Leading uppercase labels (e.g. a project/team acronym) are user data,
+    # not words for the model to discard while shortening the title.
+    prefix = re.match(r"^\s*([A-ZА-ЯЁ]{2,12})(?=\s)", body) if name is None else None
+    return CompactRequest(
+        "create_event",
+        args,
+        direct=name is not None,
+        name_prefix=prefix[1] if prefix else None,
+    )
 
 
 def plan_request(text: str, now: datetime) -> CompactRequest | None:

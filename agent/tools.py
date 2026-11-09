@@ -140,7 +140,7 @@ class McpToolbox:
             args["dry_run"] = True
         if idempotency_key is not None and name == "create_event":
             args["idempotency_key"] = idempotency_key
-        if event_ids is not None and name == "delete_events":
+        if event_ids is not None and name in {"delete_events", "get_events"}:
             args["event_ids"] = event_ids
         async with self._client() as client:
             result = await client.call_tool(name, args, raise_on_error=False)

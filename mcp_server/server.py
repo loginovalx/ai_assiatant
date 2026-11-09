@@ -322,6 +322,7 @@ async def get_events(
         bool,
         Field(description="Добавить уже выполненные. true только для «что я сделал», «что закрыл»"),
     ] = False,
+    event_ids: Annotated[list[UUID] | None, Field(max_length=10)] = None,
 ) -> list[Event]:
     """Список событий за период, отсортированный по времени.
 
@@ -336,7 +337,17 @@ async def get_events(
         raise ToolError("start_time должен быть раньше end_time")
 
     types = [EventType(t) for t in event_types] if event_types else None
-    events = await _repo(ctx).list_by_period(user_id, start, end, types, include_undated_tasks)
+    if event_ids is not None:
+        # Internal exact lookup for a trusted conversation focus. IDs are hidden
+        # from the model schema and injected only by the agent. Fetch current
+        # fields even if another client has moved the event outside this period.
+        events = [
+            event
+            for event_id in dict.fromkeys(event_ids)
+            if (event := await _repo(ctx).get(user_id, event_id)) is not None
+        ]
+    else:
+        events = await _repo(ctx).list_by_period(user_id, start, end, types, include_undated_tasks)
     if not include_done:
         events = [event for event in events if event.status != EventStatus.DONE]
     return events

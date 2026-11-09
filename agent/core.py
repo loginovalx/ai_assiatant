@@ -17,6 +17,7 @@ from openai.types.chat import ChatCompletionMessage
 
 from agent.cache import prompt_cache_session_id
 from agent.compact import CompactRequest, clarification_question, plan_request
+from agent.details import is_event_details_question, read_event_details
 from agent.dialogue import direct_reply, starts_new_request
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.policy import asks_to_read, explicitly_requests_change, is_single_action_request
@@ -96,7 +97,11 @@ class Agent:
                 await self._memory.append(
                     user_id,
                     HistoryMessage(role="user", content=text),
-                    HistoryMessage(role="assistant", content=response.reply_text),
+                    HistoryMessage(
+                        role="assistant",
+                        content=response.reply_text,
+                        focused_event_id=history[-1].get("focused_event_id"),
+                    ),
                 )
                 return response
             if trusted_edit_source:
@@ -131,7 +136,12 @@ class Agent:
                     + text
                 )
             question = clarification_question(source_text) if self._economy_enabled else None
-            if question:
+            if is_event_details_question(text):
+                logger.info(
+                    "agent_context profile=event_details model_calls=0 request_id=%s", request_id
+                )
+                response = await read_event_details(self._toolbox, user_id, history, now)
+            elif question:
                 logger.info(
                     "agent_context profile=clarification model_calls=0 request_id=%s", request_id
                 )
@@ -172,6 +182,7 @@ class Agent:
                         source_text if response.status == AgentStatus.NEED_CLARIFICATION else ""
                     ),
                     conflict_warning=response._conflict_warning,
+                    focused_event_id=response._focused_event_id,
                 )
                 if response.status in {
                     AgentStatus.NEED_CLARIFICATION,
@@ -251,6 +262,7 @@ class Agent:
                 status=AgentStatus.DONE,
             )
             response._conflict_warning = bool(conflict_warnings)
+            response._focused_event_id = summary._focused_event_id
             try:
                 await self._memory.append(
                     user_id,
@@ -258,6 +270,7 @@ class Agent:
                         role="assistant",
                         content=_with_event_refs(response),
                         conflict_warning=response._conflict_warning,
+                        focused_event_id=response._focused_event_id,
                     ),
                 )
             except Exception:
@@ -465,6 +478,8 @@ class Agent:
                     and args is not None
                 ):
                     args = {**args, **compact.arguments}
+                if compact is not None and name == "create_event" and args is not None:
+                    args = compact.preserve_name_prefix(args)
                 evidence = {}
                 if name in {"create_event", "update_event"} and source_text is not None:
                     evidence["user_text"] = source_text
@@ -899,6 +914,8 @@ def _confirmed_response(
         events=list({**events, **(conflicts or {})}.values()),
     )
     response._conflict_warning = bool(conflicts)
+    if len(events) == 1:
+        response._focused_event_id = next(iter(events))
     return response
 
 
@@ -918,4 +935,7 @@ def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentRespo
         when = _when(event)
         status = " (выполнено)" if event.status == "done" else ""
         lines.append(f"{when} — {event.name}{status}")
-    return AgentResponse(reply_text="\n".join(lines), status=AgentStatus.DONE, events=items)
+    response = AgentResponse(reply_text="\n".join(lines), status=AgentStatus.DONE, events=items)
+    if len(items) == 1:
+        response._focused_event_id = str(items[0].id)
+    return response

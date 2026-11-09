@@ -1,7 +1,7 @@
 """Цикл агента: LLM предлагает вызвать тул → выполняем → отдаём результат → … → ответ.
 
-Один запрос пользователя = до agent_max_steps раундов. Обычно хватает двух:
-вызвать тул и сформулировать ответ.
+Один запрос пользователя = до agent_max_steps раундов. Для простого действия
+достаточно одного вызова модели: подтверждение формируется по результату тула.
 """
 
 import json
@@ -14,9 +14,10 @@ from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
 
+from agent.cache import prompt_cache_session_id
 from agent.dialogue import direct_reply, starts_new_request
 from agent.memory import ConversationMemory, HistoryMessage
-from agent.policy import asks_to_read, explicitly_requests_change
+from agent.policy import asks_to_read, explicitly_requests_change, is_single_action_request
 from agent.prompt import build_system_prompt
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
 from common.display import format_calendar_time
@@ -230,14 +231,20 @@ class Agent:
         read_tools: set[str] = set()
         errors: dict[str, tuple[str, dict | None, str, int]] = {}
         mutation_number = 0
+        confirmed_tool = ""
         draft: DraftAction | None = None
         draft_fingerprint: str | None = None
+        cache_headers = {"X-Session-ID": prompt_cache_session_id(user_id)}
 
         for round_number in range(self._max_steps):
             usage_recorded = False
             try:
                 completion = await self._llm.chat.completions.create(
-                    model=self._model, messages=messages, tools=tools, temperature=0.1
+                    model=self._model,
+                    messages=messages,
+                    tools=tools,
+                    temperature=0.1,
+                    extra_headers=cache_headers,
                 )
                 record_usage(
                     completion, operation="agent", source="gpt2giga_openai", model=self._model
@@ -439,6 +446,7 @@ class Agent:
                     if result.ok and result.is_mutation:
                         confirmed[str(event.id)] = event
                 if result.ok and result.is_mutation:
+                    confirmed_tool = name
                     if fingerprint not in mutations:
                         mutation_number += 1
                     mutations[fingerprint] = result
@@ -450,6 +458,15 @@ class Agent:
             # paid generation cannot add authority and could misdescribe it.
             if draft is not None and not errors:
                 return _draft_response(draft)
+            if (
+                len(confirmed) == 1
+                and not errors
+                and len(mutations) == 1
+                and is_single_action_request(source_text or "", confirmed_tool)
+            ):
+                # One successful, explicitly single action already has all reply
+                # facts. Keep model follow-ups for compound or uncertain requests.
+                return _confirmed_response(confirmed, conflict_warnings)
             if (
                 read_tools
                 and not errors

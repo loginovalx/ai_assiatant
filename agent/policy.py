@@ -49,3 +49,28 @@ def asks_to_read(source: str) -> bool:
             re.I,
         )
     )
+
+
+def is_single_action_request(source: str, tool: str) -> bool:
+    """Conservative fast-path hint, not permission to execute a mutation.
+
+    Uncertain, compound and multi-turn requests keep the existing model loop.
+    False negatives only cost an extra generation; they do not drop user work.
+    """
+    if not explicitly_requests_change(source, tool):
+        return False
+    source = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", source).rstrip(" .!?\t")
+    if re.search(
+        r"[;!?\n]|\.\s|\b(?:и|а|но|затем|потом|далее|после|если|иначе|также|ещ[её]|плюс|"
+        r"and|then|also|if|покажи|показать|найди|найти|проверь|проверить|"
+        r"расскажи|скажи|перечисли|посчитай|исправь|переименуй|сколько|когда|show|find|list|search|"
+        r"задачи|задач|встречи|встреч|напоминания|напоминаний|дела|дел|события|событий)\b",
+        source,
+        re.I,
+    ):
+        return False
+    # Also preserve separate commands without an explicit conjunction.
+    commands = sum(
+        len(re.findall(rf"\b(?:{words})\b", source, re.I)) for words in _CHANGE_WORDS.values()
+    )
+    return commands <= 1

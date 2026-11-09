@@ -210,9 +210,8 @@ async def test_create_reminder(make_agent, tz, pool):
     row = await pool.fetchrow("SELECT user_id, type FROM events")
     assert dict(row) == {"user_id": USER, "type": "reminder"}
 
-    # Во втором раунде LLM видит результат тула.
-    tool_msg = llm.requests[1]["messages"][-1]
-    assert tool_msg["role"] == "tool" and "Позвонить Ивану" in tool_msg["content"]
+    # Stored facts are enough to confirm a single action without another generation.
+    assert len(llm.requests) == 1
 
 
 async def test_model_cannot_choose_user_id(make_agent, pool):
@@ -355,12 +354,11 @@ async def test_model_cannot_forge_time_evidence_for_untimed_request(make_agent, 
 async def test_list_today(make_agent, tz):
     start = tomorrow_at(tz, 9)
     day = start.replace(hour=0)
-    agent, _ = make_agent(
+    agent, llm = make_agent(
         tool_call(
             "create_event",
             {"event_type": "reminder", "name": "Зарядка", "start_at": start.isoformat()},
         ),
-        text("Ок"),
         tool_call(
             "get_events",
             {"start_time": day.isoformat(), "end_time": (day + timedelta(days=1)).isoformat()},
@@ -370,6 +368,7 @@ async def test_list_today(make_agent, tz):
     await agent.handle(USER, "Напомни завтра в 9 про зарядку")
     response = await agent.handle(USER, "Что у меня завтра?")
     assert [e.name for e in response.events] == ["Зарядка"]
+    assert len(llm.requests) == 2  # one generation per user request
 
 
 async def test_update_event_reschedule(make_agent, tz, pool):
@@ -486,9 +485,8 @@ async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool)
     )
     response = await agent.handle(USER, "Встреча с дизайнером завтра в 15:30 на полчаса")
 
-    tool_message = json.loads(llm.requests[1]["messages"][-1]["content"])
-    assert [c["name"] for c in tool_message["conflicts"]] == ["Созвон с Иваном"]
-    assert "user_id" not in tool_message["conflicts"][0]  # шум вырезан и во вложенных записях
+    assert len(llm.requests) == 1
+    assert "Созвон с Иваном" in response.reply_text and "пересечение" in response.reply_text
     assert {e.name for e in response.events} == {"Встреча с дизайнером", "Созвон с Иваном"}
     assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 2
 

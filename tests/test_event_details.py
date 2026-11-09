@@ -3,8 +3,8 @@ from uuid import uuid4
 
 import pytest
 
-from agent.core import _confirmed_response
-from agent.details import is_event_details_question
+from agent.core import _confirmed_response, _read_response
+from agent.details import is_event_details_question, is_single_event_time_question
 from common.schemas import EventCreate
 from tests.scripted_llm import text, tool_call
 from tests.test_agent_economy import make_agent
@@ -202,3 +202,125 @@ async def test_keep_confirmation_preserves_primary_event_focus(calendar):
     await agent.handle("u", "Оставь как есть", now=NOW)
     result = await agent.handle("u", QUESTION, now=NOW)
     assert result.status == "done" and result.events[0].id == event.id and llm.requests == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "во сколько завтра этот созвон?",
+        "Этот созвон завтра во сколько?",
+        "Во сколько этот созвон завтра?",
+        "Скажи, когда завтра этот созвон начнётся?",
+        "А во сколько она завтра начинается?",
+        "Когда начинается эта встреча завтра?",
+        "Сколько продлится этот созвон завтра?",
+        "До скольки завтра этот созвон?",
+        "Какая длительность этой встречи?",
+        "Завтра во сколько он начнется?",
+        "во\u00a0сколько\u00a0завтра\u00a0этот\u00a0созвон?",
+    ],
+)
+async def test_natural_time_questions_with_different_word_order_read_one_record(calendar, query):
+    repo, toolbox, _ = calendar
+    event = await create_meeting(repo, name="ФИНАЛ Созвон")
+    for i in range(10):
+        await create_meeting(repo, name=f"Другая запись {i}")
+    memory = CalendarMemory()
+    memory.history = [
+        {"role": "assistant", "content": "Сохранено", "focused_event_id": str(event.id)}
+    ]
+    agent, llm = make_agent(toolbox, memory=memory)
+    result = await agent.handle("u", query, now=NOW)
+    assert result.status == "done" and [e.id for e in result.events] == [event.id]
+    assert "12:10" in result.reply_text and "20 мин." in result.reply_text
+    assert "Другая запись" not in result.reply_text and llm.requests == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Во сколько они завтра?",
+        "Во сколько завтра эти созвоны?",
+        "Какие встречи завтра и во сколько?",
+        "Во сколько она и перенеси её на завтра",
+        "Во сколько она? И удали эту встречу",
+        "Покажи календарь и во сколько эта встреча?",
+        "Переименуй запись «Во сколько она?»",
+        "Во сколько этот созвон и когда эта встреча?",
+        "Во сколько «Созвон А» и «Созвон Б»?",
+    ],
+)
+def test_plural_and_compound_requests_do_not_use_a_single_focused_record(query):
+    assert not is_single_event_time_question(query)
+
+
+@pytest.mark.parametrize("query", ["Во сколько завтра этот созвон?", "Когда эта встреча сегодня?"])
+async def test_explicit_day_must_match_fresh_selected_record(calendar, query):
+    repo, toolbox, _ = calendar
+    event = await create_meeting(repo)
+    await repo.update("u", event.id, start_at=datetime(2026, 12, 1, 12, tzinfo=TZ))
+    memory = CalendarMemory()
+    memory.history = [
+        {"role": "assistant", "content": "Сохранено", "focused_event_id": str(event.id)}
+    ]
+    agent, llm = make_agent(toolbox, memory=memory)
+    result = await agent.handle("u", query, now=NOW)
+    assert result.status == "need_clarification" and "не соответствует" in result.reply_text
+    assert not llm.requests
+
+
+async def test_time_question_cannot_silently_use_focus_of_another_event_type(calendar):
+    repo, toolbox, _ = calendar
+    event = await repo.create(
+        EventCreate(
+            user_id="u",
+            type="reminder",
+            name="Молоко",
+            start_at=datetime(2026, 11, 10, 18, tzinfo=TZ),
+        )
+    )
+    memory = CalendarMemory()
+    memory.history = [
+        {"role": "assistant", "content": "Сохранено", "focused_event_id": str(event.id)}
+    ]
+    agent, llm = make_agent(toolbox, memory=memory)
+    result = await agent.handle("u", "во сколько завтра этот созвон?", now=NOW)
+    assert result.status == "need_clarification" and not llm.requests
+
+
+async def test_wide_tool_result_for_singular_question_asks_instead_of_listing_day(calendar):
+    repo, _, _ = calendar
+    events = [await create_meeting(repo, name=f"Созвон {i}") for i in range(11)]
+    result = _read_response(
+        {str(e.id): e for e in events}, {"get_events"}, "Во сколько встреча с Иваном?"
+    )
+    assert result.status == "need_clarification" and "О какой записи" in result.reply_text
+    assert "Найдено записей" not in result.reply_text and "12:10" not in result.reply_text
+
+
+async def test_exact_title_clarification_selects_only_requested_record_from_wide_result(calendar):
+    repo, toolbox, _ = calendar
+    event = await create_meeting(repo, name="ФИНАЛ Созвон")
+    await create_meeting(repo, name="Созвон с Иваном")
+    memory = CalendarMemory()
+    agent, llm = make_agent(toolbox, memory=memory)
+    first = await agent.handle("u", "во сколько завтра этот созвон?", now=NOW)
+    assert first.status == "need_clarification" and not llm.requests
+    llm.script.append(
+        tool_call(
+            "get_events",
+            {"start_time": "2026-11-10T00:00:00+03:00", "end_time": "2026-11-11T00:00:00+03:00"},
+        )
+    )
+    second = await agent.handle("u", "ФИНАЛ Созвон", now=NOW)
+    assert second.status == "done" and [e.id for e in second.events] == [event.id]
+    assert "Длительность — 20 мин." in second.reply_text
+
+
+async def test_named_time_read_cannot_execute_a_model_proposed_mutation(calendar):
+    repo, toolbox, _ = calendar
+    event = await create_meeting(repo)
+    before = repo.writes
+    agent, _ = make_agent(toolbox, tool_call("delete_event", {"event_id": str(event.id)}))
+    result = await agent.handle("u", "Во сколько встреча «С Иваном»?", now=NOW)
+    assert result.status == "error" and repo.writes == before

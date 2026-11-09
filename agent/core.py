@@ -17,7 +17,12 @@ from openai.types.chat import ChatCompletionMessage
 
 from agent.cache import prompt_cache_session_id
 from agent.compact import CompactRequest, clarification_question, plan_request
-from agent.details import is_event_details_question, read_event_details
+from agent.details import (
+    is_event_details_question,
+    is_single_event_time_question,
+    read_event_details,
+    single_event_read_response,
+)
 from agent.dialogue import direct_reply, starts_new_request
 from agent.memory import ConversationMemory, HistoryMessage
 from agent.policy import asks_to_read, explicitly_requests_change, is_single_action_request
@@ -140,7 +145,7 @@ class Agent:
                 logger.info(
                     "agent_context profile=event_details model_calls=0 request_id=%s", request_id
                 )
-                response = await read_event_details(self._toolbox, user_id, history, now)
+                response = await read_event_details(self._toolbox, user_id, history, now, text)
             elif question:
                 logger.info(
                     "agent_context profile=clarification model_calls=0 request_id=%s", request_id
@@ -434,7 +439,7 @@ class Agent:
                         else _confirmed_response(confirmed, conflict_warnings)
                     )
                 if read_tools and not errors and draft is None:
-                    return _read_response(events, read_tools)
+                    return _read_response(events, read_tools, source_text or "")
                 if errors:
                     return _incomplete_response(events, confirmed, conflict_warnings, errors)
                 raise
@@ -446,7 +451,7 @@ class Agent:
                 if draft:
                     return _draft_response(draft)
                 if read_tools and not confirmed and draft is None:
-                    return _read_response(events, read_tools)
+                    return _read_response(events, read_tools, source_text or "")
                 if confirmed:
                     return _confirmed_response(confirmed, conflict_warnings)
                 if not reply:
@@ -529,7 +534,7 @@ class Agent:
                     and not explicitly_requests_change(source_text or "", name)
                 ):
                     return (
-                        _read_response(events, read_tools)
+                        _read_response(events, read_tools, source_text or "")
                         if read_tools
                         else AgentResponse(
                             status=AgentStatus.ERROR,
@@ -666,7 +671,7 @@ class Agent:
             ):
                 # Successful list/search results already contain every display fact.
                 # Only explicit write requests need another interpretation step.
-                return _read_response(events, read_tools)
+                return _read_response(events, read_tools, source_text or "")
 
         logger.warning("agent exceeded %d steps", self._max_steps)
         if errors:
@@ -919,9 +924,13 @@ def _confirmed_response(
     return response
 
 
-def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentResponse:
+def _read_response(
+    events: dict[str, Event], read_tools: set[str], query: str = ""
+) -> AgentResponse:
     """Render retrieved facts without letting the model rewrite dates or names."""
     items = list(events.values())
+    if is_single_event_time_question(query):
+        return single_event_read_response(items, query)
     search = "search_events" in read_tools
     if not items:
         reply = "Подходящих записей не найдено." if search else "За указанный период записей нет."

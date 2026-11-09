@@ -217,13 +217,15 @@ async def test_text_bulk_delete_replays_only_its_original_snapshot(
 
     monkeypatch.setattr(redis, "set", fail_first_receipt)
     first = await service.handle("777", "Удали все задачи", request_id=request_id)
-    assert first.status == "done" and first.draft is None
+    assert first.status == "needs_confirmation" and first.draft is not None
     assert lost_receipt
     added = await repo.create(EventCreate(user_id="777", type="task", name="Новое дело"))
     replay = await AgentService(agent, redis).handle(
         "777", "Удали все задачи", request_id=request_id
     )
-    assert replay.status == "done"
+    assert replay.status == "needs_confirmation" and replay.draft.id == first.draft.id
+    assert await pool.fetchval("SELECT status FROM events WHERE id=$1", old.id) == "active"
+    assert (await service.execute_draft("777", replay.draft)).status == "done"
     statuses = {
         row["id"]: row["status"] for row in await pool.fetch("SELECT id, status FROM events")
     }

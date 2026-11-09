@@ -14,7 +14,7 @@ from redis.exceptions import RedisError
 
 from agent.core import Agent
 from agent.dialogue import starts_new_request
-from common.schemas import AgentResponse, AgentStatus, DraftAction
+from common.schemas import DRAFT_TTL_SECONDS, AgentResponse, AgentStatus, DraftAction
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ class AgentService:
                         json.dumps(
                             result.draft.model_dump(mode="json"), sort_keys=True, ensure_ascii=False
                         ),
-                        ex=300,
+                        ex=DRAFT_TTL_SECONDS,
                     )
                     await self._redis.delete(f"agent:voice-review:{user_id}")
                 receipt_saved = False
@@ -178,9 +178,17 @@ class AgentService:
             if staged:
                 # The previous text request may have committed before its receipt
                 # was saved. Replay its exact snapshot instead of invoking the model.
-                return await self._agent.execute_draft(
-                    user_id, DraftAction.model_validate_json(staged)
-                )
+                staged_draft = DraftAction.model_validate_json(staged)
+                if staged_draft.tool in {"delete_event", "delete_events"}:
+                    issued = await self._redis.get(f"agent:pending:{user_id}")
+                    if issued and DraftAction.model_validate_json(issued).id != staged_draft.id:
+                        raise InvalidDraft
+                    return AgentResponse(
+                        status=AgentStatus.NEEDS_CONFIRMATION,
+                        reply_text=staged_draft.preview,
+                        draft=staged_draft,
+                    )
+                return await self._agent.execute_draft(user_id, staged_draft)
             review = bool(
                 confirm_changes
                 or edit_draft_id is not None
@@ -205,9 +213,25 @@ class AgentService:
                 # Persist only an unfinished voice dialogue; standalone failed voice
                 # requests must not make the next ordinary text require confirmation.
                 await self._redis.set(review_key, "1", ex=self._ttl)
-            if not review and result.status == AgentStatus.NEEDS_CONFIRMATION and result.draft:
-                # Bulk deletion and writes after lookup still validate a snapshot.
-                # Typed commands approve it immediately without an extra user step.
+            if (
+                result.status == AgentStatus.NEEDS_CONFIRMATION
+                and result.draft
+                and result.draft.tool in {"delete_event", "delete_events"}
+                and auto_key
+            ):
+                # Replaying a request after a lost preview receipt must show the
+                # same approval snapshot, not collect newly created records.
+                await self._redis.set(
+                    auto_key, result.draft.model_dump_json(), ex=DRAFT_TTL_SECONDS
+                )
+            if (
+                not review
+                and result.status == AgentStatus.NEEDS_CONFIRMATION
+                and result.draft
+                and result.draft.tool not in {"delete_event", "delete_events"}
+            ):
+                # Non-destructive typed changes after lookup may approve their
+                # snapshot immediately. Deletions always wait for explicit review.
                 if auto_key:
                     await self._redis.set(auto_key, result.draft.model_dump_json(), ex=self._ttl)
                 result = await self._agent.execute_draft(user_id, result.draft)

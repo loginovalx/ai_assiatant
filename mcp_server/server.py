@@ -22,6 +22,7 @@ from starlette.responses import JSONResponse
 
 from common.config import get_settings
 from common.db import create_pool
+from common.dialogue import is_person_appointment
 from common.embeddings import build_embedder
 from common.repository import EventRepository
 from common.schemas import (
@@ -40,6 +41,7 @@ from common.timeutils import (
     allows_default_duration,
     ensure_aware,
     mentions_duration,
+    mentions_start_time,
     mentions_time,
     named_weekday,
     resolve_weekday_mismatch,
@@ -134,7 +136,7 @@ async def create_event(
             description=(
                 "task — дело, которое нужно сделать (можно без времени); "
                 "reminder — напомнить в конкретный момент; "
-                "meeting — встреча или созвон с кем-то."
+                "meeting — встреча, созвон, занятие, урок или консультация с человеком."
             )
         ),
     ],
@@ -183,6 +185,23 @@ async def create_event(
             return EventWithConflicts(
                 **_fields(existing), conflicts=await repo.find_conflicts(existing)
             )
+    source_text = user_text if user_text else description
+    if user_text and is_person_appointment(user_text):
+        event_type = "meeting"
+    if event_type == "meeting" and source_text:
+        clock = mentions_start_time(source_text)
+        length = (
+            duration_minutes is not None
+            if user_text is None
+            else mentions_duration(user_text, start_at)
+            or (allows_default_duration(user_text) and duration_minutes == DEFAULT_MEETING_MINUTES)
+        )
+        if not clock and not length:
+            raise ToolError("Во сколько начнётся встреча и сколько она продлится?")
+        if not clock:
+            raise ToolError("В исходном запросе нет времени, только день. Спроси точное время.")
+        if not length:
+            raise ToolError("Сколько продлится встреча?")
     try:
         data = EventCreate(
             user_id=user_id,
@@ -199,7 +218,6 @@ async def create_event(
     # Время проверяем по дословной реплике пользователя (user_text), а не по description:
     # модель кладёт в description только суть, а время — в start_at. Без user_text
     # (HTTP API, старые вызовы) проверяем description как раньше.
-    source_text = user_text if user_text else description
     if source_text and not _has_explicit_weekday_or_date(source_text):
         if data.type == EventType.TASK and _WEEK_END_DEADLINE.search(source_text):
             raise ToolError(

@@ -3,6 +3,8 @@
 import re
 from uuid import UUID, uuid4
 
+from common.dialogue import asks_for_clock_time as asks_for_clock_time
+
 TIME_CHOICE_TTL_SECONDS = 300
 TIME_CHOICE_OPTIONS = (
     ("09:00", "0900"),
@@ -10,21 +12,6 @@ TIME_CHOICE_OPTIONS = (
     ("18:00", "1800"),
     ("Другое время", "manual"),
 )
-
-_CLOCK_QUESTION = re.compile(
-    r"\bво\s+сколько\b"
-    r"|\b(?:в|на)\s+какое\s+(?:точное\s+)?время\b"
-    r"|\bкакое\s+(?:точное\s+)?время\b"
-    r"|\b(?:назови|назовите|укажи|укажите|уточни|уточните)"
-    r"\s+(?:пожалуйста\s+)?(?:точное\s+)?время\b"
-    r"|\bдат[ау]\s+и\s+(?:точное\s+)?время\b",
-    re.IGNORECASE,
-)
-
-
-def asks_for_clock_time(text: str) -> bool:
-    """Whether a clarification asks for a clock time, rather than duration alone."""
-    return bool(_CLOCK_QUESTION.search(text))
 
 
 def time_choice_buttons(choice_id: UUID) -> list[list[dict[str, str]]]:

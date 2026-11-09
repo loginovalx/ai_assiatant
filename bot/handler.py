@@ -9,6 +9,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from redis.asyncio import Redis
 
 from agent.dialogue import starts_new_request
+from agent.policy import asks_to_read
 from bot.agent_client import AgentClient, AgentUnavailable
 from bot.asr import SpeechRecognitionError, SpeechRecognizer
 from bot.drafts import DraftStore
@@ -129,8 +130,19 @@ QUICK_ACTIONS = [
 
 
 def confirmation_buttons(
-    draft_id: UUID, *, can_change_time: bool = False
+    draft_id: UUID,
+    *,
+    can_change_time: bool = False,
+    destructive: bool = False,
+    saving: bool = False,
 ) -> list[list[dict[str, str]]]:
+    if destructive:
+        return [
+            [
+                {"type": "callback", "text": "Удалить", "payload": f"draft:confirm:{draft_id}"},
+                {"type": "callback", "text": "Нет", "payload": f"draft:cancel:{draft_id}"},
+            ]
+        ]
     buttons = [
         [{**button, "payload": f"{button['payload']}:{draft_id}"} for button in row]
         for row in CONFIRM_BUTTONS
@@ -139,6 +151,8 @@ def confirmation_buttons(
         buttons.append(
             [{"type": "callback", "text": "Другое время", "payload": f"draft:time:{draft_id}"}]
         )
+    if saving:
+        buttons[0][0]["text"] = "Сохранить"
     return buttons
 
 
@@ -269,7 +283,10 @@ class BotHandler:
         pending = None
         if result.status == "needs_confirmation" and result.draft:
             buttons = confirmation_buttons(
-                result.draft.id, can_change_time=can_change_draft_time(result.draft)
+                result.draft.id,
+                can_change_time=can_change_draft_time(result.draft),
+                destructive=result.draft.tool in {"delete_event", "delete_events"},
+                saving=result.draft.tool in {"create_event", "update_event"},
             )
         elif result.status == "need_clarification" and asks_for_clock_time(result.reply_text):
             pending = await self.drafts.load(user_id)
@@ -282,6 +299,8 @@ class BotHandler:
         # lock prevents callbacks from racing the state publication after send.
         if result.status == "needs_confirmation" and result.draft:
             await self.drafts.save(user_id, result.draft)
+        elif result.status == "error" and result.reply_text.startswith("Подтверждение устарело"):
+            await self.drafts.drop(user_id)
         if choice_id is not None:
             await self.time_choices.issue(
                 user_id, pending.id if pending is not None else None, choice_id=choice_id
@@ -380,7 +399,10 @@ class BotHandler:
                     await self.max_api.send(int(user), "Отменил действие.", to_user=True)
                     await self.max_api.answer_callback(callback_id, "Отменено")
                 elif action == "edit":
-                    await self.max_api.send(int(user), "Что поправить?", to_user=True)
+                    await self.max_api.send(
+                        int(user), "Что изменить: название, время или длительность?", to_user=True
+                    )
+                    await self.drafts.begin_edit(user_id, draft)
                     await self.max_api.answer_callback(callback_id)
                 elif action == "time":
                     if not can_change_draft_time(draft):
@@ -397,6 +419,7 @@ class BotHandler:
                         to_user=True,
                         buttons=time_choice_buttons(choice_id),
                     )
+                    await self.drafts.begin_edit(user_id, draft)
                     await self.max_api.answer_callback(callback_id)
                 elif action == "confirm":
                     result = await self.agent.confirm(user_id, draft)
@@ -408,6 +431,8 @@ class BotHandler:
                         callback_id,
                         "✅ Подтверждено"
                         if succeeded
+                        else "Черновик устарел. Отправьте запрос заново"
+                        if result.reply_text.startswith("Подтверждение устарело")
                         else "Не получилось выполнить. Черновик сохранён",
                     )
                 else:
@@ -656,7 +681,11 @@ class BotHandler:
 
             pending = await self.drafts.load(user_id)
             keep_phrase = pending is not None and is_explicit_keep_confirmation(text)
-            if pending and starts_new_request(text):
+            if (
+                pending
+                and starts_new_request(text)
+                and (asks_to_read(text) or not await self.drafts.is_editing(user_id, pending))
+            ):
                 await self.agent.reset(user_id)
                 await self.drafts.drop(user_id)
                 pending = None

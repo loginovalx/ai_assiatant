@@ -514,7 +514,9 @@ async def test_complete_and_delete_event(make_agent, tz, pool):
     assert await pool.fetchval("SELECT status FROM events WHERE id = $1", UUID(event_id)) == "done"
 
     agent3, _ = make_agent(tool_call("delete_event", {"event_id": event_id}), text("Удалил."))
-    await agent3.handle(USER, "Удали эту задачу")
+    pending = await agent3.handle(USER, "Удали эту задачу")
+    assert pending.status == AgentStatus.NEEDS_CONFIRMATION
+    await agent3.execute_draft(USER, pending.draft)
     assert (
         await pool.fetchval("SELECT status FROM events WHERE id = $1", UUID(event_id))
         == "cancelled"

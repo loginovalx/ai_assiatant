@@ -182,7 +182,7 @@ async def test_edit_button_asks_what_to_change_and_keeps_draft(handler):
 
     await bot.handle_update(callback("draft:edit"))
 
-    assert "Что поправить" in max_api.sent[-1]["text"]
+    assert "Что изменить" in max_api.sent[-1]["text"]
     assert await bot.drafts.load(str(USER)) is not None  # ждём правку
 
 
@@ -312,7 +312,7 @@ async def test_free_text_while_draft_pending_goes_to_agent_as_edit(handler):
 
     assert agent.asked[0]["text"] == "давай в 12:30"
     assert agent.confirmed == []
-    assert max_api.sent[-1]["buttons"] == confirmation_buttons(DRAFT.id)
+    assert max_api.sent[-1]["buttons"] == confirmation_buttons(DRAFT.id, saving=True)
 
 
 async def test_quick_action_runs_like_a_typed_question(handler):

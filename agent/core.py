@@ -21,6 +21,7 @@ from agent.policy import asks_to_read, explicitly_requests_change, is_single_act
 from agent.prompt import build_system_prompt
 from agent.routing import ModelRoute, completion_problem, select_model
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
+from common.dialogue import clarification_text, is_clarification_question
 from common.display import format_calendar_time
 from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
 from common.usage import record_usage
@@ -205,8 +206,13 @@ class Agent:
                         raise ValueError("Foreign conflict event")
                     conflict_warnings[str(other.id)] = other
             summary = _confirmed_response(confirmed, conflict_warnings)
+            reply = (
+                f"Удалено записей: {len(confirmed)}."
+                if draft.tool == "delete_events"
+                else "Готово.\n" + summary.reply_text
+            )
             response = AgentResponse(
-                reply_text="Готово.\n" + summary.reply_text,
+                reply_text=reply,
                 events=summary.events,
                 status=AgentStatus.DONE,
             )
@@ -346,7 +352,13 @@ class Agent:
                         else AgentResponse(reply_text=FALLBACK_ERROR, status=AgentStatus.ERROR)
                     )
                 return AgentResponse(
-                    reply_text=reply, status=AgentStatus.DONE, events=list(events.values())
+                    reply_text=clarification_text(reply, source_text or ""),
+                    status=(
+                        AgentStatus.NEED_CLARIFICATION
+                        if is_clarification_question(reply)
+                        else AgentStatus.DONE
+                    ),
+                    events=list(events.values()),
                 )
 
             # content: "" вместо отсутствующего поля — не все OpenAI-совместимые API принимают null.
@@ -395,6 +407,7 @@ class Agent:
                     question = _safe_model_reply(
                         str((args or {}).get("question") or "").strip() or "Уточните, пожалуйста."
                     )
+                    question = clarification_text(question, source_text or "")
                     return AgentResponse(
                         reply_text=question,
                         status=AgentStatus.NEED_CLARIFICATION,
@@ -421,7 +434,7 @@ class Agent:
                 # Retrieved text can influence the model. It never grants write
                 # permission, including within a batch of tool calls.
                 preview = (
-                    confirm_changes or bool(read_tools) or name == "delete_events"
+                    confirm_changes or bool(read_tools) or name in {"delete_event", "delete_events"}
                 ) and name in MUTATING_TOOLS
                 if preview and draft_fingerprint is not None and fingerprint != draft_fingerprint:
                     return AgentResponse(
@@ -564,7 +577,16 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
     """
     if name == "delete_events":
         count = result.payload["count"]
-        return f"Удалить записи: {count} шт.?\nПодтвердите действие или нажмите «Отмена»."
+        noun = (
+            "записей"
+            if 11 <= count % 100 <= 14
+            else "запись"
+            if count % 10 == 1
+            else "записи"
+            if count % 10 in {2, 3, 4}
+            else "записей"
+        )
+        return f"Вы уверены, что хотите удалить {count} {noun}?\nНажмите «Удалить» или «Нет»."
     verbs = {
         "create_event": "Создать",
         "update_event": "Изменить",
@@ -576,13 +598,31 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
         event = Event.model_validate(raw)
         if event.user_id != user_id:
             raise ValueError("Foreign preview event")
-        title = json.dumps(event.name, ensure_ascii=False)
+        title = "«" + json.dumps(event.name, ensure_ascii=False)[1:-1] + "»"
         kind = {"task": "задачу", "reminder": "напоминание", "meeting": "встречу"}[event.type]
-        lines.append(f"{verbs[name]} {kind}: {title}, {_when(event)}.")
-        if name in {"create_event", "update_event"} and (
-            event.description or "description" in arguments
+        if name == "delete_event":
+            lines.extend(["Вы уверены, что хотите удалить запись?", title, _when(event)])
+        else:
+            lines.extend([f"{verbs[name]} {kind} {title}?", _when(event)])
+        if event.duration_minutes is not None:
+            lines.append(f"Длительность: {event.duration_minutes} мин.")
+        source = arguments.get("user_text") or ""
+
+        def normalized(value):
+            return re.findall(r"\w+", value.casefold())
+
+        duplicate_description = bool(event.description) and (
+            normalized(event.description) == normalized(event.name)
+            or (bool(source) and normalized(event.description) == normalized(source))
+        )
+        if (
+            name in {"create_event", "update_event"}
+            and event.description
+            and not duplicate_description
         ):
             lines.append(f"Описание: {json.dumps(event.description, ensure_ascii=False)}")
+        elif name == "update_event" and "description" in arguments and not event.description:
+            lines.append("Описание будет удалено.")
         for raw_conflict in raw.get("conflicts") or []:
             conflict = Event.model_validate(raw_conflict)
             if conflict.user_id != user_id:
@@ -592,7 +632,14 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
             )
     if not lines:
         raise ValueError("Missing preview facts")
-    return "\n".join([*lines, "Подтвердите действие или нажмите «Исправить» / «Отмена»."])
+    footer = (
+        "Нажмите «Удалить» или «Нет»."
+        if name == "delete_event"
+        else "Подтвердите действие."
+        if name == "complete_event"
+        else "Подтвердите кнопкой «Сохранить»."
+    )
+    return "\n".join([*lines, footer])
 
 
 def _user_source(history: list[HistoryMessage], text: str) -> str:

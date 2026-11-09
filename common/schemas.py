@@ -179,6 +179,9 @@ class DraftAction(BaseModel):
     status: str = "pending_confirmation"
 
 
+DRAFT_TTL_SECONDS = 3600
+
+
 class AgentRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=64)
     text: str = Field(min_length=1, max_length=4000)

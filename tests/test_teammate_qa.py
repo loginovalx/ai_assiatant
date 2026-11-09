@@ -116,8 +116,11 @@ async def test_text_delete_today_preserves_other_days_types_and_users(
             await repo.create(EventCreate(user_id=user, type=kind, name="Проверка", start_at=date))
         )
     agent, _ = make_agent(tool_call("delete_events", {"event_types": ["reminder"]}))
-    response = await AgentService(agent, redis).handle("u", "Удали все напоминания сегодня")
-    assert response.status == "done"
+    service = AgentService(agent, redis)
+    response = await service.handle("u", "Удали все напоминания сегодня")
+    assert response.status == "needs_confirmation"
+    assert await pool.fetchval("SELECT status FROM events WHERE id=$1", rows[0].id) == "active"
+    assert (await service.execute_draft("u", response.draft)).status == "done"
     statuses = {
         row["id"]: row["status"] for row in await pool.fetch("SELECT id,status FROM events")
     }

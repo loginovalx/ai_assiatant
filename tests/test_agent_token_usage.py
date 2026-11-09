@@ -39,9 +39,13 @@ async def test_single_mutation_needs_one_generation(tool, request_text, status):
     result.events[0]["status"] = status
     agent, llm, toolbox = make_agent([tool_call(tool, {"name": "Test"})], result)
     response = await agent.handle("u", request_text)
+    if tool == "delete_event":
+        assert response.status == "needs_confirmation" and response.events == []
+        response = await agent.execute_draft("u", response.draft)
     assert response.status == "done"
     assert response.events[0].status == status
-    assert len(llm.requests) == toolbox.calls == 1
+    assert len(llm.requests) == 1
+    assert toolbox.calls == (2 if tool == "delete_event" else 1)
     assert "Test" in response.reply_text
 
 

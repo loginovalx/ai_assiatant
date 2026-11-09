@@ -22,17 +22,20 @@ def ensure_aware(dt: datetime, tz: ZoneInfo) -> datetime:
     return dt.replace(tzinfo=tz) if dt.tzinfo is None else dt
 
 
+_DURATION_AMOUNT = (
+    r"(?:\d+(?:[,.]\d+)?|один|одну|два|две|три|четыре|пять|шесть|семь|восемь|"
+    r"девять|десять|одиннадцать|двенадцать|пятнадцать|двадцать|тридцать|сорок|"
+    r"пятьдесят|шестьдесят|полтора|полторы)"
+)
+_DURATION_LENGTH = rf"(?:{_DURATION_AMOUNT}\s+(?:час\w*|мин\w*)|час(?:а)?|полчаса|четверть\s+часа)"
+
+
 def mentions_duration(text: str, start_at: datetime | None = None) -> bool:
     """Recognize length without interpreting 'в три часа' as duration."""
-    amount = (
-        r"(?:\d+(?:[,.]\d+)?|один|одну|два|две|три|четыре|пять|шесть|семь|восемь|"
-        r"девять|десять|одиннадцать|двенадцать|пятнадцать|двадцать|тридцать|сорок|"
-        r"пятьдесят|шестьдесят|полтора|полторы)"
-    )
-    length = rf"(?:{amount}\s+(?:час\w*|мин\w*)|час(?:а)?|полчаса|четверть\s+часа)"
+    length = _DURATION_LENGTH
     if re.search(
         rf"\b(?:на|длится|продлится|длительность|продолжительность)\s+(?:около\s+)?{length}\b|"
-        rf"(?:^|\n)\s*{length}\s*[.!]?\s*(?:$|\n)",
+        rf"(?:^|[\n,;])\s*{length}\s*[.!]?\s*(?:$|\n)",
         text,
         re.I,
     ):
@@ -54,6 +57,23 @@ def allows_default_duration(text: str) -> bool:
             re.I,
         )
     )
+
+
+def mentions_start_time(text: str) -> bool:
+    # An explicit length such as "на 30 минут" cannot supply the missing clock.
+    without_length = re.sub(
+        rf"\b(?:на|длится|продлится|длительность|продолжительность)\s+(?:около\s+)?{_DURATION_LENGTH}\b",
+        "",
+        text,
+        flags=re.I,
+    )
+    without_length = re.sub(
+        rf"(?:^|[\n,;])\s*{_DURATION_AMOUNT}\s+мин\w*\s*[.!]?\s*(?=$|\n)",
+        "",
+        without_length,
+        flags=re.I,
+    )
+    return mentions_time(without_length)
 
 
 def mentions_time(text: str) -> bool:

@@ -32,13 +32,20 @@ from common.dialogue import (
 )
 from common.display import MONTHS_RU_GENITIVE, format_calendar_time
 from common.schemas import MAX_DURATION_MINUTES, AgentResponse, AgentStatus, DraftAction, Event
-from common.timeutils import ensure_aware
+from common.timeutils import ensure_aware, reschedule_clock
 from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
 
 FALLBACK_ERROR = "Не получилось обработать запрос. Попробуйте ещё раз чуть позже."
 TOO_MANY_STEPS = "Запутался в этом запросе. Попробуйте сформулировать проще."
+_UNVERIFIED_CHANGE = re.compile(
+    r"(?:^|[.!?\n]\s*)(?:готово[,!:]?\s+)?(?:я\s+)?"
+    r"(?:сохран[её]но|сохранил[аи]?|создано|создал[аи]?|"
+    r"записал[аи]?|перенесено|перен[её]с(?:ла|ли)?|изменено|изменил[аи]?|"
+    r"отменено|отменил[аи]?|удалено|удалил[аи]?|выполнено)\b",
+    re.I,
+)
 
 
 class Agent:
@@ -333,6 +340,17 @@ class Agent:
         route: ModelRoute | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
+        source = source_text or ""
+        clock_only = reschedule_clock(source) is not None
+        rescheduling = explicitly_requests_change(source, "update_event")
+        blocked_tools = set()
+        if clock_only:
+            blocked_tools = MUTATING_TOOLS - {"update_event"}
+        elif rescheduling and not explicitly_requests_change(source, "delete_event"):
+            blocked_tools = {"delete_event", "delete_events"}
+        if blocked_tools:
+            tools = [tool for tool in tools if tool["function"]["name"] not in blocked_tools]
+        retried_unverified_change = False
         events: dict[str, Event] = {}
         mutations: dict[str, ToolResult] = {}
         confirmed: dict[str, Event] = {}
@@ -381,6 +399,22 @@ class Agent:
                     return _read_response(events, read_tools)
                 if confirmed:
                     return _confirmed_response(confirmed, conflict_warnings)
+                is_question = is_clarification_question(reply)
+                if (confirm_changes or rescheduling) and _UNVERIFIED_CHANGE.search(reply):
+                    if retried_unverified_change or round_number + 1 == self._max_steps:
+                        return AgentResponse(
+                            reply_text="Не удалось выполнить действие. Календарь не изменён.",
+                            status=AgentStatus.ERROR,
+                        )
+                    retried_unverified_change = True
+                    messages[0] = {
+                        **messages[0],
+                        "content": messages[0]["content"]
+                        + "\nДля изменения календаря вызови нужный инструмент. "
+                        "Если не хватает данных, задай уточняющий вопрос. "
+                        "Не сообщай, что действие выполнено, без результата инструмента.",
+                    }
+                    continue
                 if not reply:
                     return (
                         _confirmed_response(confirmed, conflict_warnings)
@@ -389,11 +423,7 @@ class Agent:
                     )
                 return AgentResponse(
                     reply_text=clarification_text(reply, source_text or ""),
-                    status=(
-                        AgentStatus.NEED_CLARIFICATION
-                        if is_clarification_question(reply)
-                        else AgentStatus.DONE
-                    ),
+                    status=(AgentStatus.NEED_CLARIFICATION if is_question else AgentStatus.DONE),
                     events=list(events.values()),
                 )
 
@@ -403,6 +433,15 @@ class Agent:
             )
             for call in message.tool_calls:
                 name = call.function.name
+                if name in blocked_tools:
+                    rejected = ToolResult(
+                        ok=False,
+                        payload="Пользователь попросил изменить запись. Вызови update_event.",
+                    )
+                    messages.append(
+                        {"role": "tool", "tool_call_id": call.id, "content": rejected.for_llm()}
+                    )
+                    continue
                 if name not in ALLOWED_TOOLS:
                     return AgentResponse(
                         reply_text="Этот инструмент недоступен. Я работаю только с календарём.",
@@ -531,6 +570,12 @@ class Agent:
                         if name == "delete_events"
                         else args
                     )
+                    if name == "update_event" and clock_only:
+                        # Confirm the previewed date even if the record is moved again meanwhile.
+                        draft_args = {
+                            "event_id": args["event_id"],
+                            "start_at": result.events[0]["start_at"],
+                        }
                     draft = DraftAction(
                         tool=name,
                         arguments=draft_args,

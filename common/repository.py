@@ -187,7 +187,7 @@ class EventRepository:
         перенос времени и длительности его не трогает.
         """
         current = await self.get(user_id, event_id)
-        if current is None:
+        if current is None or current.status == EventStatus.CANCELLED:
             return None
 
         new_name = name if name is not None else current.name
@@ -224,7 +224,7 @@ class EventRepository:
                     THEN NULL ELSE notification_claimed_at END,
                 notification_claim_token = CASE WHEN start_at IS DISTINCT FROM $6
                     THEN NULL ELSE notification_claim_token END
-            WHERE id = $1 AND user_id = $2
+            WHERE id = $1 AND user_id = $2 AND status <> 'cancelled'
             RETURNING {_COLUMNS}
             """,
             event_id,
@@ -236,7 +236,7 @@ class EventRepository:
             new_duration,
             embedding,
         )
-        return self._to_event(row)
+        return self._to_event(row) if row is not None else None
 
     async def set_status(self, user_id: str, event_id: UUID, status: EventStatus) -> Event | None:
         """Отметить выполненной (done) или удалить мягко (cancelled — пропадает из выдач)."""

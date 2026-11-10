@@ -303,6 +303,95 @@ async def test_voice_edit_replaces_draft_and_commits_changed_values(session, red
     assert event.start_at.hour == 13 and event.duration_minutes == 45
 
 
+async def test_voice_save_claim_is_retried_as_a_draft(session, tz):
+    build, repo = session
+    when = (datetime.now(tz) + timedelta(days=1)).replace(
+        hour=19, minute=0, second=0, microsecond=0
+    )
+    _, api, message, click, _, _ = build(
+        text("Сохранено: забрать посылку, завтра в 19:00."),
+        tool_call(
+            "create_event",
+            {"event_type": "reminder", "name": "Забрать посылку", "start_at": when.isoformat()},
+        ),
+        tool_call(
+            "create_event",
+            {
+                "event_type": "reminder",
+                "name": "Забрать посылку",
+                "start_at": when.replace(minute=30).isoformat(),
+            },
+        ),
+    )
+    await message("Напомни завтра в 19:00 забрать посылку", voice=True)
+    assert repo.writes == 0
+    assert {b["text"] for b in all_buttons(api.sent[-1])} >= {"Сохранить", "Исправить", "Отмена"}
+    assert "19:00" in api.sent[-1]["text"]
+    await message("измени на 19:30")
+    assert repo.writes == 0 and "19:30" in api.sent[-1]["text"]
+    await click("Сохранить")
+    assert repo.writes == 1
+    assert next(iter(repo.rows.values())).start_at == when.replace(minute=30)
+
+
+async def test_unverified_voice_save_never_claims_success(session):
+    build, repo = session
+    claim = text("Готово! Сохранено: забрать посылку.")
+    _, api, message, _, _, _ = build(claim, claim)
+    await message("Напомни завтра в 19:00 забрать посылку", voice=True)
+    assert repo.writes == 0
+    assert "Календарь не изменён" in api.sent[-1]["text"]
+
+
+async def test_clock_only_edit_rejects_delete_and_preserves_date_and_status(session, tz):
+    build, repo = session
+    when = (datetime.now(tz) + timedelta(days=1)).replace(
+        hour=19, minute=0, second=0, microsecond=0
+    )
+    event = await repo.create(
+        EventCreate(user_id="777", type="reminder", name="Забрать посылку", start_at=when)
+    )
+    _, api, message, _, model, _ = build(
+        tool_call("delete_event", {"event_id": str(event.id)}),
+        tool_call(
+            "update_event",
+            {
+                "event_id": str(event.id),
+                "start_at": (when + timedelta(days=1)).isoformat(),
+                "name": "Другая запись",
+            },
+        ),
+    )
+    await message("измени на 19:30")
+    saved = repo.rows[event.id]
+    assert repo.writes == 2
+    assert saved.start_at == when.replace(minute=30)
+    assert saved.status == EventStatus.ACTIVE and saved.name == event.name
+    assert "19:30" in api.sent[-1]["text"] and "Отменено" not in api.sent[-1]["text"]
+    assert {tool["function"]["name"] for tool in model.requests[0]["tools"]} == {
+        "update_event",
+        "ask_user",
+    }
+
+
+async def test_clock_only_voice_confirmation_keeps_previewed_date(session, tz):
+    build, repo = session
+    when = (datetime.now(tz) + timedelta(days=1)).replace(
+        hour=19, minute=0, second=0, microsecond=0
+    )
+    event = await repo.create(
+        EventCreate(user_id="777", type="reminder", name="Забрать посылку", start_at=when)
+    )
+    _, api, message, click, _, _ = build(
+        tool_call("update_event", {"event_id": str(event.id), "start_at": when.isoformat()})
+    )
+    await message("Измени на 19:30", voice=True)
+    assert repo.rows[event.id].start_at == when and "19:30" in api.sent[-1]["text"]
+    await repo.update("777", event.id, start_at=when + timedelta(days=1))
+    await click("Сохранить")
+    assert repo.rows[event.id].start_at == when.replace(minute=30)
+
+
 async def test_voice_cannot_invent_hour_duration_for_lesson(session, tz):
     build, repo = session
     _, api, message, click, _, _ = build(
@@ -699,3 +788,28 @@ async def test_past_meeting_returns_clear_time_question(session, request_clock, 
         "Это время уже прошло. Во сколько запланировать событие? Можно указать другую дату."
     )
     assert "Другое время" in [b["text"] for b in all_buttons(api.sent[-1])]
+
+
+async def test_reschedule_rejects_cancelled_record(session, tz):
+    build, repo = session
+    when = (datetime.now(tz) + timedelta(days=1)).replace(
+        hour=19, minute=0, second=0, microsecond=0
+    )
+    event = await repo.create(
+        EventCreate(user_id="777", type="reminder", name="Забрать посылку", start_at=when)
+    )
+    await repo.set_status("777", event.id, EventStatus.CANCELLED)
+    _, api, message, _, _, _ = build(
+        tool_call(
+            "update_event",
+            {
+                "event_id": str(event.id),
+                "start_at": when.replace(minute=30).isoformat(),
+            },
+        ),
+        text("Изменено."),
+    )
+    await message("измени на 19:30")
+    assert repo.writes == 2
+    assert repo.rows[event.id].start_at == when
+    assert api.sent[-1]["text"].startswith("Эта запись уже отменена.")

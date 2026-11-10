@@ -2,6 +2,54 @@ import re
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+from common.reminder_series import CLOCK_HOUR_WORDS, parse_clock
+
+_HOUR = rf"(?:\d{{1,2}}|{'|'.join(reversed(CLOCK_HOUR_WORDS))})"
+_DAY_PART = r"(?:утра|дня|вечера|ночи)"
+_EXACT_CLOCK = re.compile(
+    rf"\b(?:\d{{1,2}}:\d{{2}}(?:\s+{_DAY_PART})?|"
+    rf"в\s+\d{{1,2}}\s+\d{{2}}(?:\s+{_DAY_PART})?|"
+    rf"(?:в|на)\s+{_HOUR}(?:\s+час(?:а|ов)?)?\s+"
+    rf"(?:ноль\s+ноль(?:\s+{_DAY_PART})?|{_DAY_PART}))\b",
+    re.I,
+)
+_BARE_HOUR = re.compile(
+    rf"\bв\s+({_HOUR})(?:\s+час(?:а|ов)?)?\b(?![:.\d]|\s+(?:утра|дня|вечера|ночи|\d|минут))",
+    re.I,
+)
+
+
+def requested_clock(source: str) -> time | None:
+    """Use the latest unambiguous clock without guessing the start of a range."""
+    for line in reversed(source.splitlines()):
+        line = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", line)
+        matches = list(_EXACT_CLOCK.finditer(line))
+        if not matches:
+            continue
+        match = matches[0]
+        if len(matches) != 1 or re.search(
+            r"\b(?:с|до|после|через)\s*$", line[: match.start()], re.I
+        ):
+            return None
+        value = re.sub(r"^(?:в|на)\s+", "", match[0], flags=re.I)
+        value = re.sub(rf"^({_HOUR})\s+час(?:а|ов)?(?=\s)", r"\1", value, flags=re.I)
+        value = re.sub(r"\s+ноль\s+ноль\b", ":00", value, flags=re.I)
+        return parse_clock(value)
+    return None
+
+
+def ambiguous_hour(source: str) -> int | None:
+    """Return an isolated hour that could mean morning or afternoon."""
+    if requested_clock(source) is not None:
+        return None
+    source = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", source)
+    matches = list(_BARE_HOUR.finditer(source))
+    if len(matches) != 1:
+        return None
+    clock = parse_clock(matches[0][1])
+    return clock.hour if clock is not None and 1 <= clock.hour <= 11 else None
+
+
 WEEKDAYS_RU = (
     "понедельник",
     "вторник",
@@ -112,7 +160,7 @@ def mentions_start_time(text: str) -> bool:
         without_length,
         flags=re.I,
     )
-    return mentions_time(without_length)
+    return requested_clock(without_length) is not None or mentions_time(without_length)
 
 
 def mentions_time(text: str) -> bool:

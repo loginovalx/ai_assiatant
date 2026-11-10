@@ -47,6 +47,7 @@ from common.timeutils import (
     mentions_time,
     mentions_week_range,
     named_weekday,
+    requested_clock,
     reschedule_clock,
     resolve_reschedule_day,
     resolve_weekday_mismatch,
@@ -178,6 +179,15 @@ async def create_event(
     source_text = user_text if user_text else description
     if user_text and is_person_appointment(user_text):
         event_type = "meeting"
+    if (
+        event_type == "meeting"
+        and user_text
+        and start_at is not None
+        and (clock := requested_clock(user_text)) is not None
+    ):
+        tz = get_settings().tz
+        local = ensure_aware(start_at, tz).astimezone(tz)
+        start_at = datetime.combine(local.date(), clock, tz)
     if event_type == "meeting" and user_text is not None and not has_meeting_day(user_text):
         raise ToolError(MEETING_DAY_QUESTION)
     if event_type == "meeting" and source_text:

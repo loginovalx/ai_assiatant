@@ -22,6 +22,7 @@ from bot.time_choices import (
     TimeChoiceStore,
     asks_for_clock_time,
     choice_kind,
+    clock_alternatives_kind,
     is_explicit_keep_confirmation,
     parse_time_choice_payload,
     time_choice_buttons,
@@ -298,7 +299,7 @@ class BotHandler:
                 week = " на следующей неделе" if "следующей неделе" in reply_text.casefold() else ""
                 reply_text = f"На какой день{week} запланировать? Выбери день или напиши дату."
             elif asks_for_clock_time(reply_text):
-                kind = "time"
+                kind = clock_alternatives_kind(reply_text) or "time"
             elif asks_for_duration(reply_text):
                 kind = "duration"
             if kind:

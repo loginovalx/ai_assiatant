@@ -23,7 +23,7 @@ from bot.state import StateStore
 from common.dialogue import is_person_appointment
 from common.repository import EventRepository
 from common.schemas import Event, EventCreate, EventStatus
-from common.timeutils import mentions_start_time
+from common.timeutils import mentions_start_time, requested_clock
 from mcp_server import server as calendar
 from tests.scripted_llm import ScriptedLLM, text, tool_call
 from tests.test_time_choice_buttons import FakeMax, all_buttons, callback, text_message
@@ -765,6 +765,84 @@ async def test_meeting_with_clock_and_duration_still_requires_user_day(session, 
     assert repo.writes == 0
     assert "На какой день" in api.sent[-1]["text"]
     assert "Пн" in [b["text"] for b in all_buttons(api.sent[-1])]
+
+
+async def test_voice_meeting_keeps_explicit_clock_when_agent_asks_again(session):
+    build, _ = session
+    _, api, message, _, _, _ = build(
+        tool_call("ask_user", {"question": "Во сколько запланировать встречу?"}),
+    )
+    await message("Назначь встречу завтра в 5:00", voice=True)
+    assert "Сколько продлится встреча?" == api.sent[-1]["text"]
+    assert "30 минут" in [b["text"] for b in all_buttons(api.sent[-1])]
+
+
+async def test_voice_meeting_asks_only_about_morning_or_evening(session, tz):
+    build, repo = session
+    proposed = (datetime.now(tz) + timedelta(days=1)).replace(
+        hour=5, minute=0, second=0, microsecond=0
+    )
+    _, api, message, click, _, _ = build(
+        tool_call("ask_user", {"question": "Во сколько запланировать встречу?"}),
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча",
+                "start_at": proposed.isoformat(),
+                "duration_minutes": 30,
+            },
+        ),
+    )
+    await message("Назначь встречу завтра в пять часов на полчаса", voice=True)
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == ["05:00", "17:00"]
+    await click("17:00")
+    assert "17:00" in api.sent[-1]["text"]
+    assert repo.writes == 0
+    await click("Сохранить")
+    assert [event.start_at for event in repo.rows.values()] == [proposed.replace(hour=17)]
+
+
+@pytest.mark.parametrize("clock", ["5:00", "пять утра", "пять ноль ноль"])
+async def test_voice_meeting_uses_spoken_clock_even_if_model_proposes_wrong_hour(
+    session, tz, clock
+):
+    build, repo = session
+    tomorrow = (datetime.now(tz) + timedelta(days=1)).replace(
+        hour=17, minute=0, second=0, microsecond=0
+    )
+    _, api, message, click, _, _ = build(
+        tool_call("ask_user", {"question": "Во сколько запланировать встречу?"}),
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча",
+                "start_at": tomorrow.isoformat(),
+                "duration_minutes": 30,
+            },
+        ),
+    )
+    await message(f"Назначь встречу завтра в {clock} на полчаса", voice=True)
+    assert "05:00" in api.sent[-1]["text"]
+    assert "17:00" not in api.sent[-1]["text"]
+    await click("Сохранить")
+    assert [event.start_at for event in repo.rows.values()] == [tomorrow.replace(hour=5)]
+
+
+@pytest.mark.parametrize("phrase", ["на 05.12", "с 05:00 до 06:00", "в 05:00 или 17:00"])
+def test_date_or_multiple_clocks_do_not_override_the_model_time(phrase):
+    assert requested_clock(f"Назначь встречу {phrase}") is None
+
+
+async def test_voice_meeting_does_not_loop_if_model_repeats_the_same_question(session):
+    build, repo = session
+    question = tool_call("ask_user", {"question": "Во сколько запланировать встречу?"})
+    _, api, message, _, _, _ = build(question, question)
+    await message("Назначь встречу завтра в 05:00 на полчаса", voice=True)
+    assert "Распознал время 05:00" in api.sent[-1]["text"]
+    assert not all_buttons(api.sent[-1])
+    assert repo.writes == 0
 
 
 async def test_past_meeting_returns_clear_time_question(session, request_clock, tz):

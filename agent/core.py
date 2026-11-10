@@ -28,6 +28,7 @@ from common.dialogue import (
     asks_for_day,
     asks_for_duration,
     clarification_text,
+    is_appointment_request,
     is_clarification_question,
 )
 from common.display import (
@@ -37,7 +38,7 @@ from common.display import (
     format_calendar_time,
 )
 from common.schemas import MAX_DURATION_MINUTES, AgentResponse, AgentStatus, DraftAction, Event
-from common.timeutils import ensure_aware, reschedule_clock
+from common.timeutils import ensure_aware, requested_clock, reschedule_clock
 from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,7 @@ class Agent:
                 source_text=source_text,
                 date_reference=now.isoformat(),
                 deletion_period=_deletion_period(source_text, now),
+                editing_draft=trusted_edit_source is not None,
                 route=route,
             )
         except Exception:  # граница сервиса: бот должен получить ответ, а не 500
@@ -371,6 +373,7 @@ class Agent:
         source_text: str | None = None,
         date_reference: str | None = None,
         deletion_period: tuple[datetime, datetime] | None = None,
+        editing_draft: bool = False,
         route: ModelRoute | None = None,
     ) -> AgentResponse:
         tools = await self._toolbox.openai_tools()
@@ -385,6 +388,12 @@ class Agent:
         if blocked_tools:
             tools = [tool for tool in tools if tool["function"]["name"] not in blocked_tools]
         retried_unverified_change = False
+        retried_known_clock = False
+        exact_clock = (
+            requested_clock(source)
+            if confirm_changes and not editing_draft and is_appointment_request(source)
+            else None
+        )
         events: dict[str, Event] = {}
         mutations: dict[str, ToolResult] = {}
         confirmed: dict[str, Event] = {}
@@ -422,6 +431,35 @@ class Agent:
                 if errors:
                     return _incomplete_response(events, confirmed, conflict_warnings, errors)
                 raise
+
+            if exact_clock is not None and not mutation_attempted and not (draft or read_tools):
+                question = message.content or ""
+                if message.tool_calls:
+                    question = ""
+                    if len(message.tool_calls) == 1:
+                        call = message.tool_calls[0].function
+                        if call.name == "ask_user":
+                            question = str((_parse_args(call.arguments) or {}).get("question", ""))
+                question = clarification_text(question, source)
+                if (
+                    asks_for_clock_time(question)
+                    and not asks_for_day(question)
+                    and "уже прошло" not in question.casefold()
+                ):
+                    if retried_known_clock or round_number + 1 == self._max_steps:
+                        return AgentResponse(
+                            reply_text=f"Распознал время {exact_clock:%H:%M}, но не смог "
+                            "подготовить запись. Попробуй повторить команду целиком.",
+                            status=AgentStatus.ERROR,
+                        )
+                    retried_known_clock = True
+                    messages[0] = {
+                        **messages[0],
+                        "content": messages[0]["content"]
+                        + f"\nПользователь уже указал время {exact_clock:%H:%M}. "
+                        "Используй его и уточни только действительно недостающие данные.",
+                    }
+                    continue
 
             if not message.tool_calls:
                 if errors:

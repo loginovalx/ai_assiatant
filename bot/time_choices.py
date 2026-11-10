@@ -49,6 +49,20 @@ CHOICE_REPLIES = {
     "120m": "На 120 минут",
 }
 
+for _hour in range(1, 12):
+    _choices = tuple((f"{h:02}:00", f"hour{h:02}") for h in (_hour, _hour + 12))
+    CHOICE_OPTIONS[f"hour{_hour:02}"] = _choices
+    CHOICE_REPLIES.update({value: f"В {label}" for label, value in _choices})
+
+
+def clock_alternatives_kind(question: str) -> str | None:
+    match = re.fullmatch(r"Во сколько запланировать: в (\d{2}):00 или в (\d{2}):00\?", question)
+    if match:
+        first, second = map(int, match.groups())
+        if 1 <= first <= 11 and second == first + 12:
+            return f"hour{first:02}"
+    return None
+
 
 def choice_kind(selection: str) -> str | None:
     return next(
@@ -72,6 +86,8 @@ def time_choice_buttons(choice_id: UUID, kind: str = "time") -> list[list[dict[s
     ]
     if kind == "day":
         return [options[:4], options[4:7], options[7:]]
+    if len(options) <= 3:
+        return [options]
     return [options[:3], options[3:]]
 
 

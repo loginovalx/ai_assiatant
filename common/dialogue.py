@@ -4,11 +4,13 @@ import re
 
 from common.timeutils import (
     allows_default_duration,
+    ambiguous_hour,
     has_explicit_weekday_or_date,
     has_meeting_day,
     mentions_duration,
     mentions_start_time,
     mentions_week_range,
+    requested_clock,
 )
 
 MEETING_DAY_QUESTION = "На какой день запланировать встречу?"
@@ -77,8 +79,14 @@ def is_person_appointment(text: str) -> bool:
     )
 
 
+def is_appointment_request(text: str) -> bool:
+    return bool(re.search(rf"\b{_APPOINTMENT_WORD}\b", _appointment_text(text), re.I))
+
+
 def clarification_text(question: str, source: str) -> str:
     """Ask both missing fields together, while retaining an already named field."""
+    if "уже прошло" in question.casefold():
+        return question
     if (
         (asks_for_day(question) or asks_for_clock_time(question) or asks_for_duration(question))
         and mentions_week_range(source)
@@ -90,12 +98,16 @@ def clarification_text(question: str, source: str) -> str:
     appointment = _appointment_text(source)
     if (
         (asks_for_clock_time(question) or asks_for_duration(question))
-        and re.search(rf"\b{_APPOINTMENT_WORD}\b", appointment, re.I)
+        and is_appointment_request(source)
         and not re.search(r"\b(?:перенес|отлож|измени|поменя|продли|сократи)\w*", appointment, re.I)
         and not has_meeting_day(appointment)
     ):
         return MEETING_DAY_QUESTION
-    if not is_person_appointment(source):
+    exact_clock = requested_clock(source)
+    appointment_has_clock = exact_clock is not None and is_appointment_request(source)
+    if asks_for_clock_time(question) and (hour := ambiguous_hour(source)) is not None:
+        return f"Во сколько запланировать: в {hour:02}:00 или в {hour + 12:02}:00?"
+    if not is_person_appointment(source) and not appointment_has_clock:
         return question
     if asks_for_day(question):
         return question

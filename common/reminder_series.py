@@ -16,7 +16,7 @@ _DAY_FORMS = (
     "суббот[уа]м?",
     "воскресень[ея]м?",
 )
-_HOUR_WORDS = (
+CLOCK_HOUR_WORDS = (
     "ноль",
     "час",
     "два",
@@ -42,7 +42,7 @@ _HOUR_WORDS = (
     "двадцать два",
     "двадцать три",
 )
-_HOUR = rf"(?:\d{{1,2}}|{'|'.join(reversed(_HOUR_WORDS))})"
+_HOUR = rf"(?:\d{{1,2}}|{'|'.join(reversed(CLOCK_HOUR_WORDS))})"
 _CLOCK = rf"{_HOUR}(?:[:. ]\d{{2}})?(?:\s+(?:утра|дня|вечера|ночи))?\b(?![:.\d]|\s+\d{{2}}\b)"
 _CLOCK_IN_TEXT = re.compile(rf"\bв\s+{_CLOCK}", re.I)
 _CADENCE = rf"(?:каждый день|ежедневно|(?:кажд(?:ый|ую|ое)|по) (?:{'|'.join(_DAY_FORMS)}))"
@@ -112,7 +112,7 @@ def parse_clock(value: str) -> time | None:
     if not match:
         return None
     raw_hour = match["hour"]
-    hour = int(raw_hour) if raw_hour.isdecimal() else _HOUR_WORDS.index(raw_hour)
+    hour = int(raw_hour) if raw_hour.isdecimal() else CLOCK_HOUR_WORDS.index(raw_hour)
     minute = int(match["minute"] or 0)
     if hour > 23 or minute > 59:
         return None

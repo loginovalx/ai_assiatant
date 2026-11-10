@@ -723,7 +723,10 @@ class BotHandler:
                 await reply("⏳ Думаю над запросом…")
 
             if self.recurring and await self.recurring.message(
-                user_id, text, uuid5(NAMESPACE_URL, f"repeat:{user_id}:{mid or request_id}")
+                user_id,
+                text,
+                uuid5(NAMESPACE_URL, f"repeat:{user_id}:{mid or request_id}"),
+                is_voice=is_voice,
             ):
                 if await self.drafts.load(user_id):
                     await self.agent.reset(user_id)

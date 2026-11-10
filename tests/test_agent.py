@@ -241,7 +241,7 @@ async def test_clarification_then_create(make_agent, tz, redis):
 
     first = await agent.handle(USER, "Поставь встречу с дизайнером на завтра")
     assert first.status == AgentStatus.NEED_CLARIFICATION
-    assert first.reply_text == "Во сколько встреча и сколько она продлится?"
+    assert first.reply_text == "Во сколько начнётся встреча и сколько она продлится?"
 
     second = await agent.handle(USER, "В три часа дня, на полтора часа")
     assert second.status == AgentStatus.DONE
@@ -252,7 +252,7 @@ async def test_clarification_then_create(make_agent, tz, redis):
     sent = [m["content"] for m in llm.requests[1]["messages"] if m["role"] in ("user", "assistant")]
     assert sent[:3] == [
         "Поставь встречу с дизайнером на завтра",
-        "Во сколько встреча и сколько она продлится?",
+        "Во сколько начнётся встреча и сколько она продлится?",
         "В три часа дня, на полтора часа",
     ]
 
@@ -269,7 +269,9 @@ async def test_tool_error_goes_back_to_llm(make_agent):
     response = await agent.handle(USER, "Встреча с Иваном")
 
     error = json.loads(llm.requests[1]["messages"][-1]["content"])
-    assert "нужно указать дату и время" in error["error"]
+    from common.dialogue import MEETING_DAY_QUESTION
+
+    assert error["error"] == MEETING_DAY_QUESTION
     assert response.status == AgentStatus.NEED_CLARIFICATION
     assert response.events == []
 
@@ -289,7 +291,7 @@ async def test_meeting_duration_unknown_falls_back_to_hour(make_agent, tz, pool)
 
     first = await agent.handle(USER, "Встреча с Олей завтра в 15")
     error = json.loads(llm.requests[1]["messages"][-1]["content"])
-    assert "длительность встречи" in error["error"]
+    assert "Сколько продлится встреча?" in error["error"]
     assert first.status == AgentStatus.NEED_CLARIFICATION
     assert first.reply_text == "Сколько продлится встреча?"
     assert await pool.fetchval("SELECT count(*) FROM events") == 0
@@ -376,11 +378,11 @@ async def test_update_event_reschedule(make_agent, tz, pool):
     agent, _ = make_agent(
         tool_call(
             "create_event",
-            {"event_type": "task", "name": "Созвон с клиентом", "start_at": start.isoformat()},
+            {"event_type": "task", "name": "Подготовить отчёт", "start_at": start.isoformat()},
         ),
         text("Поставил на 11:00 завтра."),
     )
-    created = await agent.handle(USER, "Созвон с клиентом завтра в 11")
+    created = await agent.handle(USER, "Подготовить отчёт завтра в 11")
     event_id = str(created.events[0].id)
 
     new_start = tomorrow_at(tz, 16)
@@ -388,7 +390,7 @@ async def test_update_event_reschedule(make_agent, tz, pool):
         tool_call("update_event", {"event_id": event_id, "start_at": new_start.isoformat()}),
         text("Перенёс на 16:00."),
     )
-    response = await agent2.handle(USER, "Перенеси созвон на 16:00")
+    response = await agent2.handle(USER, "Перенеси задачу на 16:00")
 
     assert response.status == AgentStatus.DONE
     assert response.events[0].start_at == new_start

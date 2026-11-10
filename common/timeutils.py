@@ -191,3 +191,17 @@ def has_explicit_weekday_or_date(text: str) -> bool:
 
 def mentions_week_range(text: str) -> bool:
     return bool(_WEEK_RANGE.search(text))
+
+
+def has_meeting_day(text: str) -> bool:
+    """A supplied calendar day or relative offset can anchor a new meeting."""
+    source = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", text)
+    return has_explicit_weekday_or_date(source) or bool(
+        re.search(
+            rf"\bчерез\s+(?:{_DURATION_LENGTH}|полминуты|день|неделю|месяц|"
+            rf"{_DURATION_AMOUNT}\s+(?:дн\w*|недел\w*|месяц\w*))\b|"
+            r"\b\d{1,2}(?:-?(?:го|е)|\s+числа)\b",
+            source,
+            re.I,
+        )
+    )

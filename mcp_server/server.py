@@ -22,7 +22,7 @@ from starlette.responses import JSONResponse
 
 from common.config import get_settings
 from common.db import create_pool
-from common.dialogue import is_person_appointment
+from common.dialogue import MEETING_DAY_QUESTION, PAST_TIME_QUESTION, is_person_appointment
 from common.embeddings import build_embedder
 from common.repository import EventRepository
 from common.schemas import (
@@ -41,6 +41,7 @@ from common.timeutils import (
     allows_default_duration,
     ensure_aware,
     has_explicit_weekday_or_date,
+    has_meeting_day,
     mentions_duration,
     mentions_start_time,
     mentions_time,
@@ -176,6 +177,8 @@ async def create_event(
     source_text = user_text if user_text else description
     if user_text and is_person_appointment(user_text):
         event_type = "meeting"
+    if event_type == "meeting" and user_text is not None and not has_meeting_day(user_text):
+        raise ToolError(MEETING_DAY_QUESTION)
     if event_type == "meeting" and source_text:
         clock = mentions_start_time(source_text)
         length = (
@@ -230,10 +233,7 @@ async def create_event(
         if resolved is not None:
             data = data.model_copy(update={"start_at": resolved})
     if data.start_at is not None and data.start_at < now - PAST_TOLERANCE:
-        raise ToolError(
-            f"Время {data.start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "
-            "Проверь вычисление даты или уточни у пользователя."
-        )
+        raise ToolError(PAST_TIME_QUESTION)
     weekday = named_weekday(source_text)
     if data.start_at is not None and weekday is not None:
         local_start = data.start_at.astimezone(get_settings().tz)
@@ -460,10 +460,7 @@ async def update_event(
         except ValueError as error:
             raise ToolError(str(error)) from error
     if start_at is not None and start_at < now - PAST_TOLERANCE:
-        raise ToolError(
-            f"Время {start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "
-            "Проверь вычисление даты или уточни у пользователя."
-        )
+        raise ToolError(PAST_TIME_QUESTION)
 
     repo = _repo(ctx)
     uuid = _parse_event_id(event_id)
@@ -597,7 +594,7 @@ async def delete_events(
         Field(description="true только после того, как пользователь ответил «да» на вопрос."),
     ] = False,
     dry_run: bool = False,
-) -> list[Event] | dict[str, int | list[str]]:
+) -> list[Event] | dict[str, int | list[str] | list[Event]]:
     """Удалить сразу ВСЕ записи пользователя заданных типов и, если указан, периода.
 
     Для «удали все мои задачи», «удали напоминания сегодня», «очисти всё». Удаление за период
@@ -621,18 +618,19 @@ async def delete_events(
     types = [EventType(t) for t in event_types] if event_types else None
     repo = _repo(ctx)
     if not confirmed or dry_run:
-        preview_ids = await repo.preview_cancellation_ids(user_id, types, start, end)
-        if not preview_ids:
+        records = await repo.preview_cancellations(user_id, types, start, end)
+        if not records:
             raise ToolError("Записей такого типа нет — удалять нечего. Так и скажи пользователю.")
         if dry_run:
             return {
-                "count": len(preview_ids),
-                "event_ids": [str(event_id) for event_id in preview_ids],
+                "count": len(records),
+                "event_ids": [str(event.id) for event in records],
+                "records": records,
             }  # no writes; confirmation approves this exact snapshot
         raise ToolError(
-            f"Ничего не удалено: будет удалено записей — {len(preview_ids)}. "
+            f"Ничего не удалено: будет удалено записей — {len(records)}. "
             "Спроси через ask_user: "
-            f"«Удалить все записи ({len(preview_ids)} шт.)? Это нельзя отменить.» Ответил «да» — "
+            f"«Удалить все записи ({len(records)} шт.)? Это нельзя отменить.» Ответил «да» — "
             "вызови тул снова с confirmed=true; «нет» — ничего не делай."
         )
     if start is not None and event_ids is None:

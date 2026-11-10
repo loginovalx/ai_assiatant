@@ -67,12 +67,12 @@ class Repository:
             and event.start_at < other.end_at
         ]
 
-    async def preview_cancellation_ids(self, owner, types, start, end):
+    async def preview_cancellations(self, owner, types, start, end):
         return [
-            event.id
+            event
             for event in self.rows.values()
             if event.user_id == owner
-            and event.status == "active"
+            and event.status != "cancelled"
             and (types is None or event.type in types)
             and (start is None or (event.start_at is not None and start <= event.start_at < end))
         ]
@@ -96,7 +96,7 @@ class Repository:
         return event
 
     async def cancel_selected(self, owner, event_ids, types, start, end):
-        allowed = await self.preview_cancellation_ids(owner, types, start, end)
+        allowed = {event.id for event in await self.preview_cancellations(owner, types, start, end)}
         return [
             await self.set_status(owner, item, EventStatus.CANCELLED)
             for item in event_ids
@@ -177,9 +177,24 @@ async def test_bulk_delete_no_and_old_button_never_write(session):
 
 async def test_bulk_approval_deletes_only_approved_snapshot_once(session):
     build, repo = session
-    first, second, foreign = await seed(repo), await seed(repo), await seed(repo, "other")
-    _, api, message, click, _, _ = build(tool_call("delete_events", {"confirmed": True}))
+    first = await seed(repo, name="Оплатить интернет")
+    second = await repo.create(
+        EventCreate(
+            user_id="777",
+            type="reminder",
+            name="Позвонить в сервис",
+            start_at=datetime(2030, 11, 12, 9, tzinfo=repo.tz),
+        )
+    )
+    foreign = await seed(repo, "other", "Чужая задача")
+    _, api, message, click, model, _ = build(tool_call("delete_events", {"confirmed": True}))
     await message("Удали все мои записи")
+    preview = api.sent[-1]["text"]
+    assert "удалить 2 записи?" in preview
+    assert "Задача «Оплатить интернет» — без даты" in preview
+    assert "Напоминание «Позвонить в сервис» — 12 ноября 2030, вторник, в 09:00" in preview
+    assert "Чужая задача" not in preview
+    assert len(model.requests) == 1
     delete = all_buttons(api.sent[-1])[0]["payload"]
     assert repo.writes == 3
     later = await seed(repo)
@@ -573,9 +588,10 @@ async def test_duration_button_and_conflict_wait_for_explicit_save(session, tz):
     await click("60 минут")
     assert model.requests[-1]["messages"][-1]["content"] == "На 60 минут"
     assert repo.writes == 1
-    assert "Обсуждение макета" in api.sent[-1]["text"]
-    assert api.sent[-1]["text"].startswith("Выбранное время пересекается")
-    assert api.sent[-1]["text"].endswith("Вы уверены, что хотите сохранить выбранное время?")
+    reply = api.sent[-1]["text"]
+    assert "у вас уже запланировано\n• «Обсуждение макета» — 12:20–12:40" in reply
+    assert reply.endswith("Всё равно сохранить «Встреча с Антоном» на 12:30–13:30?")
+    assert "Длительность" not in reply
     assert len(model.requests) == 2  # no generation to describe the overlap
     assert (await bot.drafts.load("777")).confirm_overlap
     await click("Отмена")
@@ -583,6 +599,10 @@ async def test_duration_button_and_conflict_wait_for_explicit_save(session, tz):
     await message("Поставь завтра встречу с Антоном в 12:30 на час")
     assert repo.writes == 1
     await click("Сохранить")
+    reply = api.sent[-1]["text"]
+    assert reply.startswith("Готово.\nСохранено: Встреча с Антоном")
+    assert "с 12:30 до 13:30" in reply
+    assert "Учтите" not in reply and "Обсуждение макета" not in reply
     assert repo.writes == 2
     assert (
         next(
@@ -590,3 +610,92 @@ async def test_duration_button_and_conflict_wait_for_explicit_save(session, tz):
         ).duration_minutes
         == 60
     )
+
+
+async def test_misspelled_meeting_asks_day_before_time_and_duration(session, request_clock, tz):
+    build, repo = session
+    _, api, message, click, _, _ = build(
+        text("Во сколько и сколько продлится встреча с Антоном?"),
+        text("Во сколько начнётся встреча?"),
+        text("Сколько продлится встреча?"),
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча с Антоном",
+                "start_at": datetime(2030, 11, 11, 9, tzinfo=tz).isoformat(),
+                "duration_minutes": 30,
+            },
+        ),
+        text("Встреча сохранена."),
+    )
+    await message("пастафь встрчу с антоном")
+    assert "На какой день" in api.sent[-1]["text"]
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == [
+        "Пн",
+        "Вт",
+        "Ср",
+        "Чт",
+        "Пт",
+        "Сб",
+        "Вс",
+        "Другая дата",
+    ]
+    assert repo.writes == 0
+    await click("Пн")
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == [
+        "09:00",
+        "12:00",
+        "18:00",
+        "Другое время",
+    ]
+    await click("09:00")
+    assert repo.writes == 0
+    await click("30 минут")
+    assert repo.writes == 1
+    saved = next(iter(repo.rows.values()))
+    assert saved.start_at == datetime(2030, 11, 11, 9, tzinfo=tz)
+    assert saved.duration_minutes == 30
+
+
+async def test_meeting_with_clock_and_duration_still_requires_user_day(session, request_clock, tz):
+    build, repo = session
+    _, api, message, _, _, _ = build(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча с Антоном",
+                "start_at": datetime(2030, 11, 10, 9, tzinfo=tz).isoformat(),
+                "duration_minutes": 30,
+            },
+        ),
+        text("Сохранено."),
+    )
+    await message("Поставь встречу с Антоном в 09:00 на 30 минут")
+    assert repo.writes == 0
+    assert "На какой день" in api.sent[-1]["text"]
+    assert "Пн" in [b["text"] for b in all_buttons(api.sent[-1])]
+
+
+async def test_past_meeting_returns_clear_time_question(session, request_clock, tz):
+    build, repo = session
+    request_clock[0] = datetime(2030, 11, 10, 14, 11, tzinfo=tz)
+    _, api, message, _, _, _ = build(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча с Антоном",
+                "start_at": datetime(2030, 11, 10, 9, tzinfo=tz).isoformat(),
+                "duration_minutes": 30,
+            },
+        ),
+        text("Сохранено."),
+    )
+    await message("Поставь встречу с Антоном сегодня в 09:00 на 30 минут")
+    assert repo.writes == 0
+    assert api.sent[-1]["text"] == (
+        "Это время уже прошло. Во сколько запланировать событие? Можно указать другую дату."
+    )
+    assert "Другое время" in [b["text"] for b in all_buttons(api.sent[-1])]

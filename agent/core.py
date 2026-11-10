@@ -21,15 +21,18 @@ from agent.policy import asks_to_read, explicitly_requests_change, is_single_act
 from agent.prompt import build_system_prompt
 from agent.routing import ModelRoute, completion_problem, select_model
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
+from common.config import get_settings
 from common.dialogue import (
+    PAST_TIME_QUESTION,
     asks_for_clock_time,
     asks_for_day,
     asks_for_duration,
     clarification_text,
     is_clarification_question,
 )
-from common.display import format_calendar_time
+from common.display import MONTHS_RU_GENITIVE, format_calendar_time
 from common.schemas import MAX_DURATION_MINUTES, AgentResponse, AgentStatus, DraftAction, Event
+from common.timeutils import ensure_aware
 from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -235,7 +238,9 @@ class Agent:
                     if other.user_id != user_id:
                         raise ValueError("Foreign conflict event")
                     conflict_warnings[str(other.id)] = other
-            summary = _confirmed_response(confirmed, conflict_warnings)
+            summary = _confirmed_response(
+                confirmed, conflict_warnings, show_conflicts=not draft.confirm_overlap
+            )
             reply = (
                 f"Удалено записей: {len(confirmed)}."
                 if draft.tool == "delete_events"
@@ -538,9 +543,12 @@ class Agent:
                         return _draft_response(draft)
                     draft_fingerprint = fingerprint
                     mutations[fingerprint] = result
-                    messages.append(
-                        {"role": "tool", "tool_call_id": call.id, "content": result.for_llm()}
+                    content = (
+                        json.dumps({"count": result.payload["count"]})
+                        if name == "delete_events"
+                        else result.for_llm()
                     )
+                    messages.append({"role": "tool", "tool_call_id": call.id, "content": content})
                     continue
                 for raw in result.events:
                     event = Event.model_validate(raw)
@@ -629,7 +637,19 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
             if count % 10 in {2, 3, 4}
             else "записей"
         )
-        return f"Вы уверены, что хотите удалить {count} {noun}?\nНажмите «Удалить» или «Нет»."
+        records = [Event.model_validate(item) for item in result.payload.get("records", [])]
+        if (
+            len(records) != count
+            or [str(event.id) for event in records] != result.payload["event_ids"]
+            or any(event.user_id != user_id for event in records)
+        ):
+            raise ValueError("Deletion preview does not match the selected records")
+        lines = [f"Вы уверены, что хотите удалить {count} {noun}?"]
+        kinds = {"task": "Задача", "meeting": "Встреча", "reminder": "Напоминание"}
+        for event in records:
+            title = json.dumps(event.name, ensure_ascii=False)[1:-1]
+            lines.append(f"• {kinds[event.type]} «{title}» — {_when(event)}")
+        return "\n".join([*lines, "", "Нажмите «Удалить» или «Нет»."])
     verbs = {
         "create_event": "Создать",
         "update_event": "Изменить",
@@ -643,20 +663,16 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
         event = Event.model_validate(raw)
         if event.user_id != user_id:
             raise ValueError("Foreign preview event")
-        title = "«" + json.dumps(event.name, ensure_ascii=False)[1:-1] + "»"
-        kind = {"task": "задачу", "reminder": "напоминание", "meeting": "встречу"}[event.type]
-        if name == "delete_event":
-            lines.extend(["Вы уверены, что хотите удалить запись?", title, _when(event)])
-        else:
-            suffix = "" if overlap else "?"
-            lines.extend([f"{verbs[name]} {kind} {title}{suffix}", _when(event)])
-        if event.duration_minutes is not None:
-            lines.append(f"Длительность: {event.duration_minutes} мин.")
+        conflicts = [Event.model_validate(item) for item in raw.get("conflicts") or []]
+        if any(conflict.user_id != user_id for conflict in conflicts):
+            raise ValueError("Foreign preview conflict")
+        title = _quoted_title(event.name)
         source = arguments.get("user_text") or ""
 
         def normalized(value):
             return re.findall(r"\w+", value.casefold())
 
+        details = []
         duplicate_description = bool(event.description) and (
             normalized(event.description) == normalized(event.name)
             or (bool(source) and normalized(event.description) == normalized(source))
@@ -666,29 +682,29 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
             and event.description
             and not duplicate_description
         ):
-            lines.append(f"Описание: {json.dumps(event.description, ensure_ascii=False)}")
+            details.append(f"Описание: {json.dumps(event.description, ensure_ascii=False)}")
         elif name == "update_event" and "description" in arguments and not event.description:
-            lines.append("Описание будет удалено.")
-        for raw_conflict in raw.get("conflicts") or []:
-            conflict = Event.model_validate(raw_conflict)
-            if conflict.user_id != user_id:
-                raise ValueError("Foreign preview conflict")
-            conflict_lines.append(
-                f"Пересечение: {json.dumps(conflict.name, ensure_ascii=False)}, {_when(conflict)}."
-            )
+            details.append("Описание будет удалено.")
+        if overlap:
+            lines.extend(_overlap_preview(event, conflicts, details))
+            continue
+
+        kind = {"task": "задачу", "reminder": "напоминание", "meeting": "встречу"}[event.type]
+        if name == "delete_event":
+            lines.extend(["Вы уверены, что хотите удалить запись?", title, _when(event)])
+        else:
+            lines.extend([f"{verbs[name]} {kind} {title}?", _when(event)])
+        if event.duration_minutes is not None:
+            lines.append(f"Длительность: {event.duration_minutes} мин.")
+        lines.extend(details)
+        conflict_lines.extend(
+            f"Пересечение: {json.dumps(conflict.name, ensure_ascii=False)}, {_when(conflict)}."
+            for conflict in conflicts
+        )
     if not lines:
         raise ValueError("Missing preview facts")
     if overlap:
-        return "\n".join(
-            [
-                "Выбранное время пересекается с другими записями.",
-                *conflict_lines,
-                "",
-                *lines,
-                "",
-                "Вы уверены, что хотите сохранить выбранное время?",
-            ]
-        )
+        return "\n".join(lines)
     footer = (
         "Нажмите «Удалить» или «Нет»."
         if name == "delete_event"
@@ -697,6 +713,42 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
         else "Подтвердите кнопкой «Сохранить»."
     )
     return "\n".join([*lines, *conflict_lines, footer])
+
+
+def _quoted_title(name: str) -> str:
+    return "«" + json.dumps(name, ensure_ascii=False)[1:-1] + "»"
+
+
+def _overlap_preview(event: Event, conflicts: list[Event], details: list[str]) -> list[str]:
+    tz = get_settings().tz
+
+    def local(moment: datetime) -> datetime:
+        return ensure_aware(moment, tz).astimezone(tz)
+
+    day = local(event.start_at).date() if event.start_at else None
+    same_day = day is not None and all(
+        moment is not None and local(moment).date() == day
+        for entry in [event, *conflicts]
+        for moment in (entry.start_at, entry.end_at)
+    )
+
+    def time_range(entry: Event) -> str:
+        if same_day and entry.start_at and entry.end_at:
+            return f"{local(entry.start_at):%H:%M}–{local(entry.end_at):%H:%M}"
+        return _when(entry)
+
+    heading = "В это время у вас уже запланировано"
+    if same_day and day is not None:
+        heading = (
+            f"{day.day} {MONTHS_RU_GENITIVE[day.month - 1]} {day.year} у вас уже запланировано"
+        )
+    existing = [
+        f"• {_quoted_title(conflict.name)} — {time_range(conflict)}" for conflict in conflicts
+    ]
+    proposed_time = time_range(event)
+    when = f"на {proposed_time}" if same_day else f"({proposed_time})"
+    question = f"Всё равно сохранить {_quoted_title(event.name)} {when}?"
+    return [heading, *existing, "", *details, question]
 
 
 def _duration_answer(history: list[HistoryMessage], text: str) -> str:
@@ -828,6 +880,8 @@ def _incomplete_response(events, confirmed, conflicts, errors) -> AgentResponse:
 
 
 def _public_tool_error(message: str) -> str:
+    if "уже прошло" in message.casefold():
+        return PAST_TIME_QUESTION
     if "Названа неделя, но не конкретный день" in message:
         return "На какой день недели запланировать событие?"
     if "удалять нечего" in message.casefold():
@@ -848,6 +902,12 @@ def _public_tool_error(message: str) -> str:
 
 def _safe_model_reply(message: str) -> str:
     message = re.split(r"\[(?:черновик|записи в этом ответе):", message, maxsplit=1)[0].strip()
+    if "проверь вычисление даты" in message.casefold():
+        return (
+            _public_tool_error(message)
+            if "уже прошло" in message.casefold()
+            else ("На какой день запланировать событие?")
+        )
     if re.search(
         r"create_event|update_event|delete_event|duration_minutes|user_text|"
         r"ты\s*[—-]\s*голосовой\s+ассистент|системный\s+промпт\s*[:=]",
@@ -898,14 +958,18 @@ def _when(event: Event) -> str:
 
 
 def _confirmed_response(
-    events: dict[str, Event], conflicts: dict[str, Event] | None = None
+    events: dict[str, Event],
+    conflicts: dict[str, Event] | None = None,
+    *,
+    show_conflicts: bool = True,
 ) -> AgentResponse:
     lines = []
     for event in events.values():
         action = {"done": "Выполнено", "cancelled": "Отменено"}.get(event.status, "Сохранено")
         lines.append(f"{action}: {event.name}, {_when(event)}.")
-    for event in (conflicts or {}).values():
-        lines.append(f"Учтите: пересечение с «{event.name}», {_when(event)}.")
+    if show_conflicts:
+        for event in (conflicts or {}).values():
+            lines.append(f"Учтите: пересечение с «{event.name}», {_when(event)}.")
     response = AgentResponse(
         reply_text="\n".join(lines),
         status=AgentStatus.DONE,

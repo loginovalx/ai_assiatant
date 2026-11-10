@@ -394,30 +394,30 @@ class EventRepository:
         )
         return [self._to_event(r) for r in rows]
 
-    async def preview_cancellation_ids(
+    async def preview_cancellations(
         self,
         user_id: str,
         types: Sequence[EventType] | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
-    ) -> list[UUID]:
-        """Return IDs of active rows matching type and optional [start, end) period."""
+    ) -> list[Event]:
+        """Read the records and IDs shown in one cancellation snapshot."""
         _validate_optional_period(start, end)
         type_values = [t.value for t in types] if types else None
         rows = await self._pool.fetch(
-            """
-            SELECT id FROM events
+            f"""
+            SELECT {_COLUMNS} FROM events
             WHERE user_id = $1 AND status <> 'cancelled'
               AND ($2::text[] IS NULL OR type = ANY($2))
               AND ($3::timestamptz IS NULL OR (start_at >= $3 AND start_at < $4))
-            ORDER BY id
+            ORDER BY start_at NULLS LAST, created_at, id
             """,
             user_id,
             type_values,
             start,
             end,
         )
-        return [row["id"] for row in rows]
+        return [self._to_event(row) for row in rows]
 
     async def cancel_selected(
         self,

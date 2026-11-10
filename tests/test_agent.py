@@ -486,7 +486,7 @@ async def test_conflict_waits_for_confirmation_and_preserves_references(make_age
 
     assert len(llm.requests) == 1
     assert response.status == "needs_confirmation"
-    assert "Созвон с Иваном" in response.reply_text and "Вы уверены" in response.reply_text
+    assert "Созвон с Иваном" in response.reply_text and "Всё равно сохранить" in response.reply_text
     assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 1
     response = await agent.execute_draft(USER, response.draft)
     assert {e.name for e in response.events} == {"Встреча с дизайнером", "Созвон с Иваном"}

@@ -69,7 +69,7 @@ async def pool():
     import asyncpg
 
     conn = await asyncpg.connect(TEST_DSN)
-    await conn.execute("DROP TABLE IF EXISTS events CASCADE")
+    await conn.execute("DROP TABLE IF EXISTS events, reminder_series CASCADE")
     for migration in MIGRATIONS:
         await conn.execute(migration.read_text(encoding="utf-8"))
     await conn.close()
@@ -83,7 +83,7 @@ async def pool():
 async def _clean(request):
     if "pool" in request.fixturenames:
         pool = request.getfixturevalue("pool")
-        await pool.execute("TRUNCATE events")
+        await pool.execute("TRUNCATE events, reminder_series")
     yield
 
 

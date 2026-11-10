@@ -10,6 +10,7 @@ import asyncpg
 
 from common.calendar_import import IMPORTED_DURATION_MINUTES, CalendarRow
 from common.embeddings import EMBEDDING_DIM, Embedder
+from common.reminder_series import ReminderRule, SavedReminderRule
 from common.schemas import (
     DEFAULT_MEETING_MINUTES,
     MAX_DURATION_MINUTES,
@@ -281,6 +282,140 @@ class EventRepository:
         )
         return len(inserted)
 
+    async def list_reminder_series(self, user_id: str) -> list[SavedReminderRule]:
+        rows = await self._pool.fetch(
+            "SELECT id, revision, name, weekday, clock FROM reminder_series "
+            "WHERE user_id = $1 AND active ORDER BY name, id",
+            user_id,
+        )
+        return [SavedReminderRule.model_validate(dict(row)) for row in rows]
+
+    async def save_reminder_series(
+        self,
+        user_id: str,
+        series_id: UUID,
+        rule: ReminderRule,
+        now: datetime,
+        revision: UUID | None = None,
+        *,
+        operation_id: UUID,
+    ) -> bool:
+        first = rule.first_after(now.astimezone(self._tz))
+        async with self._pool.acquire() as conn, conn.transaction():
+            if revision is None:
+                await conn.execute(
+                    """
+                    INSERT INTO reminder_series
+                        (id, user_id, name, weekday, clock, timezone, starts_at,
+                         generated_until, revision)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    series_id,
+                    user_id,
+                    rule.name,
+                    rule.weekday,
+                    rule.clock,
+                    self._tz.key,
+                    first,
+                    first.date() - timedelta(days=1),
+                    operation_id,
+                )
+                saved = await conn.fetchval(
+                    "SELECT active FROM reminder_series WHERE id = $1 AND user_id = $2",
+                    series_id,
+                    user_id,
+                )
+            else:
+                saved = await conn.fetchval(
+                    """
+                    UPDATE reminder_series SET weekday = $4, clock = $5, starts_at = $6,
+                        generated_until = $7, revision = $8
+                    WHERE id = $1 AND user_id = $2 AND revision = $3 AND active
+                    RETURNING true
+                    """,
+                    series_id,
+                    user_id,
+                    revision,
+                    rule.weekday,
+                    rule.clock,
+                    first,
+                    first.date() - timedelta(days=1),
+                    operation_id,
+                )
+                if saved:
+                    await self._delete_future_reminders(conn, series_id, now)
+                else:
+                    saved = await conn.fetchval(
+                        "SELECT active FROM reminder_series "
+                        "WHERE id = $1 AND user_id = $2 AND revision = $3",
+                        series_id,
+                        user_id,
+                        operation_id,
+                    )
+            if saved:
+                await self._fill_reminders(conn, now, now, series_id)
+            return bool(saved)
+
+    async def stop_reminder_series(self, user_id: str, series_id: UUID, now: datetime) -> bool:
+        async with self._pool.acquire() as conn, conn.transaction():
+            stopped = await conn.fetchval(
+                "UPDATE reminder_series SET active = false "
+                "WHERE id = $1 AND user_id = $2 RETURNING true",
+                series_id,
+                user_id,
+            )
+            if stopped:
+                await self._delete_future_reminders(conn, series_id, now)
+            return bool(stopped)
+
+    @staticmethod
+    async def _delete_future_reminders(conn, series_id: UUID, now: datetime) -> None:
+        await conn.execute(
+            "DELETE FROM events WHERE reminder_series_id = $1 AND start_at >= $2 "
+            "AND notified_at IS NULL AND status = 'active'",
+            series_id,
+            now,
+        )
+
+    async def fill_reminders(self, now: datetime, lookback: timedelta) -> None:
+        await self._fill_reminders(self._pool, now, now - lookback)
+
+    @staticmethod
+    async def _fill_reminders(conn, now: datetime, earliest: datetime, series_id=None) -> None:
+        # Generate a rolling calendar window. The watermark and rows commit together.
+        await conn.execute(
+            """
+            WITH selected AS (
+                SELECT s.*, ($1::timestamptz AT TIME ZONE timezone)::date + 7 AS horizon
+                FROM reminder_series s
+                WHERE active AND ($3::uuid IS NULL OR id = $3)
+                  AND generated_until < ($1 AT TIME ZONE timezone)::date + 7
+                ORDER BY generated_until, id
+                LIMIT 100 FOR UPDATE SKIP LOCKED
+            ), advanced AS (
+                UPDATE reminder_series s SET generated_until = selected.horizon
+                FROM selected WHERE s.id = selected.id
+            )
+            INSERT INTO events (user_id, type, name, start_at, reminder_series_id, occurrence_at)
+            SELECT s.user_id, 'reminder', s.name, slot.starts, s.id, slot.starts
+            FROM selected s
+            CROSS JOIN LATERAL generate_series(
+                GREATEST(s.generated_until + 1, ($2::timestamptz AT TIME ZONE s.timezone)::date)
+                    ::timestamp, s.horizon::timestamp, interval '1 day'
+            ) AS day(value)
+            CROSS JOIN LATERAL (
+                SELECT (day.value::date + s.clock) AT TIME ZONE s.timezone AS starts
+            ) AS slot
+            WHERE (s.weekday IS NULL OR extract(isodow FROM day.value) = s.weekday + 1)
+              AND slot.starts >= s.starts_at AND slot.starts >= $2
+            ON CONFLICT (reminder_series_id, occurrence_at) DO NOTHING
+            """,
+            now,
+            earliest,
+            series_id,
+        )
+
     async def claim_due_events(
         self,
         now: datetime,
@@ -289,7 +424,8 @@ class EventRepository:
         *,
         claim_token: UUID | None = None,
     ) -> list[Event]:
-        """Claim unsent events for five minutes; expired claims survive sender crashes."""
+        """Extend the schedule, then claim unsent events for five minutes."""
+        await self.fill_reminders(now, lookback)
         rows = await self._pool.fetch(
             f"""
             UPDATE events SET notification_claimed_at = $1, notification_claim_token = $4
@@ -297,13 +433,16 @@ class EventRepository:
                 SELECT id FROM events
                 WHERE status = 'active' AND notified_at IS NULL
                   AND start_at IS NOT NULL AND start_at <= $1 AND start_at > $2
+                  AND (reminder_series_id IS NULL OR EXISTS (
+                      SELECT 1 FROM reminder_series s WHERE s.id = reminder_series_id AND s.active
+                  ))
                   AND (notification_claimed_at IS NULL
                        OR notification_claimed_at <= $1 - interval '5 minutes')
                 ORDER BY start_at
                 LIMIT $3
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING {_COLUMNS}
+            RETURNING {_COLUMNS}, reminder_series_id
             """,
             now,
             now - lookback,
@@ -610,6 +749,7 @@ class EventRepository:
             start_at=start_at.astimezone(self._tz) if start_at else None,
             duration_minutes=row["duration_minutes"],
             status=EventStatus(row["status"]),
+            reminder_series_id=row.get("reminder_series_id"),
             created_at=row["created_at"].astimezone(self._tz),
             updated_at=row["updated_at"].astimezone(self._tz),
         )

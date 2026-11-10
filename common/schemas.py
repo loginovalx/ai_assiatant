@@ -112,6 +112,7 @@ class EventCreate(BaseModel):
 
 
 class Event(BaseModel):
+    reminder_series_id: UUID | None = Field(default=None, exclude=True)
     id: UUID
     user_id: str
     type: EventType

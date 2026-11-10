@@ -15,6 +15,7 @@ from bot.asr import SpeechRecognitionError, SpeechRecognizer
 from bot.drafts import DraftStore
 from bot.max_api import MaxAPI, MaxAPIError
 from bot.models import AgentMessageResponse
+from bot.recurring import RecurringReminders
 from bot.state import StateStore
 from bot.time_choices import (
     CHOICE_REPLIES,
@@ -279,6 +280,11 @@ class BotHandler:
         self.repo = repo
         self.drafts = DraftStore(redis)
         self.time_choices = TimeChoiceStore(redis)
+        self.recurring = (
+            RecurringReminders(repo, redis, max_api, get_settings().tz)
+            if repo is not None
+            else None
+        )
 
     async def _result(self, user_id, chat_id, result, to_user=True):
         buttons = None
@@ -358,6 +364,9 @@ class BotHandler:
             await self.max_api.answer_callback(callback_id, _BUSY)
             return
         try:
+            if payload.startswith("repeat:") and self.recurring:
+                await self.recurring.callback(user_id, callback_id, payload)
+                return
             if payload.startswith("event:"):
                 await self._event_action(user_id, callback_id, payload)
                 return
@@ -704,6 +713,14 @@ class BotHandler:
                 await reply("⏳ Записал в блокнот, думаю…")
             else:
                 await reply("⏳ Думаю над запросом…")
+
+            if self.recurring and await self.recurring.message(
+                user_id, text, uuid5(NAMESPACE_URL, f"repeat:{user_id}:{mid or request_id}")
+            ):
+                if await self.drafts.load(user_id):
+                    await self.agent.reset(user_id)
+                    await self.drafts.drop(user_id)
+                return
 
             pending = await self.drafts.load(user_id)
             keep_phrase = pending is not None and is_explicit_keep_confirmation(text)

@@ -19,14 +19,25 @@ from common.timeutils import ensure_aware
 logger = logging.getLogger(__name__)
 
 
-def event_buttons(event_id: UUID) -> list[list[dict[str, str]]]:
+def event_buttons(event_id: UUID, series_id: UUID | None = None) -> list[list[dict[str, str]]]:
     """Кнопки под уведомлением: закрыть напоминание или отложить на час."""
-    return [
+    buttons = [
         [
             {"type": "callback", "text": "Готово", "payload": f"event:done:{event_id}"},
             {"type": "callback", "text": "На час позже", "payload": f"event:snooze:{event_id}"},
         ]
     ]
+    if series_id is not None:
+        buttons.append(
+            [
+                {
+                    "type": "callback",
+                    "text": "Настроить повтор",
+                    "payload": f"repeat:manage:{series_id}",
+                }
+            ]
+        )
+    return buttons
 
 
 def format_notification(event: Event, tz: ZoneInfo | None = None) -> str:
@@ -93,7 +104,7 @@ class ReminderSender:
                     int(event.user_id),
                     format_notification(event, self._tz),
                     to_user=True,
-                    buttons=event_buttons(event.id),
+                    buttons=event_buttons(event.id, event.reminder_series_id),
                 )
                 await self._repo.mark_notified(event.id, claim_token)
                 sent += 1

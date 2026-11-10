@@ -422,10 +422,13 @@ class BotHandler:
                     await self.max_api.send(int(user), "Отменил действие.", to_user=True)
                     await self.max_api.answer_callback(callback_id, "Отменено")
                 elif action == "edit":
-                    await self.max_api.send(
-                        int(user), "Что изменить: название, время или длительность?", to_user=True
-                    )
-                    await self.drafts.begin_edit(user_id, draft)
+                    if not await self.drafts.is_editing(user_id, draft):
+                        await self.max_api.send(
+                            int(user),
+                            "Что изменить: название, время или длительность?",
+                            to_user=True,
+                        )
+                        await self.drafts.begin_edit(user_id, draft)
                     await self.max_api.answer_callback(callback_id)
                 elif action == "time":
                     if not can_change_draft_time(draft):

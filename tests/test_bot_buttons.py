@@ -176,14 +176,25 @@ async def test_cancel_button_drops_draft_without_executing(handler):
     assert await bot.drafts.load(str(USER)) is None
 
 
-async def test_edit_button_asks_what_to_change_and_keeps_draft(handler):
+async def test_edit_button_asks_once_per_draft_and_keeps_draft(handler):
     bot, max_api = handler(FakeAgent())
     await bot.drafts.save(str(USER), DRAFT)
 
     await bot.handle_update(callback("draft:edit"))
+    duplicate = callback("draft:edit")
+    duplicate["callback"]["callback_id"] = "cb-2"
+    await bot.handle_update(duplicate)
 
+    assert len(max_api.sent) == 1
+    assert "Что изменить" in max_api.sent[0]["text"]
+    assert max_api.answered == [("cb-1", None), ("cb-2", None)]
+    assert await bot.drafts.load(str(USER)) == DRAFT
+
+    replacement = scheduled_draft()
+    await bot.drafts.save(str(USER), replacement)
+    await bot.handle_update(callback(f"draft:edit:{replacement.id}"))
+    assert len(max_api.sent) == 2
     assert "Что изменить" in max_api.sent[-1]["text"]
-    assert await bot.drafts.load(str(USER)) is not None  # ждём правку
 
 
 async def test_scheduled_preview_offers_another_time_without_saving(handler):

@@ -47,6 +47,7 @@ from common.timeutils import (
     mentions_time,
     mentions_week_range,
     named_weekday,
+    reschedule_clock,
     resolve_reschedule_day,
     resolve_weekday_mismatch,
 )
@@ -440,19 +441,34 @@ async def update_event(
     поменять длительность.
 
     Для «перенеси её на завтра», «подвинь встречу на 15:00», «переименуй задачу»,
-    «встреча будет на полчаса».
+    «встреча будет на полчаса». Если пользователь указал только новое время, сохрани дату.
     Если новое время пересекается с другими встречами или делами, нужно подтверждение.
     """
-    if name is None and start_at is None and description is None and duration_minutes is None:
+    clock = reschedule_clock(user_text or "")
+    if clock:
+        name = description = duration_minutes = None
+    if not clock and all(
+        value is None for value in (name, start_at, description, duration_minutes)
+    ):
         raise ToolError("Не указано, что менять: нужно хотя бы одно новое значение")
     if name is not None:
         name = name.strip()
         if not name:
             raise ToolError("Название не должно быть пустым")
 
-    now = datetime.now(get_settings().tz).replace(microsecond=0)
-    if start_at is not None:
-        tz = get_settings().tz
+    repo = _repo(ctx)
+    uuid = _parse_event_id(event_id)
+    current = await repo.get(user_id, uuid)
+    if current is None:
+        raise ToolError("Событие не найдено")
+
+    tz = get_settings().tz
+    now = datetime.now(tz).replace(microsecond=0)
+    if clock:
+        if current.start_at is None:
+            raise ToolError("На какой день запланировать событие?")
+        start_at = datetime.combine(current.start_at.astimezone(tz).date(), clock, tz)
+    elif start_at is not None:
         start_at = ensure_aware(start_at, tz).astimezone(tz)
         reference = ensure_aware(date_reference or now, tz).astimezone(tz)
         try:
@@ -462,11 +478,6 @@ async def update_event(
     if start_at is not None and start_at < now - PAST_TOLERANCE:
         raise ToolError(PAST_TIME_QUESTION)
 
-    repo = _repo(ctx)
-    uuid = _parse_event_id(event_id)
-    current = await repo.get(user_id, uuid)
-    if current is None:
-        raise ToolError("Событие не найдено")
     try:
         check_duration(
             current.type,

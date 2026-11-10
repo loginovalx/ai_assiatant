@@ -19,13 +19,15 @@ _DAY_FORMS = (
 _CLOCK = r"(?:[01]?\d|2[0-3]):[0-5]\d"
 _CADENCE = rf"(?:каждый день|ежедневно|(?:кажд(?:ый|ую|ое)|по) (?:{'|'.join(_DAY_FORMS)}))"
 _VERB = r"(?:напомни(?:те)?|напоминай(?:те)?|напоминать)"
+_CREATE = rf"(?:{_VERB}\s+(?:мне\s+)?|"
+_CREATE += r"(?:поставь|создай|добавь|запланируй)(?:\s+мне)?\s+напоминание\s+)"
 _SCHEDULE = rf"(?P<cadence>{_CADENCE})\s+в\s+(?P<clock>{_CLOCK})"
 _COMMANDS = tuple(
     re.compile(pattern, re.I)
     for pattern in (
-        rf"{_VERB}\s+(?:мне\s+)?{_SCHEDULE}\s+(?P<name>.+)",
+        rf"{_CREATE}(?:на\s+)?{_SCHEDULE}\s*[,—:]?\s+(?P<name>.+)",
         rf"{_SCHEDULE}\s+{_VERB}\s+(?:мне\s+)?(?P<name>.+)",
-        rf"{_VERB}\s+(?:мне\s+)?(?P<name>.+?)\s+{_SCHEDULE}",
+        rf"{_CREATE}(?P<name>.+?)\s+(?:на\s+)?{_SCHEDULE}",
     )
 )
 _REPEATING = re.compile(

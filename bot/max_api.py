@@ -80,7 +80,15 @@ class MaxAPI:
         except (httpx.HTTPError, ValueError) as exc:
             raise MaxAPIError("Не удалось получить подробности сообщения") from exc
 
-    async def send(self, chat_id: int, text: str, *, to_user: bool = False, buttons=None) -> None:
+    async def send(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        to_user: bool = False,
+        buttons=None,
+        text_format: str | None = None,
+    ) -> None:
         """Send in dialog/chat respecting the per-recipient rate limit.
 
         When MAX provides no chat_id for a dialog, use the sender's user_id.
@@ -100,6 +108,7 @@ class MaxAPI:
                         params={target[0]: target[1]},
                         json={
                             "text": chunk,
+                            **({"format": text_format} if text_format else {}),
                             **(
                                 {
                                     "attachments": [

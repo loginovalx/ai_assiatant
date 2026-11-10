@@ -34,7 +34,7 @@ class FakeMax:
         self.sent: list[dict[str, Any]] = []
         self.answered: list[tuple[str, str | None]] = []
 
-    async def send(self, chat_id, text, *, to_user=False, buttons=None) -> None:
+    async def send(self, chat_id, text, *, to_user=False, buttons=None, text_format=None) -> None:
         self.sent.append({"chat_id": chat_id, "text": text, "buttons": buttons})
 
     async def answer_callback(self, callback_id, text=None) -> None:
@@ -135,7 +135,7 @@ async def test_greeting_offers_quick_actions(handler):
     await bot.handle_update(text_message("/start"))
 
     assert max_api.sent[0]["buttons"] == QUICK_ACTIONS
-    assert "AI-ассистент" in max_api.sent[0]["text"]
+    assert QUICK_ACTIONS[0][0]["payload"] == "quick:import"
 
 
 async def test_confirm_button_executes_draft(handler, redis_client):

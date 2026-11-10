@@ -24,6 +24,12 @@ def test_parse_repeat(command, weekday):
     )
 
 
+def test_parse_reminder_from_natural_create_command():
+    assert parse_command("поставь напоминание на каждый вторник в 17:48 полить цветы") == (
+        ReminderRule(name="полить цветы", weekday=1, clock=time(17, 48))
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [

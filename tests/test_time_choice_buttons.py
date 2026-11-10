@@ -46,8 +46,10 @@ class FakeMax:
         self.sent: list[dict[str, Any]] = []
         self.answered: list[tuple[str, str | None]] = []
 
-    async def send(self, chat_id, text, *, to_user=False, buttons=None):
-        self.sent.append({"chat_id": chat_id, "text": text, "buttons": buttons})
+    async def send(self, chat_id, text, *, to_user=False, buttons=None, text_format=None):
+        self.sent.append(
+            {"chat_id": chat_id, "text": text, "buttons": buttons, "format": text_format}
+        )
 
     async def answer_callback(self, callback_id, text=None):
         self.answered.append((callback_id, text))
@@ -369,3 +371,24 @@ async def test_negative_reschedule_text_is_not_treated_as_keep():
     assert agent.confirmed == []
     assert agent.asked[0]["text"] == "нет, перенеси на 12:00"
     assert agent.asked[0]["edit_draft_id"] == str(current.id)
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        text_message("/start"),
+        {"update_type": "bot_started", "user": {"user_id": USER}},
+    ],
+)
+async def test_welcome_only_shows_calendar_format_after_import_button(start):
+    bot, api, agent, _ = build_bot()
+    await bot.handle_update(start)
+    welcome = api.sent[-1]
+    assert "**Задачи и встречи**" in welcome["text"]
+    assert "мини-приложение" in welcome["text"]
+    assert "CSV" not in welcome["text"]
+    assert welcome["format"] == "markdown"
+    await bot.handle_update(callback(all_buttons(welcome)[0]["payload"]))
+    assert "CSV UTF-8" in api.sent[-1]["text"]
+    assert all(column in api.sent[-1]["text"] for column in ("`id`", "`date`", "`time`", "`text`"))
+    assert not agent.asked

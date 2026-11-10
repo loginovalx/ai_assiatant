@@ -47,6 +47,12 @@ def parse_calendar_csv(data: bytes, tz: ZoneInfo) -> tuple[list[CalendarRow], li
 
     reader = csv.DictReader(io.StringIO(text))
     columns = {(name or "").strip().lower() for name in (reader.fieldnames or [])}
+    # Excel can use a semicolon as the CSV separator depending on locale.
+    if not set(REQUIRED_COLUMNS).issubset(columns):
+        excel = csv.DictReader(io.StringIO(text), delimiter=";")
+        excel_columns = {(name or "").strip().lower() for name in (excel.fieldnames or [])}
+        if set(REQUIRED_COLUMNS).issubset(excel_columns):
+            reader, columns = excel, excel_columns
     missing = [c for c in REQUIRED_COLUMNS if c not in columns]
     if missing:
         raise CalendarImportError(f"В файле нет обязательных колонок: {', '.join(missing)}")

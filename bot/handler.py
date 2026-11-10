@@ -35,36 +35,21 @@ from common.schemas import DraftAction, EventStatus
 logger = logging.getLogger(__name__)
 
 _HELP = (
-    "Привет! Я твой персональный AI-ассистент.\n\n"
-    "Помогаю вести дела и расписание: создаю встречи и напоминания, нахожу события "
-    "в календаре, рассказываю о предстоящем и напоминаю о нём в нужное время.\n\n"
-    "Напиши или скажи голосом, например:\n"
-    "• «Что у меня завтра?»\n"
-    "• «Напомни в 18:00 отправить отчёт»\n"
-    "• «Поставь встречу с Марией на пятницу в 14:00»\n"
-    "• «Когда у меня следующая встреча с Иваном?»\n\n"
-    "Можно обычным языком — я разберусь. А ещё можно прислать CSV-файл "
-    "с календарём (колонки id, date, time, text), и я загружу его себе.\n\n"
-    "Всё расписание целиком — в мини-приложении: кнопка слева от поля ввода. "
-    "Там список по дням, поиск, фильтры по типу и отметка «выполнено»."
+    "Привет! Я помогу вести расписание. Пиши или говори голосом.\n\n"
+    "• **Задачи и встречи** — добавляй в календарь.\n"
+    "• **Напоминания** — разовые или по расписанию.\n"
+    "• **Календарь** — спроси «Что у меня завтра?» или открой мини-приложение "
+    "кнопкой слева от поля ввода.\n\n"
+    "Уже есть расписание в Excel? Нажми «Загрузить календарь»."
 )
-# Подсказка по кнопке «Загрузить свой календарь»: без примера формата пользователь
-# присылает произвольную таблицу, и импорт падает на проверке колонок.
 _IMPORT_HELP = (
-    "Пришли мне CSV-файл с календарём — я загружу его, и дальше можно спрашивать "
-    "про эти события обычными словами.\n\n"
-    "В файле нужны четыре колонки с такими заголовками: id, date, time, text\n"
-    "• id — любой номер строки, лишь бы не повторялся\n"
-    "• date — дата в виде 2026-11-13\n"
-    "• time — время в виде 14:30\n"
-    "• text — что за событие\n\n"
-    "Например:\n"
-    "id,date,time,text\n"
-    "1,2026-11-13,14:30,Встреча с Марией\n"
-    "2,2026-11-14,09:00,Отправить отчёт\n\n"
-    "Длительности в таком файле нет, поэтому каждая запись займёт час. Если нужно "
-    "иначе — скажи потом, например «встреча с Марией длится два часа», и я поправлю.\n\n"
-    "Просто прикрепи файл в чат — писать ничего не нужно."
+    "**Как загрузить календарь из Excel**\n\n"
+    "1. Назови колонки `id`, `date`, `time`, `text`.\n"
+    "2. Сохрани таблицу как **CSV UTF-8** и прикрепи файл к сообщению.\n\n"
+    "**Пример строки**\n"
+    "`1,2026-11-13,14:30,Встреча с Марией`\n\n"
+    "У каждой строки свой номер. Дата — ГГГГ-ММ-ДД, время — ЧЧ:ММ. "
+    "Каждая запись займёт 1 час."
 )
 # Больше 1000 строк CSV для теста не нужно, а файл на мегабайты — повод отказать сразу.
 _MAX_CSV_BYTES = 5_000_000
@@ -126,7 +111,7 @@ QUICK_ACTIONS = [
     [
         {
             "type": "callback",
-            "text": "Загрузить свой календарь",
+            "text": "Загрузить календарь",
             "payload": "quick:import",
         },
     ],
@@ -338,7 +323,7 @@ class BotHandler:
         user_id = str(user)
         if payload == "quick:import":
             # Статичная подсказка: гонять её через агента незачем, формат фиксированный.
-            await self.max_api.send(int(user), _IMPORT_HELP, to_user=True)
+            await self.max_api.send(int(user), _IMPORT_HELP, to_user=True, text_format="markdown")
             await self.max_api.answer_callback(callback_id)
             return
         if payload.startswith("quick:"):
@@ -504,10 +489,10 @@ class BotHandler:
         else:
             await self.max_api.answer_callback(callback_id, "Неизвестное действие")
 
-    async def _greet_if_new(self, user_id: str, reply: Callable[[str], Awaitable[None]]) -> None:
-        """Приветствие ровно один раз на пользователя: флаг переживает перезапуск бота."""
-        if await self.redis.set(f"bot:greeted:{user_id}", "1", nx=True):
-            await reply(_HELP)
+    async def _send_welcome(self, chat_id: int, *, to_user: bool = False) -> None:
+        await self.max_api.send(
+            chat_id, _HELP, to_user=to_user, buttons=QUICK_ACTIONS, text_format="markdown"
+        )
 
     async def _import_csv(
         self, user_id: str, url: str, reply: Callable[[str], Awaitable[None]]
@@ -590,9 +575,9 @@ class BotHandler:
                 # Представились здесь — не повторяем приветствие перед первым ответом.
                 await self.redis.set(f"bot:greeted:{user_id}", "1")
             if chat_id is not None:
-                await self.max_api.send(int(chat_id), _HELP)
+                await self._send_welcome(int(chat_id))
             elif user_id is not None:
-                await self.max_api.send(int(user_id), _HELP, to_user=True)
+                await self._send_welcome(int(user_id), to_user=True)
             return
         if kind != "message_created":
             return
@@ -625,11 +610,12 @@ class BotHandler:
         text = ((message.get("body") or {}).get("text") or "").strip()
         if text in {"/start", "/help"}:
             await self.redis.set(f"bot:greeted:{user_id}", "1")
-            await self.max_api.send(chat_id, _HELP, to_user=to_user, buttons=QUICK_ACTIONS)
+            await self._send_welcome(chat_id, to_user=to_user)
             return
 
         # Первое сообщение от незнакомого пользователя: сначала представимся.
-        await self._greet_if_new(user_id, reply)
+        if await self.redis.set(f"bot:greeted:{user_id}", "1", nx=True):
+            await self._send_welcome(chat_id, to_user=to_user)
 
         csv_url = extract_csv(message)
         if csv_url:

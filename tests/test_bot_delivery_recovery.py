@@ -40,7 +40,7 @@ class FailAfterAgentMax:
         self.sent = []
         self.fail_result = True
 
-    async def send(self, chat_id, text, *, to_user=False, buttons=None):
+    async def send(self, chat_id, text, *, to_user=False, buttons=None, text_format=None):
         if text == "Запрос обработан" and self.fail_result:
             self.fail_result = False
             raise OSError("temporary MAX send failure")

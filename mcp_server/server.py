@@ -44,6 +44,7 @@ from common.timeutils import (
     mentions_start_time,
     mentions_time,
     named_weekday,
+    resolve_reschedule_day,
     resolve_weekday_mismatch,
 )
 from mcp_server.auth import InternalTokenVerifier
@@ -442,6 +443,8 @@ async def update_event(
         ),
     ] = None,
     dry_run: bool = False,
+    user_text: str | None = None,
+    date_reference: datetime | None = None,
 ) -> EventWithConflicts:
     """Изменить существующую задачу, напоминание или встречу: перенести время, переименовать,
     поменять длительность.
@@ -460,7 +463,13 @@ async def update_event(
 
     now = datetime.now(get_settings().tz).replace(microsecond=0)
     if start_at is not None:
-        start_at = ensure_aware(start_at, get_settings().tz)
+        tz = get_settings().tz
+        start_at = ensure_aware(start_at, tz).astimezone(tz)
+        reference = ensure_aware(date_reference or now, tz).astimezone(tz)
+        try:
+            start_at = resolve_reschedule_day(user_text or "", start_at, reference)
+        except ValueError as error:
+            raise ToolError(str(error)) from error
     if start_at is not None and start_at < now - PAST_TOLERANCE:
         raise ToolError(
             f"Время {start_at.isoformat()} уже прошло (сейчас {now.isoformat()}). "

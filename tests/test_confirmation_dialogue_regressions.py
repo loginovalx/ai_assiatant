@@ -385,3 +385,91 @@ def test_start_time_is_not_duration(value, expected):
 )
 def test_explicit_tasks_and_reminders_keep_their_type(value):
     assert not is_person_appointment(value)
+
+
+@pytest.fixture
+def request_clock(monkeypatch, tz):
+    clock = [datetime(2030, 11, 10, 1, 10, tzinfo=tz)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, zone=None):
+            return clock[0].astimezone(zone) if zone else clock[0].replace(tzinfo=None)
+
+    monkeypatch.setattr("agent.core.datetime", Clock)
+    monkeypatch.setattr("mcp_server.server.datetime", Clock)
+    return clock
+
+
+async def test_read_reschedule_shorten_rename_keeps_tomorrow(session, request_clock, tz):
+    build, repo = session
+    target = datetime(2030, 11, 11, 11, tzinfo=tz)
+    # A known creation ID lets the scripted model imitate the exact regression.
+    event = await repo.create(
+        EventCreate(
+            user_id="777",
+            type="meeting",
+            name="ПРОВЕРКА Созвон с Анной",
+            start_at=target,
+            duration_minutes=60,
+        )
+    )
+    _, api, message, _, _, _ = build(
+        text("Этот созвон начнётся завтра в 11:00 и продлится 1 час."),
+        tool_call(
+            "update_event",
+            {
+                "event_id": str(event.id),
+                "start_at": target.replace(day=12, hour=12, minute=20).isoformat(),
+                "user_text": "послезавтра",
+                "date_reference": "2030-11-20T01:10:00+03:00",
+            },
+        ),
+        tool_call("update_event", {"event_id": str(event.id), "duration_minutes": 20}),
+        tool_call(
+            "update_event", {"event_id": str(event.id), "name": "ПРОВЕРКА Обсуждение макета"}
+        ),
+    )
+    await message("Во сколько начнётся этот созвон и сколько продлится?")
+    await message("Перенеси его на завтра в 12:20.")
+    assert "11 ноября 2030" in api.sent[-1]["text"]
+    assert repo.rows[event.id].start_at == target.replace(hour=12, minute=20)
+    await message("Сократи до 20 минут.")
+    await message("Переименуй её в «ПРОВЕРКА Обсуждение макета».")
+    saved = repo.rows[event.id]
+    assert saved.start_at == target.replace(hour=12, minute=20)
+    assert saved.duration_minutes == 20 and saved.end_at.hour == 12 and saved.end_at.minute == 40
+    assert saved.name == "ПРОВЕРКА Обсуждение макета"
+
+
+async def test_voice_reschedule_approval_after_midnight_keeps_preview_day(
+    session, request_clock, tz
+):
+    build, repo = session
+    request_clock[0] = datetime(2030, 11, 10, 23, 59, tzinfo=tz)
+    target = datetime(2030, 11, 11, 11, tzinfo=tz)
+    event = await repo.create(
+        EventCreate(
+            user_id="777",
+            type="meeting",
+            name="Созвон",
+            start_at=target,
+            duration_minutes=60,
+        )
+    )
+    _, api, message, click, _, _ = build(
+        tool_call(
+            "update_event",
+            {
+                "event_id": str(event.id),
+                "start_at": target.replace(day=12, hour=12, minute=20).isoformat(),
+            },
+        )
+    )
+    await message("Перенеси созвон на завтра в 12:20", voice=True)
+    assert "11 ноября 2030" in api.sent[-1]["text"]
+    assert repo.rows[event.id].start_at == target
+    request_clock[0] = datetime(2030, 11, 11, 0, 1, tzinfo=tz)
+    await click("Сохранить")
+    assert repo.rows[event.id].start_at == target.replace(hour=12, minute=20)
+    assert repo.rows[event.id].duration_minutes == 60

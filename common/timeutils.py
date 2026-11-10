@@ -22,6 +22,34 @@ def ensure_aware(dt: datetime, tz: ZoneInfo) -> datetime:
     return dt.replace(tzinfo=tz) if dt.tzinfo is None else dt
 
 
+def resolve_reschedule_day(text: str, proposed: datetime, reference: datetime) -> datetime:
+    """Anchor clear relative target days to the request clock, not the event date.
+
+    Both datetimes must be in the user's timezone. Quoted event names never
+    supply a scheduling instruction. Complex/date-qualified requests stay with
+    the existing model interpretation; conflicting simple days require a question.
+    """
+    source = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", text)
+    source = re.sub(r"\bв\s+\d{1,2}[.:]\d{2}\b", "", source, flags=re.I)
+    if re.search(
+        r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[./]\d{1,2}\b|"
+        r"\b(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)\w*|"
+        r"\b(?:после|перед|через|относительно)\b",
+        source,
+        re.I,
+    ):
+        return proposed
+    days = set(re.findall(r"\b(?:сегодня|завтра|послезавтра)\b", source.casefold()))
+    if len(days) > 1:
+        raise ValueError("Названо несколько дней. Уточните конкретную дату переноса.")
+    if not days:
+        return proposed
+    target = reference.date() + timedelta(
+        days={"сегодня": 0, "завтра": 1, "послезавтра": 2}[days.pop()]
+    )
+    return proposed.replace(year=target.year, month=target.month, day=target.day)
+
+
 _DURATION_AMOUNT = (
     r"(?:\d+(?:[,.]\d+)?|один|одну|два|две|три|четыре|пять|шесть|семь|восемь|"
     r"девять|десять|одиннадцать|двенадцать|пятнадцать|двадцать|тридцать|сорок|"

@@ -124,6 +124,7 @@ class Agent:
                 request_id=request_id,
                 read_period=_read_period(text, now),
                 source_text=source_text,
+                date_reference=now.isoformat(),
                 deletion_period=_deletion_period(source_text, now),
                 route=route,
             )
@@ -184,6 +185,14 @@ class Agent:
                     draft.tool,
                     draft.arguments,
                     event_ids=draft.arguments.get("event_ids"),
+                )
+            elif draft.tool == "update_event":
+                result = await self._toolbox.call(
+                    user_id,
+                    draft.tool,
+                    draft.arguments,
+                    user_text=draft.arguments.get("user_text"),
+                    date_reference=draft.arguments.get("date_reference"),
                 )
             else:
                 result = await self._toolbox.call(user_id, draft.tool, draft.arguments)
@@ -293,6 +302,7 @@ class Agent:
         request_id: UUID | None = None,
         read_period: tuple[datetime, datetime] | None = None,
         source_text: str | None = None,
+        date_reference: str | None = None,
         deletion_period: tuple[datetime, datetime] | None = None,
         route: ModelRoute | None = None,
     ) -> AgentResponse:
@@ -378,6 +388,10 @@ class Agent:
                     evidence["user_text"] = source_text
                     if args is not None:
                         args = {**args, "user_text": source_text}
+                elif name == "update_event" and source_text is not None:
+                    evidence = {"user_text": source_text, "date_reference": date_reference}
+                    if args is not None:
+                        args = {**args, **evidence}
                 if name == "get_events" and args is not None and read_period is not None:
                     args = {
                         **args,

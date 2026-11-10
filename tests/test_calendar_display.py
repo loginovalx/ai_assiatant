@@ -64,4 +64,10 @@ def test_agent_calendar_renderers_use_the_same_readable_display():
     preview = _draft_preview("u", "create_event", ToolResult(ok=True, payload={}, events=[raw]), {})
     assert expected in preview
     assert expected in _confirmed_response({str(event.id): event}).reply_text
-    assert expected in _read_response({str(event.id): event}, {"get_events"}).reply_text
+    reminder = event.model_copy(update={"id": uuid4(), "type": "reminder", "name": "Позвонить"})
+    schedule = _read_response({str(e.id): e for e in [event, reminder]}, {"get_events"})
+    assert schedule.reply_text == (
+        "Расписание\n\n8 ноября 2026, воскресенье\n"
+        "• 12:00–13:00 — Встреча · Встреча\n"
+        "• 12:00 — Позвонить · Напоминание"
+    )

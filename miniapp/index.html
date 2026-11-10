@@ -58,12 +58,19 @@
   }
   .create-dialog::backdrop { background: rgb(0 0 0 / 48%); }
   .create-dialog h2 { margin: 0 0 12px; font-size: 20px; }
-  .create-dialog label { display: grid; gap: 4px; margin-bottom: 12px; }
+  .create-when {
+    display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 8px;
+  }
+  .create-dialog label { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; margin-bottom: 12px; }
   .create-dialog input, .create-dialog select {
     min-width: 0; width: 100%; min-height: 44px; padding: 8px 10px; font: inherit;
     border: 1px solid var(--border); border-radius: 10px;
     color: var(--text); background: var(--bg);
   }
+  .create-when input {
+    display: block; max-width: 100%; -webkit-appearance: none; appearance: none;
+  }
+  .create-when input::-webkit-date-and-time-value { min-width: 0; text-align: left; }
   .create-actions { flex-wrap: wrap; justify-content: flex-end; margin-top: 12px; }
   .create-error { color: var(--error); }
   .conflict-list { max-height: 9rem; overflow: auto; overflow-wrap: anywhere; }
@@ -157,9 +164,12 @@
         </select>
       </label>
       <label>Название <input id="createName" maxlength="200" required></label>
-      <label><span id="createStartLabel">Дата и время (необязательно)</span>
-        <input id="createStart" type="datetime-local">
-      </label>
+      <div class="create-when">
+        <label><span id="createDateLabel">Дата (необязательно)</span>
+          <input id="createDate" type="date">
+        </label>
+        <label>Время <input id="createTime" type="time"></label>
+      </div>
       <label class="hidden" id="createDurationField"><span id="createDurationLabel">Длительность, мин</span>
         <input id="createDuration" type="number" min="1" max="1440" step="1" inputmode="numeric">
       </label>
@@ -618,7 +628,8 @@ const entryDialog = document.getElementById('createDialog');
 const entryForm = document.getElementById('createForm');
 const entryType = document.getElementById('createType');
 const entryName = document.getElementById('createName');
-const entryStart = document.getElementById('createStart');
+const entryDate = document.getElementById('createDate');
+const entryTime = document.getElementById('createTime');
 const entryDuration = document.getElementById('createDuration');
 const entryError = document.getElementById('createError');
 const entryConflict = document.getElementById('createConflict');
@@ -634,10 +645,10 @@ let entryBusy = false;
 function entryFields() {
   const task = entryType.value === 'task';
   const meeting = entryType.value === 'meeting';
-  entryStart.required = !task;
-  document.getElementById('createStartLabel').textContent =
-    task ? 'Дата и время (необязательно)' : 'Дата и время';
-  const hasDuration = meeting || (task && !!entryStart.value);
+  entryDate.required = !task || !!entryTime.value;
+  entryTime.required = !task || !!entryDate.value;
+  document.getElementById('createDateLabel').textContent = task ? 'Дата (необязательно)' : 'Дата';
+  const hasDuration = meeting || (task && !!entryDate.value && !!entryTime.value);
   document.getElementById('createDurationField').classList.toggle('hidden', !hasDuration);
   document.getElementById('createDurationLabel').textContent =
     meeting ? 'Длительность, мин' : 'Длительность, мин (необязательно)';
@@ -676,7 +687,8 @@ entryType.addEventListener('change', () => {
   entryDuration.value = entryType.value === 'meeting' ? '60' : '';
   entryFields();
 });
-entryStart.addEventListener('input', entryFields);
+entryDate.addEventListener('input', entryFields);
+entryTime.addEventListener('input', entryFields);
 entryForm.addEventListener('input', () => {
   entryRequestId = crypto.randomUUID();
   entryError.classList.add('hidden');
@@ -684,7 +696,7 @@ entryForm.addEventListener('input', () => {
 });
 entryChange.addEventListener('click', () => {
   showEntryConflict(null);
-  entryStart.focus();
+  entryTime.focus();
 });
 entryCancel.addEventListener('click', () => entryDialog.close());
 entryDialog.addEventListener('cancel', (event) => {
@@ -700,10 +712,12 @@ async function saveEntry(confirmation) {
     entryName.focus();
     return;
   }
-  const start = entryStart.value ? toLocalISO(new Date(entryStart.value)) : null;
+  const start = entryDate.value && entryTime.value
+    ? toLocalISO(new Date(entryDate.value + 'T' + entryTime.value))
+    : null;
   const duration = entryDuration.disabled || !entryDuration.value ? null : Number(entryDuration.value);
   entryBusy = true;
-  const controls = [entryType, entryName, entryStart, entryCancel, entryChange, entrySave, entryConfirm];
+  const controls = [entryType, entryName, entryDate, entryTime, entryCancel, entryChange, entrySave, entryConfirm];
   controls.forEach((control) => { control.disabled = true; });
   entryDuration.disabled = true;
   entryError.classList.add('hidden');

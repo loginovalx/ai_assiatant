@@ -258,7 +258,7 @@ async def test_read_dates_and_names_are_rendered_from_persisted_fields(tool_name
     assert "18:00" in result.reply_text and "19:00" in result.reply_text
     assert "Точное название" in result.reply_text and "21 октября" not in result.reply_text
     if tool_name == "search_events":
-        assert "выборка" in result.reply_text
+        assert result.reply_text.startswith("Результаты поиска")
 
 
 async def test_successful_empty_read_cannot_be_replaced_with_fictional_event():
@@ -280,7 +280,7 @@ async def test_successful_read_survives_model_failure_after_tool():
     )
     result = await agent.handle("u", "Покажи задачи")
     assert result.status == AgentStatus.DONE and len(result.events) == 1
-    assert "без даты" in result.reply_text and "выполнено" in result.reply_text
+    assert "Без даты" in result.reply_text and "выполнено" in result.reply_text
 
 
 @pytest.mark.parametrize("tool_name", ["get_events", "search_events"])

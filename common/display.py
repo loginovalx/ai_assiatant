@@ -62,3 +62,23 @@ def format_calendar_time(
         return f"{_date_with_weekday(start)}, с {start:%H:%M} до {end:%H:%M}"
 
     return f"с {_date_with_weekday(start)}, {start:%H:%M} до {_date_with_weekday(end)}, {end:%H:%M}"
+
+
+def format_calendar_day(value: datetime, tz: ZoneInfo | None = None) -> str:
+    return _date_with_weekday(_local_datetime(value, tz))
+
+
+def format_calendar_slot(
+    start_at: datetime | None, end_at: datetime | None, tz: ZoneInfo | None = None
+) -> str:
+    """Compact time for a row displayed under a calendar date heading."""
+    if start_at is None:
+        return ""
+    start = _local_datetime(start_at, tz)
+    if end_at is None:
+        return f"{start:%H:%M}"
+    end = _local_datetime(end_at, tz)
+    end_day = (
+        "" if start.date() == end.date() else f" ({end.day} {MONTHS_RU_GENITIVE[end.month - 1]})"
+    )
+    return f"{start:%H:%M}–{end:%H:%M}{end_day}"

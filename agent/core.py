@@ -30,7 +30,12 @@ from common.dialogue import (
     clarification_text,
     is_clarification_question,
 )
-from common.display import MONTHS_RU_GENITIVE, format_calendar_time
+from common.display import (
+    MONTHS_RU_GENITIVE,
+    format_calendar_day,
+    format_calendar_slot,
+    format_calendar_time,
+)
 from common.schemas import MAX_DURATION_MINUTES, AgentResponse, AgentStatus, DraftAction, Event
 from common.timeutils import ensure_aware, reschedule_clock
 from common.usage import record_usage
@@ -1031,6 +1036,14 @@ def _when(event: Event) -> str:
     return format_calendar_time(event.start_at, event.end_at)
 
 
+_ENTRY_KINDS = {"task": "Задача", "meeting": "Встреча", "reminder": "Напоминание"}
+
+
+def _entry_name(event: Event) -> str:
+    # Keep a title from introducing extra rows in a schedule.
+    return " ".join(event.name.split())
+
+
 def _confirmed_response(
     events: dict[str, Event],
     conflicts: dict[str, Event] | None = None,
@@ -1040,7 +1053,7 @@ def _confirmed_response(
     lines = []
     for event in events.values():
         action = {"done": "Выполнено", "cancelled": "Отменено"}.get(event.status, "Сохранено")
-        lines.append(f"{action}: {event.name}, {_when(event)}.")
+        lines.append(f"{action}: {_entry_name(event)}\n{_ENTRY_KINDS[event.type]} · {_when(event)}")
     if show_conflicts:
         for event in (conflicts or {}).values():
             lines.append(f"Учтите: пересечение с «{event.name}», {_when(event)}.")
@@ -1060,13 +1073,20 @@ def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentRespo
     if not items:
         reply = "Подходящих записей не найдено." if search else "За указанный период записей нет."
         return AgentResponse(reply_text=reply, status=AgentStatus.DONE)
-    lines = [
-        "Подходящие записи (выборка по релевантности):"
-        if search
-        else f"Найдено записей: {len(items)}."
-    ]
+    tz = get_settings().tz
+    if not search:
+        items.sort(key=lambda event: (event.start_at is None, event.start_at))
+    lines = ["Результаты поиска" if search else "Расписание"]
+    previous_day = None
     for event in items:
-        when = _when(event)
-        status = " (выполнено)" if event.status == "done" else ""
-        lines.append(f"{when} — {event.name}{status}")
+        day = format_calendar_day(event.start_at, tz) if event.start_at else "Без даты"
+        if day != previous_day:
+            lines.extend(["", day])
+            previous_day = day
+        when = format_calendar_slot(event.start_at, event.end_at, tz)
+        status = " · выполнено" if event.status == "done" else ""
+        title = _entry_name(event)
+        kind = _ENTRY_KINDS[event.type]
+        prefix = f"{when} — " if when else ""
+        lines.append(f"• {prefix}{title} · {kind}{status}")
     return AgentResponse(reply_text="\n".join(lines), status=AgentStatus.DONE, events=items)

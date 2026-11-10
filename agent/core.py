@@ -21,6 +21,7 @@ from agent.policy import asks_to_read, explicitly_requests_change, is_single_act
 from agent.prompt import build_system_prompt
 from agent.routing import ModelRoute, completion_problem, select_model
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
+from agent.voice import grounded_voice_create
 from common.config import get_settings
 from common.dialogue import (
     PAST_TIME_QUESTION,
@@ -31,6 +32,7 @@ from common.dialogue import (
     clock_alternatives_question,
     is_appointment_request,
     is_clarification_question,
+    missing_meeting_question,
 )
 from common.display import (
     MONTHS_RU_GENITIVE,
@@ -149,7 +151,7 @@ class Agent:
                 read_period=_read_period(text, now),
                 source_text=source_text,
                 date_reference=now.isoformat(),
-                deletion_period=_deletion_period(source_text, now),
+                calendar_window=_day_or_read_period(source_text, now),
                 editing_draft=trusted_edit_source is not None,
                 route=route,
             )
@@ -344,6 +346,8 @@ class Agent:
                     completion, operation="agent", source="gpt2giga_openai", model=route.model
                 )
                 usage_recorded = True
+                if completion.choices[0].finish_reason == "length":
+                    raise ValueError("Model response was truncated by the output token limit")
                 message = completion.choices[0].message
                 problem = (
                     completion_problem(message, tools, route.expected_tool)
@@ -373,20 +377,48 @@ class Agent:
         read_period: tuple[datetime, datetime] | None = None,
         source_text: str | None = None,
         date_reference: str | None = None,
-        deletion_period: tuple[datetime, datetime] | None = None,
+        calendar_window: tuple[datetime, datetime] | None = None,
         editing_draft: bool = False,
         route: ModelRoute | None = None,
     ) -> AgentResponse:
         source = source_text or ""
         if (
             confirm_changes
-            and not editing_draft
-            and is_appointment_request(source)
-            and is_single_action_request(
-                " ".join(line.rstrip(".!?") for line in source.splitlines()), "create_event"
+            and calendar_window
+            and re.fullmatch(
+                r"что\s+у\s+меня\s+(?:сегодня|завтра|послезавтра)",
+                source.strip().rstrip(" .!?"),
+                re.I,
             )
-            and (hour := ambiguous_hour(source)) is not None
         ):
+            start, end = calendar_window
+            result = await self._toolbox.call(
+                user_id,
+                "get_events",
+                {"start_time": start.isoformat(), "end_time": end.isoformat()},
+            )
+            if not result.ok:
+                return AgentResponse(
+                    reply_text="Не удалось проверить календарь.", status=AgentStatus.ERROR
+                )
+            items = [Event.model_validate(raw) for raw in result.events]
+            if any(event.user_id != user_id for event in items):
+                raise ValueError("MCP returned another user's events")
+            return _read_response({str(event.id): event for event in items}, {"get_events"})
+
+        single_creation = is_single_action_request(
+            " ".join(line.rstrip(".!?") for line in source.splitlines()), "create_event"
+        )
+        simple_voice_create = confirm_changes and not editing_draft and single_creation
+        grounded = (
+            grounded_voice_create(
+                source, datetime.fromisoformat(date_reference).astimezone(self._tz)
+            )
+            if simple_voice_create and date_reference
+            else None
+        )
+        simple_voice_meeting = simple_voice_create and is_appointment_request(source)
+        if simple_voice_meeting and (hour := ambiguous_hour(source)) is not None:
             return AgentResponse(
                 reply_text=clarification_text(clock_alternatives_question(hour), source),
                 status=AgentStatus.NEED_CLARIFICATION,
@@ -403,7 +435,7 @@ class Agent:
         if blocked_tools:
             tools = [tool for tool in tools if tool["function"]["name"] not in blocked_tools]
         retried_unverified_change = False
-        retried_known_clock = False
+        retried_known_fields = False
         exact_clock = (
             requested_clock(source)
             if confirm_changes and not editing_draft and is_appointment_request(source)
@@ -432,6 +464,10 @@ class Agent:
                     allow_fallback=not mutation_attempted and not confirmed and draft is None,
                 )
             except Exception:
+                if grounded is not None and not (mutation_attempted or draft or read_tools):
+                    return await self._grounded_voice_preview(
+                        user_id, grounded, source, date_reference
+                    )
                 if draft is not None and not errors:
                     return _draft_response(draft)
                 if confirmed:
@@ -447,32 +483,69 @@ class Agent:
                     return _incomplete_response(events, confirmed, conflict_warnings, errors)
                 raise
 
-            if exact_clock is not None and not mutation_attempted and not (draft or read_tools):
+            if grounded is not None and not (mutation_attempted or draft or read_tools):
+                calls = message.tool_calls or []
+                if len(calls) != 1 or calls[0].function.name != "create_event":
+                    return await self._grounded_voice_preview(
+                        user_id, grounded, source, date_reference
+                    )
+
+            if (
+                (simple_voice_meeting or exact_clock is not None)
+                and not mutation_attempted
+                and not (draft or read_tools)
+            ):
                 question = message.content or ""
+                can_clarify = not message.tool_calls
                 if message.tool_calls:
                     question = ""
                     if len(message.tool_calls) == 1:
                         call = message.tool_calls[0].function
                         if call.name == "ask_user":
+                            can_clarify = True
                             question = str((_parse_args(call.arguments) or {}).get("question", ""))
                 question = clarification_text(question, source)
                 if (
-                    asks_for_clock_time(question)
-                    and not asks_for_day(question)
+                    simple_voice_meeting
+                    and can_clarify
                     and "уже прошло" not in question.casefold()
+                    and (missing := missing_meeting_question(source))
                 ):
-                    if retried_known_clock or round_number + 1 == self._max_steps:
+                    return AgentResponse(reply_text=missing, status=AgentStatus.NEED_CLARIFICATION)
+                if (
+                    asks_for_clock_time(question)
+                    or (
+                        simple_voice_meeting
+                        and (asks_for_day(question) or asks_for_duration(question))
+                    )
+                ) and "уже прошло" not in question.casefold():
+                    if not simple_voice_meeting and asks_for_day(question):
                         return AgentResponse(
-                            reply_text=f"Распознал время {exact_clock:%H:%M}, но не смог "
-                            "подготовить запись. Попробуй повторить команду целиком.",
+                            reply_text=question, status=AgentStatus.NEED_CLARIFICATION
+                        )
+                    if retried_known_fields or round_number + 1 == self._max_steps:
+                        return AgentResponse(
+                            reply_text=(
+                                f"Распознал время {exact_clock:%H:%M}, но не смог "
+                                "подготовить запись. "
+                                "Попробуй повторить команду целиком."
+                                if exact_clock is not None
+                                else "Не удалось подготовить запись. Календарь не изменён."
+                            ),
                             status=AgentStatus.ERROR,
                         )
-                    retried_known_clock = True
+                    retried_known_fields = True
+                    known_fields = (
+                        f"Пользователь уже указал время {exact_clock:%H:%M}. "
+                        if exact_clock is not None
+                        else "В команде уже есть дата, время и длительность. "
+                    )
                     messages[0] = {
                         **messages[0],
                         "content": messages[0]["content"]
-                        + f"\nПользователь уже указал время {exact_clock:%H:%M}. "
-                        "Используй его и уточни только действительно недостающие данные.",
+                        + "\n"
+                        + known_fields
+                        + "Используй указанные данные для создания записи.",
                     }
                     continue
 
@@ -487,7 +560,9 @@ class Agent:
                 if confirmed:
                     return _confirmed_response(confirmed, conflict_warnings)
                 is_question = is_clarification_question(reply)
-                if (confirm_changes or rescheduling) and _UNVERIFIED_CHANGE.search(reply):
+                if (confirm_changes or rescheduling) and (
+                    _UNVERIFIED_CHANGE.search(reply) or (simple_voice_create and not is_question)
+                ):
                     if retried_unverified_change or round_number + 1 == self._max_steps:
                         return AgentResponse(
                             reply_text="Не удалось выполнить действие. Календарь не изменён.",
@@ -535,6 +610,8 @@ class Agent:
                         status=AgentStatus.ERROR,
                     )
                 args = _parse_args(call.function.arguments)
+                if name == "create_event" and grounded is not None:
+                    args = grounded
                 evidence = {}
                 if name in {"create_event", "update_event"} and source_text is not None:
                     evidence = {"user_text": source_text, "date_reference": date_reference}
@@ -550,11 +627,11 @@ class Agent:
                     }
                 logger.info("tool call %s", name)
                 if name == "delete_events" and args is not None:
-                    if deletion_period:
+                    if calendar_window:
                         args = {
                             **args,
-                            "start_time": deletion_period[0].isoformat(),
-                            "end_time": deletion_period[1].isoformat(),
+                            "start_time": calendar_window[0].isoformat(),
+                            "end_time": calendar_window[1].isoformat(),
                         }
                     elif re.search(
                         r"сегодня|завтра|вчера|недел|месяц|\d|январ|феврал|март|апрел|"
@@ -581,7 +658,6 @@ class Agent:
                 fingerprint = json.dumps([name, args], ensure_ascii=False, sort_keys=True)
                 if (
                     name in MUTATING_TOOLS
-                    and not confirm_changes
                     and (read_tools or name == "delete_events" or asks_to_read(source_text or ""))
                     and not explicitly_requests_change(source_text or "", name)
                 ):
@@ -741,6 +817,36 @@ class Agent:
             return _draft_response(draft)
         return AgentResponse(reply_text=TOO_MANY_STEPS, status=AgentStatus.ERROR)
 
+    async def _grounded_voice_preview(self, user_id, arguments, source, date_reference):
+        args = {**arguments, "user_text": source, "date_reference": date_reference}
+        result = await self._toolbox.call(
+            user_id,
+            "create_event",
+            args,
+            dry_run=True,
+            user_text=source,
+            date_reference=date_reference,
+            preview_on_conflict=True,
+        )
+        if not result.ok:
+            question = _public_tool_error(str(result.payload))
+            return AgentResponse(
+                reply_text=question,
+                status=AgentStatus.NEED_CLARIFICATION
+                if question == PAST_TIME_QUESTION
+                else AgentStatus.ERROR,
+            )
+        return _draft_response(
+            DraftAction(
+                tool="create_event",
+                arguments=args,
+                preview=_draft_preview(user_id, "create_event", result, args),
+                status="pending_overlap_confirmation"
+                if _awaits_overlap_confirmation(result)
+                else "pending_confirmation",
+            )
+        )
+
 
 def _draft_response(draft: DraftAction) -> AgentResponse:
     return AgentResponse(
@@ -837,13 +943,7 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
         raise ValueError("Missing preview facts")
     if overlap:
         return "\n".join(lines)
-    footer = (
-        "Нажмите «Удалить» или «Нет»."
-        if name == "delete_event"
-        else "Подтвердите действие."
-        if name == "complete_event"
-        else "Подтвердите кнопкой «Сохранить»."
-    )
+    footer = "Нажмите «Удалить» или «Нет»." if name == "delete_event" else "Нажмите «Да» или «Нет»."
     return "\n".join([*lines, *conflict_lines, footer])
 
 
@@ -938,7 +1038,7 @@ def _user_source(history: list[HistoryMessage], text: str) -> str:
     return (pending + "\n" + text if pending else text)[-6000:]
 
 
-def _deletion_period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
+def _day_or_read_period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
     words = re.findall(r"\b(сегодня|завтра|послезавтра|вчера)\b", text.casefold())
     if len(words) == 1:
         day = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(

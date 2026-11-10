@@ -87,6 +87,20 @@ def clock_alternatives_question(hour: int) -> str:
     return f"Во сколько запланировать: в {hour:02}:00 или в {hour + 12:02}:00?"
 
 
+def missing_meeting_question(source: str) -> str | None:
+    if not has_meeting_day(source):
+        return MEETING_DAY_QUESTION
+    clock = mentions_start_time(source)
+    duration = mentions_duration(source) or allows_default_duration(source)
+    if not clock and not duration:
+        return "Во сколько начнётся встреча и сколько она продлится?"
+    if not clock:
+        return "Во сколько начнётся встреча?"
+    if not duration:
+        return "Сколько продлится встреча?"
+    return None
+
+
 def clarification_text(question: str, source: str) -> str:
     """Ask both missing fields together, while retaining an already named field."""
     if "уже прошло" in question.casefold():

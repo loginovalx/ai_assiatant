@@ -45,23 +45,24 @@ CLOCK_HOUR_WORDS = (
 _HOUR = rf"(?:\d{{1,2}}|{'|'.join(reversed(CLOCK_HOUR_WORDS))})"
 _HOUR_UNIT = r"(?:\s+час(?:а|ов)?)?"
 _PART = r"(?:утра|дня|вечера|ночи|утром|дн[её]м|вечером|ночью)"
-_CLOCK = (
+CLOCK_EXPRESSION = (
     rf"{_HOUR}(?:[:. ]\d{{2}}|\s+ноль\s+ноль|{_HOUR_UNIT})(?:\s+{_PART})?"
     rf"\b(?![:.]\d|\d|\s+(?:\d{{2}}|час(?:а|ов)?|{_PART})\b)"
 )
-_CLOCK_IN_TEXT = re.compile(rf"\bв\s+{_CLOCK}", re.I)
+_CLOCK_IN_TEXT = re.compile(rf"\bв\s+{CLOCK_EXPRESSION}", re.I)
 _CADENCE = rf"(?:каждый день|ежедневно|(?:кажд(?:ый|ую|ое)|по) (?:{'|'.join(_DAY_FORMS)}))"
 _VERB = r"(?:напомни(?:те)?|напоминай(?:те)?|напоминать)"
 _CREATE = rf"(?:{_VERB}\s+(?:мне\s+)?|"
 _CREATE += r"(?:поставь|создай|добавь|запланируй)(?:\s+мне)?\s+напоминание\s+|(?:я\s+)?хочу\s+)"
-_SCHEDULE = rf"(?P<cadence>{_CADENCE})\s*[,—]?\s+в\s+(?P<clock>{_CLOCK})"
+_SCHEDULE = rf"(?P<cadence>{_CADENCE})\s*[,—]?\s+в\s+(?P<clock>{CLOCK_EXPRESSION})"
 _COMMANDS = tuple(
     re.compile(pattern, re.I)
     for pattern in (
         rf"{_CREATE}(?:на\s+)?{_SCHEDULE}\s*[,—:]?\s+(?P<name>.+)",
         rf"{_SCHEDULE}\s+{_VERB}\s+(?:мне\s+)?(?P<name>.+)",
         rf"{_CREATE}(?P<name>.+?)\s+(?:на\s+)?{_SCHEDULE}",
-        rf"{_CREATE}(?:на\s+)?(?P<cadence>{_CADENCE})\s+(?P<name>.+?)\s+в\s+(?P<clock>{_CLOCK})",
+        rf"{_CREATE}(?:на\s+)?(?P<cadence>{_CADENCE})\s+(?P<name>.+?)\s+в\s+"
+        rf"(?P<clock>{CLOCK_EXPRESSION})",
     )
 )
 _REPEATING = re.compile(
@@ -139,6 +140,10 @@ def complete_clock(text: str, clock: time) -> str:
     return updated if count else f"{text.rstrip(' .!?')} {value}"
 
 
+def clock_needs_daypart(value: str, clock: time) -> bool:
+    return 1 <= clock.hour <= 11 and bool(re.fullmatch(rf"{_HOUR}{_HOUR_UNIT}", value, re.I))
+
+
 def parse_command(text: str) -> ReminderRule | None:
     parsed = parse_request(text)
     return parsed[0] if parsed else None
@@ -172,7 +177,6 @@ def parse_request(text: str) -> tuple[ReminderRule, bool] | None:
     clock = parse_clock(match["clock"])
     if clock is None:
         raise ValueError
-    ambiguous = 1 <= clock.hour <= 11 and bool(
-        re.fullmatch(rf"{_HOUR}{_HOUR_UNIT}", match["clock"], re.I)
+    return ReminderRule(name=name, weekday=day, clock=clock), clock_needs_daypart(
+        match["clock"], clock
     )
-    return ReminderRule(name=name, weekday=day, clock=clock), ambiguous

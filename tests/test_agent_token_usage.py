@@ -23,6 +23,15 @@ def make_agent(script, results):
     return Agent(llm, "test", toolbox, Memory(), ZoneInfo("Europe/Moscow")), llm, toolbox
 
 
+async def test_truncated_model_output_cannot_prepare_or_execute_a_calendar_change():
+    completion = tool_call("create_event", {"name": "Test"})
+    completion.choices[0].finish_reason = "length"
+    agent, _, toolbox = make_agent([completion], mutation())
+    response = await agent.handle("u", "Создай задачу подготовить отчёт", confirm_changes=True)
+    assert response.status == "error" and response.draft is None
+    assert toolbox.calls == 0
+
+
 @pytest.mark.parametrize(
     ("tool", "request_text", "status"),
     [

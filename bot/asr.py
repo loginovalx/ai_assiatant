@@ -8,6 +8,7 @@ from typing import Protocol
 import httpx
 
 logger = logging.getLogger(__name__)
+DEFAULT_WHISPER_MODEL = "small"
 
 
 class SpeechRecognitionError(Exception):
@@ -25,7 +26,7 @@ class WhisperASR:
     PyAV inside faster-whisper can decode OGG/Opus and other common formats.
     """
 
-    def __init__(self, model_name: str = "base"):
+    def __init__(self, model_name: str = DEFAULT_WHISPER_MODEL):
         self.model_name = model_name
         self._model = None
         self._lock = asyncio.Lock()

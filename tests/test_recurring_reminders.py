@@ -54,14 +54,14 @@ async def test_preview_edit_and_confirm_use_only_entered_clock(redis, tz):
         await repeats.callback("777", uuid4().hex, payload)
 
     assert await repeats.message("777", "Напоминай каждый понедельник в 09:00 отчёт", series)
-    await press("Изменить")
+    assert await repeats.message("777", "Исправить", uuid4())
     await press("Изменить время")
     assert await repeats.message("777", "25:00", uuid4())
     assert "ЧЧ:ММ" in api.sent[-1]["text"]
     assert await repeats.message("777", "10:30", uuid4())
     assert "Каждый понедельник в 10:30" in api.sent[-1]["text"]
     repo.save_reminder_series.assert_not_called()
-    await press("Сохранить")
+    await press("Да")
     assert [b["text"] for b in all_buttons(api.sent[-1])] == ["Изменить", "Отключить"]
     args = repo.save_reminder_series.await_args.args
     assert args[:3] == ("777", series, ReminderRule(name="отчёт", weekday=0, clock=time(10, 30)))

@@ -136,8 +136,8 @@ def session(redis, tz, monkeypatch):
         api = FakeMax()
         bot = BotHandler(api, None, AgentClient("http://agent"), StateStore(redis), redis)
 
-        async def message(value, voice=False):
-            update = text_message(value, uuid4().hex)
+        async def message(value, voice=False, mid=None):
+            update = text_message(value, mid or uuid4().hex)
             if voice:
                 body = update["message"]["body"]
                 body.pop("text")
@@ -286,14 +286,14 @@ async def test_voice_edit_replaces_draft_and_commits_changed_values(session, red
     assert "Создать встречу «Занятие с Аней»?" in preview["text"]
     assert "Описание:" not in preview["text"]
     assert "30 мин." in preview["text"] and repo.writes == 0
-    old_save = next(b["payload"] for b in all_buttons(preview) if b["text"] == "Сохранить")
+    old_save = next(b["payload"] for b in all_buttons(preview) if b["text"] == "Да")
     assert await redis.ttl("agent:pending:777") >= 3500
     assert await redis.ttl("bot:draft:777") >= 3500
-    await click("Исправить")
+    await message("Исправить")
     assert await bot.drafts.is_editing("777", await bot.drafts.load("777"))
     await message("Поставь встречу с Ольгой завтра в 13:00 на 45 минут")
     assert repo.writes == 0 and "Ольгой" in api.sent[-1]["text"]
-    save = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Сохранить")
+    save = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Да")
     await click(payload=old_save)
     assert repo.writes == 0
     await click(payload=save)
@@ -323,13 +323,13 @@ async def test_voice_save_claim_is_retried_as_a_draft(session, tz):
             },
         ),
     )
-    await message("Напомни завтра в 19:00 забрать посылку", voice=True)
+    await message("Пожалуйста, напомни завтра в 19:00 забрать посылку", voice=True)
     assert repo.writes == 0
-    assert {b["text"] for b in all_buttons(api.sent[-1])} >= {"Сохранить", "Исправить", "Отмена"}
+    assert {b["text"] for b in all_buttons(api.sent[-1])} == {"Да", "Нет"}
     assert "19:00" in api.sent[-1]["text"]
     await message("измени на 19:30")
     assert repo.writes == 0 and "19:30" in api.sent[-1]["text"]
-    await click("Сохранить")
+    await click("Да")
     assert repo.writes == 1
     assert next(iter(repo.rows.values())).start_at == when.replace(minute=30)
 
@@ -338,7 +338,7 @@ async def test_unverified_voice_save_never_claims_success(session):
     build, repo = session
     claim = text("Готово! Сохранено: забрать посылку.")
     _, api, message, _, _, _ = build(claim, claim)
-    await message("Напомни завтра в 19:00 забрать посылку", voice=True)
+    await message("Пожалуйста, напомни завтра в 19:00 забрать посылку", voice=True)
     assert repo.writes == 0
     assert "Календарь не изменён" in api.sent[-1]["text"]
 
@@ -388,7 +388,7 @@ async def test_clock_only_voice_confirmation_keeps_previewed_date(session, tz):
     await message("Измени на 19:30", voice=True)
     assert repo.rows[event.id].start_at == when and "19:30" in api.sent[-1]["text"]
     await repo.update("777", event.id, start_at=when + timedelta(days=1))
-    await click("Сохранить")
+    await click("Да")
     assert repo.rows[event.id].start_at == when.replace(minute=30)
 
 
@@ -404,7 +404,7 @@ async def test_voice_cannot_invent_hour_duration_for_lesson(session, tz):
     assert repo.writes == 0
     await message("30 минут")
     assert "30 мин." in api.sent[-1]["text"] and repo.writes == 0
-    await click("Сохранить")
+    await click("Да")
     assert repo.writes == 1
 
 
@@ -435,10 +435,10 @@ async def test_voice_edit_of_existing_meeting_saves_latest_values_after_review(s
     )
     await message("Переименуй занятие с Аней в Занятие с Ольгой", voice=True)
     assert repo.rows[event.id].name == "Занятие с Аней"
-    await click("Исправить")
+    await message("Исправить")
     await message("Перенеси на 13:00")
     assert repo.writes == 1 and "13:00" in api.sent[-1]["text"]
-    await click("Сохранить")
+    await click("Да")
     assert repo.writes == 2
     assert repo.rows[event.id].name == "Занятие с Ольгой"
     assert repo.rows[event.id].start_at.hour == 13
@@ -596,7 +596,7 @@ async def test_voice_reschedule_approval_after_midnight_keeps_preview_day(
     assert "11 ноября 2030" in api.sent[-1]["text"]
     assert repo.rows[event.id].start_at == target
     request_clock[0] = datetime(2030, 11, 11, 0, 1, tzinfo=tz)
-    await click("Сохранить")
+    await click("Да")
     assert repo.rows[event.id].start_at == target.replace(hour=12, minute=20)
     assert repo.rows[event.id].duration_minutes == 60
 
@@ -683,11 +683,11 @@ async def test_duration_button_and_conflict_wait_for_explicit_save(session, tz):
     assert "Длительность" not in reply
     assert len(model.requests) == 2  # no generation to describe the overlap
     assert (await bot.drafts.load("777")).confirm_overlap
-    await click("Отмена")
+    await click("Нет")
     assert repo.writes == 1
     await message("Поставь завтра встречу с Антоном в 12:30 на час")
     assert repo.writes == 1
-    await click("Сохранить")
+    await click("Да")
     reply = api.sent[-1]["text"]
     assert reply.startswith("Готово.\nСохранено: Встреча с Антоном")
     assert "с 12:30 до 13:30" in reply
@@ -767,14 +767,82 @@ async def test_meeting_with_clock_and_duration_still_requires_user_day(session, 
     assert "Пн" in [b["text"] for b in all_buttons(api.sent[-1])]
 
 
-async def test_voice_meeting_keeps_explicit_clock_when_agent_asks_again(session):
+@pytest.mark.parametrize("question", ["Во сколько запланировать встречу?", "На какой день?"])
+async def test_voice_meeting_keeps_explicit_clock_when_agent_asks_again(session, question):
     build, _ = session
     _, api, message, _, _, _ = build(
-        tool_call("ask_user", {"question": "Во сколько запланировать встречу?"}),
+        tool_call("ask_user", {"question": question}),
     )
     await message("Назначь встречу завтра в 5:00", voice=True)
     assert "Сколько продлится встреча?" == api.sent[-1]["text"]
     assert "30 минут" in [b["text"] for b in all_buttons(api.sent[-1])]
+
+
+async def test_answering_missing_duration_does_not_ask_for_known_fields_again(session):
+    build, repo = session
+    _, api, message, click, _, _ = build(
+        tool_call("ask_user", {"question": "Сколько продлится встреча?"}),
+        tool_call("ask_user", {"question": "На какой день и время?"}),
+    )
+    await message("Назначь встречу с Анной завтра в 14:00", voice=True)
+    await click("30 минут")
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == ["Да", "Нет"]
+    assert "Встреча с Анной" in api.sent[-1]["text"] and "14:00" in api.sent[-1]["text"]
+    await click("Да")
+    assert repo.writes == 1
+
+
+async def test_voice_meeting_with_duration_only_asks_for_missing_time(session):
+    build, repo = session
+    _, api, message, _, _, _ = build(
+        tool_call("ask_user", {"question": "Сколько продлится встреча?"})
+    )
+    await message("Назначь встречу завтра на полчаса", voice=True)
+    assert api.sent[-1]["text"] == "Во сколько начнётся встреча?"
+    assert repo.writes == 0
+
+
+@pytest.mark.parametrize("model_reply", ["question", "unrelated", "wrong_fields"])
+async def test_complete_voice_command_only_offers_verified_confirmation(session, tz, model_reply):
+    build, repo = session
+    start = (datetime.now(tz) + timedelta(days=1)).replace(
+        hour=14, minute=0, second=0, microsecond=0
+    )
+    replies = {
+        "question": tool_call("ask_user", {"question": "На какой день и время?"}),
+        "unrelated": text("Мне ничего не нужно."),
+        "wrong_fields": tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча с Иваном",
+                "start_at": (start + timedelta(days=1, hours=2)).isoformat(),
+                "duration_minutes": 60,
+            },
+        ),
+    }
+    bot, api, message, click, _, _ = build(replies[model_reply])
+    await bot.redis.set("bot:greeted:777", "1")
+    duration = 45 if model_reply == "wrong_fields" else 30
+    spoken_duration = "сорок пять" if duration == 45 else "30"
+    source = f"Назначь встречу с Анной завтра в 14:00 на {spoken_duration} минут."
+    mid = uuid4().hex
+    await message(source, voice=True, mid=mid)
+    await message(source, voice=True, mid=mid)
+    assert len(api.sent) == 1
+    assert "Встреча с Анной" in api.sent[-1]["text"] and "14:00" in api.sent[-1]["text"]
+    buttons = all_buttons(api.sent[-1])
+    assert [b["text"] for b in buttons][:2] == ["Да", "Нет"]
+    assert repo.writes == 0
+    await click(payload=buttons[0]["payload"])
+    await click(payload=buttons[0]["payload"])
+    assert len(api.sent) == 2 and repo.writes == 1
+    saved = next(iter(repo.rows.values()))
+    assert (saved.name, saved.start_at, saved.duration_minutes) == (
+        "Встреча с Анной",
+        start,
+        duration,
+    )
 
 
 @pytest.mark.parametrize(
@@ -809,7 +877,7 @@ async def test_voice_meeting_asks_only_about_morning_or_evening(session, tz, req
         await message("Вечером", voice=True)
     assert "17:00" in api.sent[-1]["text"]
     assert repo.writes == 0
-    await click("Сохранить")
+    await click("Да")
     assert [event.start_at for event in repo.rows.values()] == [proposed.replace(hour=17)]
 
 
@@ -838,7 +906,7 @@ async def test_voice_meeting_uses_spoken_clock_even_if_model_proposes_wrong_hour
     await message(f"Назначь встречу завтра {clock} на полчаса", voice=True)
     assert "05:00" in api.sent[-1]["text"]
     assert "17:00" not in api.sent[-1]["text"]
-    await click("Сохранить")
+    await click("Да")
     assert [event.start_at for event in repo.rows.values()] == [tomorrow.replace(hour=5)]
 
 
@@ -860,7 +928,7 @@ async def test_voice_meeting_does_not_loop_if_model_repeats_the_same_question(se
     build, repo = session
     question = tool_call("ask_user", {"question": "Во сколько запланировать встречу?"})
     _, api, message, _, _, _ = build(question, question)
-    await message("Назначь встречу завтра в 05:00 на полчаса", voice=True)
+    await message("Назначь встречу 21 ноября 2030 в 05:00 на полчаса", voice=True)
     assert "Распознал время 05:00" in api.sent[-1]["text"]
     assert not all_buttons(api.sent[-1])
     assert repo.writes == 0
@@ -929,14 +997,14 @@ async def test_name_only_edit_keeps_meeting_day_time_and_duration(session, reque
         )
     )
     await message("Поставь встречу с Сольгой 21 ноября 2030 в 07:00 на 20 минут", voice=True)
-    old_save = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Сохранить")
-    await click("Исправить")
+    old_save = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Да")
+    await message("Исправить")
     await message("Встреча с Ольгой")
     assert len(model.requests) == 1 and repo.writes == 0
     assert "Встреча с Ольгой" in api.sent[-1]["text"]
     assert "21 ноября 2030" in api.sent[-1]["text"]
     assert "с 07:00 до 07:20" in api.sent[-1]["text"]
-    new_save = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Сохранить")
+    new_save = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Да")
     await click(payload=old_save)
     assert repo.writes == 0
     await click(payload=new_save)

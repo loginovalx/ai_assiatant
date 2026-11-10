@@ -147,7 +147,7 @@ async def test_confirm_button_executes_draft(handler, redis_client):
 
     assert agent.confirmed == [DRAFT]
     assert max_api.sent[-1]["text"].startswith("Готово.")
-    assert max_api.answered == [("cb-1", "✅ Подтверждено")]  # кнопки убраны
+    assert max_api.answered == [("cb-1", None)]
     assert await bot.drafts.load(str(USER)) is None
 
 
@@ -197,10 +197,10 @@ async def test_edit_button_asks_once_per_draft_and_keeps_draft(handler):
     assert "Что изменить" in max_api.sent[-1]["text"]
 
 
-async def test_scheduled_preview_offers_another_time_without_saving(handler):
+async def test_conflicting_preview_offers_another_time_without_saving(handler):
     agent = FakeAgent()
     bot, max_api = handler(agent)
-    draft = scheduled_draft()
+    draft = scheduled_draft().model_copy(update={"status": "pending_overlap_confirmation"})
     result = AgentMessageResponse(
         status="needs_confirmation", reply_text=draft.preview, draft=draft
     )
@@ -323,7 +323,7 @@ async def test_free_text_while_draft_pending_goes_to_agent_as_edit(handler):
 
     assert agent.asked[0]["text"] == "давай в 12:30"
     assert agent.confirmed == []
-    assert max_api.sent[-1]["buttons"] == confirmation_buttons(DRAFT.id, saving=True)
+    assert max_api.sent[-1]["buttons"] == confirmation_buttons(DRAFT.id)
 
 
 async def test_quick_action_runs_like_a_typed_question(handler):

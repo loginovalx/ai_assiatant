@@ -62,12 +62,11 @@ class RecurringReminders:
             user,
             f"Напоминание «{rule.name}»\n{rule.schedule}.\n"
             f"Первое напоминание — {format_calendar_time(first)}.\n"
-            "Повтор будет работать, пока ты его не остановишь.",
+            "Сохранить повтор?",
             [
                 [
-                    _button("Сохранить", "save", draft.id),
-                    _button("Изменить", "edit", draft.id),
-                    _button("Отмена", "cancel", draft.id),
+                    _button("Да", "save", draft.id),
+                    _button("Нет", "cancel", draft.id),
                 ]
             ],
         )
@@ -121,9 +120,12 @@ class RecurringReminders:
             elif draft.waiting_for_time:
                 await self._send(user, "Напиши новое время, например 10:30.")
             elif is_voice:
-                await self._preview(user, draft)
+                await self._send(user, "Нажми «Да» под черновиком.")
             else:
                 await self.callback(user, None, f"repeat:save:{draft.id}")
+            return True
+        if draft and not draft.choosing_daypart and value == "исправить":
+            await self._choose(user, draft)
             return True
         if value in {"повторяющиеся напоминания", "покажи повторяющиеся напоминания"}:
             await self.redis.delete(self._key(user))

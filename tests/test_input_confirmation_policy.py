@@ -49,7 +49,8 @@ def bot_session(make_agent, redis, monkeypatch):
         async def confirm():
             payload = next(
                 b["payload"]
-                for row in max_api.sent[-1]["buttons"]
+                for sent in reversed(max_api.sent)
+                for row in sent.get("buttons") or []
                 for b in row
                 if b["payload"].startswith("draft:confirm:")
             )
@@ -117,7 +118,8 @@ async def test_voice_always_shows_buttons_and_spoken_yes_does_not_commit(bot_ses
     await message("Да", voice=True)
     assert await pool.fetchval("SELECT count(*) FROM events") == 0
     assert await bot.drafts.load("777") == first
-    assert api.sent[-1]["buttons"]
+    assert api.sent[-1]["text"] == "Нажми «Да» под черновиком."
+    assert not api.sent[-1].get("buttons")
     callback = await confirm()
     await bot.handle_update(callback)
     assert await pool.fetchval("SELECT count(*) FROM events") == 1

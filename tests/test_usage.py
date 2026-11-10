@@ -64,6 +64,16 @@ def test_missing_usage_is_unknown_not_free():
     assert summary["complete"] is False
 
 
+def test_token_log_records_truncation_without_response_content():
+    record = record_usage(
+        {"choices": [{"finish_reason": "length", "message": {"content": "private"}}]},
+        operation="agent",
+        source="gpt2giga_openai",
+    )
+    assert record["finish_reason"] == "length"
+    assert "private" not in json.dumps(record)
+
+
 def test_cost_includes_relevance_and_embeddings_and_flags_malformed():
     records = [
         {"operation": "agent", "model": "GigaChat-2-Max", "billable_tokens": 2000},

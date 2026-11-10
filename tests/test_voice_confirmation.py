@@ -174,18 +174,12 @@ async def test_draft_can_be_corrected_before_saving(make_agent, tz, pool):
 
 async def test_questions_by_voice_need_no_confirmation(make_agent, tz, pool):
     """«Что у меня завтра» ничего не меняет — подтверждать нечего, отвечаем сразу."""
-    day = tomorrow_at(tz, 0)
-    agent, _ = make_agent(
-        tool_call(
-            "get_events",
-            {"start_time": day.isoformat(), "end_time": (day + timedelta(days=1)).isoformat()},
-        ),
-        text("Завтра ничего не запланировано."),
-    )
+    agent, _ = make_agent(text("Завтра у вас десять встреч."))
     response = await agent.handle(USER, "Что у меня завтра?", confirm_changes=True)
 
     assert response.status == AgentStatus.DONE
     assert response.draft is None
+    assert response.reply_text == "За указанный период записей нет."
 
 
 async def test_low_level_agent_can_execute_without_http_review_policy(make_agent, tz, pool):

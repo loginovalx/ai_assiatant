@@ -5,6 +5,8 @@ from os import getenv
 
 from dotenv import load_dotenv
 
+from bot.asr import DEFAULT_WHISPER_MODEL
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -13,7 +15,7 @@ class Settings:
     redis_url: str = "redis://localhost:6379/0"
     agent_url: str = "http://localhost:8002"
     asr_provider: str = "whisper"  # whisper | http | disabled
-    whisper_model: str = "base"
+    whisper_model: str = DEFAULT_WHISPER_MODEL
     asr_http_url: str = ""
     asr_http_token: str = field(default="", repr=False)
     bot_state_ttl: int = 300
@@ -34,7 +36,7 @@ class Settings:
             redis_url=getenv("REDIS_URL", "redis://localhost:6379/0"),
             agent_url=getenv("AGENT_URL", "http://localhost:8002").rstrip("/"),
             asr_provider=getenv("ASR_PROVIDER", "whisper").lower(),
-            whisper_model=getenv("WHISPER_MODEL", "base"),
+            whisper_model=getenv("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
             asr_http_url=getenv("ASR_HTTP_URL", ""),
             asr_http_token=getenv("ASR_HTTP_TOKEN", ""),
             bot_state_ttl=int(getenv("BOT_STATE_TTL", "300")),

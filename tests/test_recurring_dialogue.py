@@ -39,8 +39,9 @@ async def test_yes_stays_with_repeat_preview_and_button_saves_once(tz):
     draft = await repeat._load("777")
     assert await repeat.message("777", "Да", uuid4(), is_voice=True)
     assert await repeat._load("777") is not None
-    assert "Каждый вторник в 10:00" in api.sent[-1]["text"]
-    button = next(b for b in all_buttons(api.sent[-1]) if b["text"] == "Сохранить")
+    assert api.sent[-1]["text"] == "Нажми «Да» под черновиком."
+    assert not all_buttons(api.sent[-1])
+    button = next(b for b in all_buttons(api.sent[-2]) if b["text"] == "Да")
     await repeat.callback("777", "save1", button["payload"])
     await repeat.callback("777", "save2", button["payload"])
     assert repo.save_reminder_series.await_count == 1
@@ -110,7 +111,7 @@ async def test_real_bot_repeat_flow_never_calls_agent_or_asks_for_date(repo, poo
     )
     assert "Каждый вторник в 10:00" in api.sent[-1]["text"]
     assert "поливать цветы" in api.sent[-1]["text"]
-    payload = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Сохранить")
+    payload = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Да")
     update = {
         "update_type": "message_callback",
         "callback": {
@@ -190,7 +191,7 @@ async def test_max_transcript_of_weekly_intention_uses_the_requested_hour(
         await click("14:00")
     assert "Каждый понедельник в 14:00" in api.sent[-1]["text"]
     assert await pool.fetchval("SELECT count(*) FROM reminder_series") == 0
-    await click("Сохранить")
+    await click("Да")
     row = await pool.fetchrow(
         "SELECT name, weekday, clock FROM reminder_series WHERE user_id='777'"
     )

@@ -14,7 +14,6 @@ from bot.agent_client import AgentClient, AgentUnavailable
 from bot.asr import SpeechRecognitionError, SpeechRecognizer
 from bot.drafts import DraftStore
 from bot.max_api import MaxAPI, MaxAPIError
-from bot.models import AgentMessageResponse
 from bot.recurring import RecurringReminders
 from bot.state import StateStore
 from bot.time_choices import (
@@ -114,13 +113,6 @@ def is_valid_update(update: Any) -> bool:
 
 
 _AUDIO_EXT = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".aac")
-CONFIRM_BUTTONS = [
-    [
-        {"type": "callback", "text": "Подтвердить", "payload": "draft:confirm"},
-        {"type": "callback", "text": "Исправить", "payload": "draft:edit"},
-        {"type": "callback", "text": "Отмена", "payload": "draft:cancel"},
-    ]
-]
 QUICK_ACTIONS = [
     [{"type": "callback", "text": "Загрузить календарь", "payload": "quick:import"}],
     [{"type": "callback", "text": "Что я умею", "payload": "quick:features"}],
@@ -132,25 +124,21 @@ def confirmation_buttons(
     *,
     can_change_time: bool = False,
     destructive: bool = False,
-    saving: bool = False,
 ) -> list[list[dict[str, str]]]:
-    if destructive:
-        return [
-            [
-                {"type": "callback", "text": "Удалить", "payload": f"draft:confirm:{draft_id}"},
-                {"type": "callback", "text": "Нет", "payload": f"draft:cancel:{draft_id}"},
-            ]
-        ]
     buttons = [
-        [{**button, "payload": f"{button['payload']}:{draft_id}"} for button in row]
-        for row in CONFIRM_BUTTONS
+        [
+            {
+                "type": "callback",
+                "text": "Удалить" if destructive else "Да",
+                "payload": f"draft:confirm:{draft_id}",
+            },
+            {"type": "callback", "text": "Нет", "payload": f"draft:cancel:{draft_id}"},
+        ]
     ]
     if can_change_time:
         buttons.append(
             [{"type": "callback", "text": "Другое время", "payload": f"draft:time:{draft_id}"}]
         )
-    if saving:
-        buttons[0][0]["text"] = "Сохранить"
     return buttons
 
 
@@ -298,9 +286,9 @@ class BotHandler:
         if result.status == "needs_confirmation" and result.draft:
             buttons = confirmation_buttons(
                 result.draft.id,
-                can_change_time=can_change_draft_time(result.draft),
+                can_change_time=result.draft.confirm_overlap
+                and can_change_draft_time(result.draft),
                 destructive=result.draft.tool in {"delete_event", "delete_events"},
-                saving=result.draft.tool in {"create_event", "update_event"},
             )
         elif result.status == "need_clarification":
             if asks_for_day(reply_text):
@@ -446,7 +434,7 @@ class BotHandler:
                     await self.drafts.drop(user_id)
                     await self.time_choices.clear(user_id)
                     await self.max_api.send(int(user), "Отменил действие.", to_user=True)
-                    await self.max_api.answer_callback(callback_id, "Отменено")
+                    await self.max_api.answer_callback(callback_id)
                 elif action == "edit":
                     if not await self.drafts.is_editing(user_id, draft):
                         await self.max_api.send(
@@ -476,12 +464,12 @@ class BotHandler:
                 elif action == "confirm":
                     result = await self.agent.confirm(user_id, draft)
                     succeeded = result.status == "done"
+                    await self._result(user_id, int(user), result)
                     if succeeded:
                         await self.drafts.drop(user_id)
-                    await self._result(user_id, int(user), result)
                     await self.max_api.answer_callback(
                         callback_id,
-                        "✅ Подтверждено"
+                        None
                         if succeeded
                         else "Черновик устарел. Отправьте запрос заново"
                         if result.reply_text.startswith("Подтверждение устарело")
@@ -646,7 +634,8 @@ class BotHandler:
             return
 
         # Первое сообщение от незнакомого пользователя: сначала представимся.
-        if await self.redis.set(f"bot:greeted:{user_id}", "1", nx=True):
+        greeted = await self.redis.set(f"bot:greeted:{user_id}", "1", nx=True)
+        if greeted and text and not _audio_present(message):
             await self._send_welcome(chat_id, to_user=to_user)
 
         csv_url = extract_csv(message)
@@ -720,16 +709,12 @@ class BotHandler:
                 if transcription:
                     text = transcription
                 else:
-                    await reply("🎤 Голос получил, распознаю…")
                     audio = await self.max_api.get_audio(url)
                     text = await self.asr.transcribe(audio)
                 if not text.strip():
                     raise SpeechRecognitionError("Не получилось распознать речь")
                 await self.state.transition(user_id, request_id)
-                # Распознанный текст пользователю не показываем: он бывает кривым,
-                # а ответ агент всё равно даёт верный (фидбек QA от роли E).
-                await reply("⏳ Записал в блокнот, думаю…")
-            else:
+            elif _state_request_id is None:
                 await reply("⏳ Думаю над запросом…")
 
             if self.recurring and await self.recurring.message(
@@ -758,24 +743,23 @@ class BotHandler:
                 await self.drafts.drop(user_id)
                 await reply("Оставил календарь без изменений.")
                 return
+            if pending and text.casefold().strip(" .!") == "исправить":
+                await self.drafts.begin_edit(user_id, pending)
+                await reply("Что изменить: название, время или длительность?")
+                return
+            confirmed = False
             if pending and (
                 text.casefold().strip(" .!") in {"да", "подтвердить", "подтверждаю"} or keep_phrase
             ):
                 if is_voice:
-                    await self._result(
-                        user_id,
-                        chat_id,
-                        AgentMessageResponse(
-                            reply_text=pending.preview,
-                            status="needs_confirmation",
-                            draft=pending,
-                        ),
-                        to_user,
+                    await reply(
+                        "Нажми «Удалить» под черновиком."
+                        if pending.tool in {"delete_event", "delete_events"}
+                        else "Нажми «Да» под черновиком."
                     )
                     return
                 result = await self.agent.confirm(user_id, pending)
-                if result.status == "done":
-                    await self.drafts.drop(user_id)
+                confirmed = result.status == "done"
             elif pending and text.casefold().strip(" .!") in {
                 "нет",
                 "отмена",
@@ -800,6 +784,8 @@ class BotHandler:
                     **({"edit_draft_id": str(pending.id)} if pending is not None else {}),
                 )
             await self._result(user_id, chat_id, result, to_user)
+            if confirmed:
+                await self.drafts.drop(user_id)
         except (SpeechRecognitionError, MaxAPIError) as exc:
             logger.warning("Audio problem for user %s: %s", user_id, exc)
             await reply(f"Не получилось обработать голос: {exc}. Попробуй ещё раз.")

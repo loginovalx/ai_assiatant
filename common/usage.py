@@ -44,6 +44,17 @@ def record_usage(
     billable = total
     if total is not None and source == "gpt2giga_openai":
         billable = total - cached if total >= cached else None
+    choices = _field(response, "choices") or []
+    finish_reason = _field(choices[0], "finish_reason") if choices else None
+    if finish_reason not in {
+        "stop",
+        "length",
+        "function_call",
+        "tool_calls",
+        "content_filter",
+        "blacklist",
+    }:
+        finish_reason = None
     record = {
         "event": "token_usage",
         "timestamp": datetime.now(UTC).isoformat(),
@@ -52,6 +63,7 @@ def record_usage(
         "model": _field(response, "model") or model,
         "prompt_tokens": prompt,
         "completion_tokens": completion,
+        "finish_reason": finish_reason,
         "cached_tokens": cached,
         "reported_total_tokens": total,
         "billable_tokens": billable,

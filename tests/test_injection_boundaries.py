@@ -92,7 +92,7 @@ async def test_preview_survives_model_failure_and_is_not_claimed_committed():
     agent, _ = setup_agent([completion(call=True), ConnectionError("LLM down")], mutation())
     result = await agent.handle("u", "Создай Test", confirm_changes=True)
     assert result.status == AgentStatus.NEEDS_CONFIRMATION
-    assert "Создать" in result.reply_text and "Подтверд" in result.reply_text
+    assert "Создать" in result.reply_text and "«Да» или «Нет»" in result.reply_text
     assert not result.events
 
 

@@ -15,7 +15,6 @@ from redis.exceptions import RedisError
 from agent.core import Agent
 from agent.dialogue import starts_new_request
 from common.schemas import DRAFT_TTL_SECONDS, AgentResponse, AgentStatus, DraftAction
-from common.timeutils import reschedule_clock
 
 logger = logging.getLogger(__name__)
 
@@ -219,10 +218,7 @@ class AgentService:
                 if issued is None or issued.id != edit_draft_id:
                     raise InvalidDraft
                 source = issued.arguments.get("user_text")
-                if isinstance(source, str) and (
-                    issued.tool == "create_event"
-                    or (issued.tool == "update_event" and reschedule_clock(text) is not None)
-                ):
+                if issued.tool == "create_event" and isinstance(source, str):
                     kwargs["trusted_edit_source"] = source
             result = await self._agent.handle(
                 user_id, text, confirm_changes=review, request_id=request_id, **kwargs

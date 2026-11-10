@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 WEEKDAYS_RU = (
@@ -11,17 +11,6 @@ WEEKDAYS_RU = (
     "суббота",
     "воскресенье",
 )
-_CLOCK_ONLY_UPDATE = re.compile(
-    r"(?:измени|поменяй|перенеси|передвинь|сдвинь)(?:те)?\s+"
-    r"(?:(?:е[её]|его|это|время)\s+)?(?:на|в)\s+([01]?\d|2[0-3]):([0-5]\d)[.!]?",
-    re.I,
-)
-
-
-def reschedule_clock(text: str) -> time | None:
-    """Recognize an explicit change of clock time without a new calendar day."""
-    match = _CLOCK_ONLY_UPDATE.fullmatch(text.strip())
-    return time(int(match[1]), int(match[2])) if match else None
 
 
 def ensure_aware(dt: datetime, tz: ZoneInfo) -> datetime:

@@ -49,8 +49,7 @@
 
   .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
   .filters { margin-bottom: 16px; }
-  .filters h2 { font-size: 14px; margin: 0 0 3px; }
-  .filter-hint { color: var(--muted); font-size: 13px; margin: 0 0 8px; }
+  .filters h2 { font-size: 14px; margin: 0 0 8px; }
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
 
   button {
@@ -141,8 +140,7 @@
 
   <section class="filters" aria-labelledby="filterTitle">
     <h2 id="filterTitle">Какие записи показывать</h2>
-    <p class="filter-hint" id="filterHint">Можно выбрать несколько типов. Без выбора видны все.</p>
-    <div class="chips" id="chips" role="group" aria-labelledby="filterTitle" aria-describedby="filterHint">
+    <div class="chips" id="chips" role="group" aria-labelledby="filterTitle">
       <button class="chip" aria-pressed="false" data-type="task">Задачи</button>
       <button class="chip" aria-pressed="false" data-type="meeting">Встречи</button>
       <button class="chip" aria-pressed="false" data-type="reminder">Напоминания</button>

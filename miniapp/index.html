@@ -6,8 +6,7 @@
 <title>Мои задачи</title>
 
 <!-- MAX Bridge: нужен, чтобы получить настоящий user_id внутри MAX.
-     ВАЖНО: адрес скрипта и названия полей сверить с документацией dev.max.ru.
-     Если скрипт не загрузится (например, в обычном браузере) - страница работает с ?user_id=... -->
+     Если скрипт не загрузится - страница работает с ?user_id=... -->
 <script src="https://st.max.ru/js/max-web-app.js"></script>
 
 <style>
@@ -16,8 +15,19 @@
     --card: #ffffff;
     --text: #1b1d21;
     --muted: #6b7280;
-    --accent: #3b6cf6;
-    --accent-text: #ffffff;
+    --pixel-ink: #160e12;
+    --pixel-peach: #ffb68b;
+    --pixel-pale: #ffe4d1;
+    --pixel-active: #ff975e;
+    --pixel-focus: #70371b;
+    --pixel-cut: polygon(
+      8px 0, calc(100% - 8px) 0, calc(100% - 8px) 4px, calc(100% - 4px) 4px,
+      calc(100% - 4px) 8px, 100% 8px, 100% calc(100% - 8px),
+      calc(100% - 4px) calc(100% - 8px), calc(100% - 4px) calc(100% - 4px),
+      calc(100% - 8px) calc(100% - 4px), calc(100% - 8px) 100%, 8px 100%,
+      8px calc(100% - 4px), 4px calc(100% - 4px), 4px calc(100% - 8px),
+      0 calc(100% - 8px), 0 8px, 4px 8px, 4px 4px, 8px 4px
+    );
     --border: #e3e5ea;
     --task: #3b6cf6;
     --meeting: #e0791f;
@@ -31,6 +41,7 @@
       --text: #eceef2;
       --muted: #9aa1ad;
       --border: #2d313a;
+      --pixel-focus: #fff3e6;
     }
   }
   * { box-sizing: border-box; }
@@ -45,33 +56,53 @@
   .app { max-width: 640px; margin: 0 auto; padding: 16px; padding-bottom: 40px; }
   h1 { font-size: 22px; margin: 4px 0 12px; }
 
-  .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
-  .tab {
-    flex: 1; padding: 10px 8px; border: 1px solid var(--border); border-radius: 12px;
-    background: var(--card); color: var(--text); font-size: 15px; cursor: pointer;
-  }
-  .tab.active { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
-
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
   .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-  .chip {
-    padding: 6px 12px; border-radius: 999px; border: 1px solid var(--border);
-    background: var(--card); color: var(--text); font-size: 14px; cursor: pointer;
+
+  button {
+    --button-fill: var(--pixel-pale);
+    position: relative;
+    isolation: isolate;
+    min-height: 44px;
+    padding: 8px 12px;
+    border: 0;
+    background: var(--pixel-ink);
+    color: var(--pixel-ink);
+    font: inherit;
+    font-size: 14px;
+    font-weight: 650;
+    cursor: pointer;
+    clip-path: var(--pixel-cut);
   }
-  .chip.active { background: var(--text); color: var(--bg); border-color: var(--text); }
+  button::before {
+    content: "";
+    position: absolute;
+    z-index: -1;
+    inset: 2px;
+    background: var(--button-fill);
+    box-shadow: inset 0 -3px 0 rgb(22 14 18 / 16%);
+    clip-path: var(--pixel-cut);
+    pointer-events: none;
+  }
+  button:focus-visible {
+    background: var(--pixel-focus);
+    outline: 0;
+  }
+  button:focus-visible::before { inset: 4px; }
+  button:active:not(:disabled)::before { box-shadow: inset 0 3px 0 rgb(22 14 18 / 20%); }
+  button:disabled { opacity: 0.55; cursor: default; }
+  .tab { flex: 1 1 0; min-width: 0; padding-inline: 4px; }
+  .tab.active, .chip.active { --button-fill: var(--pixel-active); }
 
   .search { display: flex; gap: 8px; margin-bottom: 16px; }
   .search input {
     flex: 1; min-width: 0; padding: 10px 12px; font-size: 16px;
     border: 1px solid var(--border); border-radius: 12px; background: var(--card); color: var(--text);
   }
-  .btn {
-    padding: 10px 14px; border: none; border-radius: 12px; background: var(--accent);
-    color: var(--accent-text); font-size: 15px; cursor: pointer;
-  }
-  .btn.secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+  .btn { --button-fill: var(--pixel-peach); padding-inline: 14px; }
+  .btn.secondary { --button-fill: var(--pixel-pale); }
 
   .note { color: var(--muted); font-size: 14px; margin: 0 0 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-  .note button { background: none; border: none; color: var(--accent); font-size: 14px; cursor: pointer; padding: 0; }
 
   .day { margin: 18px 0 8px; font-size: 14px; color: var(--muted); text-transform: capitalize; font-weight: 600; }
 
@@ -93,7 +124,7 @@
   .badge-row { display: flex; gap: 6px; flex-shrink: 0; }
   .meta { color: var(--muted); font-size: 14px; margin-top: 4px; }
   .desc { font-size: 14px; margin-top: 6px; color: var(--text); opacity: 0.85; word-break: break-word; }
-  .card .btn { margin-top: 10px; padding: 8px 12px; font-size: 14px; }
+  .card .btn { margin: 10px 6px 0 0; }
 
   .state { text-align: center; color: var(--muted); padding: 40px 12px; }
   .state.error { color: var(--error); }
@@ -118,15 +149,16 @@
   </form>
 
   <div class="tabs" id="tabs">
-    <button class="tab active" data-period="today">Сегодня</button>
-    <button class="tab" data-period="tomorrow">Завтра</button>
-    <button class="tab" data-period="week">Неделя</button>
+    <button class="tab active" aria-pressed="true" data-period="today">Сегодня</button>
+    <button class="tab" aria-pressed="false" data-period="tomorrow">Завтра</button>
+    <button class="tab" aria-pressed="false" data-period="week">Неделя</button>
+    <button class="tab" aria-pressed="false" data-period="all">Всё</button>
   </div>
 
   <div class="chips" id="chips">
-    <button class="chip" data-type="task">Задачи</button>
-    <button class="chip" data-type="meeting">Встречи</button>
-    <button class="chip" data-type="reminder">Напоминания</button>
+    <button class="chip" aria-pressed="false" data-type="task">Задачи</button>
+    <button class="chip" aria-pressed="false" data-type="meeting">Встречи</button>
+    <button class="chip" aria-pressed="false" data-type="reminder">Напоминания</button>
   </div>
 
   <form class="search" id="searchForm">
@@ -151,17 +183,10 @@
 const params = new URLSearchParams(location.search);
 const initData = window.WebApp?.initData ||
   new URLSearchParams(location.hash.slice(1)).get('WebAppData') || '';
-// Some sandboxed webview contexts (notably MAX's in-app WebKit webview)
-// report location.origin as the literal string "null" instead of a real
-// origin. Fall back to rebuilding it from protocol+host in that case, so
-// API_BASE never ends up holding the string "null" (which later breaks
-// `new URL(API_BASE + path)` with "The string did not match the expected
-// pattern.").
 const realOrigin = (location.origin && location.origin !== 'null')
   ? location.origin
   : `${location.protocol}//${location.host}`;
 const DEFAULT_API = location.protocol === 'file:' ? 'http://localhost:8000' : realOrigin;
-// A URL parameter must never redirect signed MAX data to an arbitrary server.
 const isLocalDev = !initData && ['localhost', '127.0.0.1', ''].includes(location.hostname);
 const API_BASE = ((isLocalDev && params.get('api')) || DEFAULT_API).replace(/\/$/, '');
 const authHeaders = () => ({
@@ -182,8 +207,7 @@ const state = {
 
 /* ---------- user_id ---------- */
 function detectUserId() {
-  if (initData) return ''; // the backend resolves the signed identity via /v1/me
-  // Browser development requires API_ALLOW_DEV_USER_ID=true on the backend.
+  if (initData) return '';
   const fromUrl = params.get('user_id');
   if (fromUrl) return fromUrl;
   return '';
@@ -211,6 +235,8 @@ function periodRange(period) {
   if (period === 'today') { to.setDate(to.getDate() + 1); }
   if (period === 'tomorrow') { from.setDate(from.getDate() + 1); to.setDate(to.getDate() + 2); }
   if (period === 'week') { to.setDate(to.getDate() + 7); }
+  // «Все»: очень широкий период, чтобы получить записи за всё время
+  if (period === 'all') { from.setFullYear(2000, 0, 1); to.setFullYear(2100, 0, 1); }
   return { from, to };
 }
 
@@ -255,15 +281,14 @@ async function fetchPeriod() {
   const { from, to } = periodRange(state.period);
   const base = {
     user_id: state.userId,
-    // задачи без даты показываем только на вкладке "Неделя", чтобы не засорять "Сегодня"
-    include_undated: state.period === 'week' ? 'true' : 'false',
+    // задачи без даты показываем на вкладках "Неделя" и "Все", чтобы не засорять "Сегодня"
+    include_undated: (state.period === 'week' || state.period === 'all') ? 'true' : 'false',
   };
   try {
-    // сначала пробуем передать дату со временем
+    // пробуем передать дату со временем
     return await api('/v1/events', { ...base, from: toLocalISO(from), to: toLocalISO(to) });
   } catch (e) {
     if (e.status === 422) {
-      // если бэкенд хочет только дату - пробуем так
       return await api('/v1/events', { ...base, from: toDateOnly(from), to: toDateOnly(to) });
     }
     throw e;
@@ -274,9 +299,6 @@ function fetchSearch() {
   return api('/v1/events/search', { user_id: state.userId, q: state.query, type: [...state.types] });
 }
 
-/* ---------- разбор ответа ---------- */
-// Мы не знаем точные названия полей, поэтому пробуем несколько вариантов.
-// После просмотра /docs можно оставить только нужные.
 function pick(obj, keys) {
   for (const k of keys) {
     if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
@@ -408,8 +430,19 @@ function render(events) {
     showState(state.query ? 'По запросу ничего не найдено' : 'Здесь пока ничего нет', '', false);
     return;
   }
-  // сортировка: по времени, "без даты" в конце (в режиме поиска порядок бэкенда сохраняем)
-  if (!state.query) {
+  // вкладка «Все»: сначала предстоящие (по возрастанию), потом без даты, потом прошедшие (свежие выше)
+  if (!state.query && state.period === 'all') {
+    const now = Date.now();
+    const rank = (e) => (!e.when ? 1 : (e.when.getTime() >= now ? 0 : 2));
+    events.sort((a, b) => {
+      const ra = rank(a), rb = rank(b);
+      if (ra !== rb) return ra - rb;
+      if (ra === 0) return a.when - b.when;
+      if (ra === 2) return b.when - a.when;
+      return 0;
+    });
+  } else if (!state.query) {
+    // сортировка: по времени, без даты в конце (в режиме поиска порядок бэкенда сохраняем)
     events.sort((a, b) => {
       if (!a.when && !b.when) return 0;
       if (!a.when) return 1;
@@ -483,7 +516,10 @@ document.getElementById('tabs').addEventListener('click', (e) => {
   const btn = e.target.closest('.tab');
   if (!btn) return;
   state.period = btn.dataset.period;
-  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t === btn));
+  document.querySelectorAll('.tab').forEach((t) => {
+    t.classList.toggle('active', t === btn);
+    t.setAttribute('aria-pressed', String(t === btn));
+  });
   // переключение периода выходит из режима поиска
   clearSearch(false);
   load();
@@ -495,6 +531,7 @@ document.getElementById('chips').addEventListener('click', (e) => {
   const t = btn.dataset.type;
   if (state.types.has(t)) state.types.delete(t); else state.types.add(t);
   btn.classList.toggle('active', state.types.has(t));
+  btn.setAttribute('aria-pressed', String(state.types.has(t)));
   load();
 });
 

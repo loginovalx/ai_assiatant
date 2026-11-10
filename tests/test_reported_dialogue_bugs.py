@@ -127,7 +127,7 @@ async def test_a_separate_meetings_time_range_cannot_supply_the_new_meetings_dur
         ("Завтра с 12 до 14", 120, True),
         ("Завтра в 12:00\nНе знаю", 60, True),
         ("Завтра в 12:00\nНе знаю", 30, False),
-        ("Завтра в три часа", 60, False),
+        ("Завтра в три часа дня", 60, False),
     ],
 )
 async def test_duration_requires_user_evidence_or_explicit_default(

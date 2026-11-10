@@ -8,13 +8,17 @@ _HOUR = rf"(?:\d{{1,2}}|{'|'.join(reversed(CLOCK_HOUR_WORDS))})"
 _DAY_PART = r"(?:утра|дня|вечера|ночи)"
 _EXACT_CLOCK = re.compile(
     rf"\b(?:\d{{1,2}}:\d{{2}}(?:\s+{_DAY_PART})?|"
+    rf"(?:в\s+\d{{1,2}}\.\d{{2}}|на\s+\d{{1,2}}\.00)(?![./]\d)(?:\s+{_DAY_PART})?|"
     rf"в\s+\d{{1,2}}\s+\d{{2}}(?:\s+{_DAY_PART})?|"
     rf"(?:в|на)\s+{_HOUR}(?:\s+час(?:а|ов)?)?\s+"
     rf"(?:ноль\s+ноль(?:\s+{_DAY_PART})?|{_DAY_PART}))\b",
     re.I,
 )
 _BARE_HOUR = re.compile(
-    rf"\bв\s+({_HOUR})(?:\s+час(?:а|ов)?)?\b(?![:.\d]|\s+(?:утра|дня|вечера|ночи|\d|минут))",
+    rf"\b(?:в\s+({_HOUR})(?:\s+час(?:а|ов)?)?|"
+    rf"на\s+({_HOUR})(?=\s*(?:$|[.,!?;]|\b(?:с|со|на|сегодня|завтра|послезавтра)\b)))\b"
+    rf"(?!:|\.\d|\s+(?:\d|(?:{_DAY_PART}|час(?:а|ов)?|минут\w*|"
+    rf"{_HOUR}|тридцать|сорок|пятьдесят)\b|(?:или|и)\s+{_HOUR}\b))",
     re.I,
 )
 
@@ -25,6 +29,8 @@ def requested_clock(source: str) -> time | None:
         line = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", line)
         matches = list(_EXACT_CLOCK.finditer(line))
         if not matches:
+            if _BARE_HOUR.search(line):
+                return None
             continue
         match = matches[0]
         if len(matches) != 1 or re.search(
@@ -40,14 +46,18 @@ def requested_clock(source: str) -> time | None:
 
 def ambiguous_hour(source: str) -> int | None:
     """Return an isolated hour that could mean morning or afternoon."""
-    if requested_clock(source) is not None:
-        return None
-    source = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", source)
-    matches = list(_BARE_HOUR.finditer(source))
-    if len(matches) != 1:
-        return None
-    clock = parse_clock(matches[0][1])
-    return clock.hour if clock is not None and 1 <= clock.hour <= 11 else None
+    for line in reversed(source.splitlines()):
+        line = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", line)
+        if _EXACT_CLOCK.search(line):
+            return None
+        matches = list(_BARE_HOUR.finditer(line))
+        if not matches:
+            continue
+        if len(matches) != 1:
+            return None
+        clock = parse_clock(matches[0][1] or matches[0][2])
+        return clock.hour if clock is not None and 1 <= clock.hour <= 11 else None
+    return None
 
 
 WEEKDAYS_RU = (
@@ -239,12 +249,11 @@ _EXPLICIT_WEEKDAY_OR_DATE = re.compile(
     r"ма[йя]\w*|июн\w*|июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)\b",
     re.I,
 )
-_CLOCK_TIME = re.compile(r"\bв\s+\d{1,2}[.:]\d{2}\b", re.I)
 
 
 def has_explicit_weekday_or_date(text: str) -> bool:
     # Dot-separated dates are valid, but "в 10.00" is a clock time, not day.month.
-    without_clock_times = _CLOCK_TIME.sub(" ", text)
+    without_clock_times = _EXACT_CLOCK.sub(" ", text)
     return bool(_EXPLICIT_WEEKDAY_OR_DATE.search(without_clock_times))
 
 

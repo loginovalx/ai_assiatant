@@ -95,7 +95,7 @@ async def test_another_time_button_edits_owners_conflicting_draft_then_confirms(
             }
         )
 
-    await message("Встреча новый созвон завтра в 10 на полчаса", "create-meeting", voice=True)
+    await message("Встреча новый созвон завтра в 10:00 на полчаса", "create-meeting", voice=True)
     assert "уже запланировано" in max_api.sent[-1]["text"]
     first = await bot.drafts.load(owner)
     button = next(

@@ -28,6 +28,7 @@ from common.dialogue import (
     asks_for_day,
     asks_for_duration,
     clarification_text,
+    clock_alternatives_question,
     is_appointment_request,
     is_clarification_question,
 )
@@ -38,7 +39,7 @@ from common.display import (
     format_calendar_time,
 )
 from common.schemas import MAX_DURATION_MINUTES, AgentResponse, AgentStatus, DraftAction, Event
-from common.timeutils import ensure_aware, requested_clock, reschedule_clock
+from common.timeutils import ambiguous_hour, ensure_aware, requested_clock, reschedule_clock
 from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -105,7 +106,7 @@ class Agent:
                 )
             if starts_new_request(text) and history and history[-1].get("clarification_text"):
                 history = []
-            text = _duration_answer(history, text)
+            text = _clock_answer(history, _duration_answer(history, text))
             source_text = _user_source(history, text)
             if _keeps_conflicting_time(history, text):
                 response = AgentResponse(
@@ -376,8 +377,22 @@ class Agent:
         editing_draft: bool = False,
         route: ModelRoute | None = None,
     ) -> AgentResponse:
-        tools = await self._toolbox.openai_tools()
         source = source_text or ""
+        if (
+            confirm_changes
+            and not editing_draft
+            and is_appointment_request(source)
+            and is_single_action_request(
+                " ".join(line.rstrip(".!?") for line in source.splitlines()), "create_event"
+            )
+            and (hour := ambiguous_hour(source)) is not None
+        ):
+            return AgentResponse(
+                reply_text=clarification_text(clock_alternatives_question(hour), source),
+                status=AgentStatus.NEED_CLARIFICATION,
+            )
+
+        tools = await self._toolbox.openai_tools()
         clock_only = reschedule_clock(source) is not None
         rescheduling = explicitly_requests_change(source, "update_event")
         blocked_tools = set()
@@ -886,6 +901,18 @@ def _duration_answer(history: list[HistoryMessage], text: str) -> str:
     ):
         return f"На {minutes} минут"
     return text
+
+
+def _clock_answer(history: list[HistoryMessage], text: str) -> str:
+    part = text.casefold().strip(" .!?").replace("ё", "е")
+    if part not in {"утром", "ночью", "днем", "вечером"} or not history:
+        return text
+    last = history[-1]
+    hour = ambiguous_hour(last.get("clarification_text", ""))
+    if hour is None or last["content"] != clock_alternatives_question(hour):
+        return text
+    offset = 12 if part in {"днем", "вечером"} else 0
+    return f"В {hour + offset:02}:00"
 
 
 def _user_source(history: list[HistoryMessage], text: str) -> str:

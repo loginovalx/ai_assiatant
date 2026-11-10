@@ -83,6 +83,10 @@ def is_appointment_request(text: str) -> bool:
     return bool(re.search(rf"\b{_APPOINTMENT_WORD}\b", _appointment_text(text), re.I))
 
 
+def clock_alternatives_question(hour: int) -> str:
+    return f"Во сколько запланировать: в {hour:02}:00 или в {hour + 12:02}:00?"
+
+
 def clarification_text(question: str, source: str) -> str:
     """Ask both missing fields together, while retaining an already named field."""
     if "уже прошло" in question.casefold():
@@ -106,7 +110,7 @@ def clarification_text(question: str, source: str) -> str:
     exact_clock = requested_clock(source)
     appointment_has_clock = exact_clock is not None and is_appointment_request(source)
     if asks_for_clock_time(question) and (hour := ambiguous_hour(source)) is not None:
-        return f"Во сколько запланировать: в {hour:02}:00 или в {hour + 12:02}:00?"
+        return clock_alternatives_question(hour)
     if not is_person_appointment(source) and not appointment_has_clock:
         return question
     if asks_for_day(question):

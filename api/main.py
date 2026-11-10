@@ -13,6 +13,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, ValidationError
 
 from api.auth import get_current_user_id
 from api.ics import build_ics
@@ -21,7 +22,7 @@ from common.config import get_settings
 from common.db import create_pool
 from common.embeddings import build_embedder
 from common.repository import EventRepository
-from common.schemas import Event, EventStatus, EventType, ImportResult, SearchHit
+from common.schemas import Event, EventCreate, EventStatus, EventType, ImportResult, SearchHit
 from common.timeutils import ensure_aware
 
 MAX_IMPORT_BYTES = 5_000_000
@@ -45,7 +46,7 @@ app = FastAPI(title="Voice Assistant API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().api_cors_origins,
-    allow_methods=["GET", "POST"],  # POST — загрузка календаря из Mini App
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -72,6 +73,48 @@ async def me(user_id: UserId) -> dict[str, str]:
 @app.get("/app/", include_in_schema=False)
 async def miniapp() -> FileResponse:
     return FileResponse(MINIAPP_INDEX)
+
+
+class MiniAppEventInput(BaseModel):
+    type: EventType
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=2000)
+    start_at: datetime | None = None
+    duration_minutes: int | None = None
+    request_id: UUID
+    confirmation: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/v1/events", response_model=Event, status_code=201)
+async def create_event(repo: Repo, user_id: UserId, body: MiniAppEventInput) -> Event:
+    try:
+        data = EventCreate(
+            user_id=user_id,
+            **body.model_dump(exclude={"request_id", "confirmation"}),
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail="Проверьте название, дату и длительность."
+        ) from exc
+    if data.type == EventType.REMINDER and data.start_at <= datetime.now(get_settings().tz):
+        raise HTTPException(status_code=422, detail="Выберите будущее время для напоминания.")
+    event, conflicts, snapshot = await repo.create_checked(data, body.request_id, body.confirmation)
+    if event is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "confirmation": snapshot,
+                "conflicts": [
+                    {
+                        "name": other.name,
+                        "start_at": other.start_at.isoformat(),
+                        "end_at": other.end_at.isoformat(),
+                    }
+                    for other in conflicts
+                ],
+            },
+        )
+    return event
 
 
 @app.post("/v1/events/{event_id}/complete", response_model=Event)

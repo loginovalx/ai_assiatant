@@ -47,6 +47,26 @@
   .app { max-width: 640px; margin: 0 auto; padding: 16px; padding-bottom: 40px; }
   h1 { font-size: 22px; margin: 4px 0 12px; }
 
+  .app-header, .create-actions { display: flex; align-items: center; gap: 8px; }
+  .app-header { justify-content: space-between; margin-bottom: 12px; }
+  .app-header h1 { margin: 0; }
+  .add-entry { min-width: 44px; font-size: 24px; line-height: 1; }
+  .create-dialog {
+    width: min(440px, calc(100% - 24px)); max-height: calc(100% - 24px); overflow: auto;
+    border: 1px solid var(--border); border-radius: 16px; padding: 16px;
+    background: var(--card); color: var(--text);
+  }
+  .create-dialog::backdrop { background: rgb(0 0 0 / 48%); }
+  .create-dialog h2 { margin: 0 0 12px; font-size: 20px; }
+  .create-dialog label { display: grid; gap: 4px; margin-bottom: 12px; }
+  .create-dialog input, .create-dialog select {
+    min-width: 0; width: 100%; min-height: 44px; padding: 8px 10px; font: inherit;
+    border: 1px solid var(--border); border-radius: 10px;
+    color: var(--text); background: var(--bg);
+  }
+  .create-actions { flex-wrap: wrap; justify-content: flex-end; margin-top: 12px; }
+  .create-error { color: var(--error); }
+  .conflict-list { max-height: 9rem; overflow: auto; overflow-wrap: anywhere; }
   .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
   .filters { margin-bottom: 16px; }
   .filters h2 { font-size: 14px; margin: 0 0 8px; }
@@ -120,7 +140,43 @@
 </head>
 <body>
 <div class="app">
-  <h1>Мои задачи и встречи</h1>
+  <header class="app-header">
+    <h1>Мои задачи и встречи</h1>
+    <button class="btn add-entry" id="createOpen" type="button" aria-label="Создать запись" disabled>+</button>
+  </header>
+  <p id="createNotice" class="note hidden" role="status"></p>
+
+  <dialog class="create-dialog" id="createDialog" aria-labelledby="createTitle">
+    <form id="createForm">
+      <h2 id="createTitle">Новая запись</h2>
+      <label>Тип записи
+        <select id="createType">
+          <option value="task">Задача</option>
+          <option value="meeting">Встреча</option>
+          <option value="reminder">Напоминание</option>
+        </select>
+      </label>
+      <label>Название <input id="createName" maxlength="200" required></label>
+      <label><span id="createStartLabel">Дата и время (необязательно)</span>
+        <input id="createStart" type="datetime-local">
+      </label>
+      <label class="hidden" id="createDurationField"><span id="createDurationLabel">Длительность, мин</span>
+        <input id="createDuration" type="number" min="1" max="1440" step="1" inputmode="numeric">
+      </label>
+      <p id="createError" class="create-error hidden" role="alert"></p>
+      <section class="hidden" id="createConflict" aria-labelledby="conflictTitle">
+        <h3 id="conflictTitle" tabindex="-1">Это время уже занято</h3>
+        <p>Запись пересекается с событиями ниже. Сохранить её на это время?</p>
+        <ul class="conflict-list" id="createConflictList"></ul>
+      </section>
+      <div class="create-actions">
+        <button type="button" class="btn secondary" id="createCancel">Отмена</button>
+        <button type="button" class="btn secondary hidden" id="createChange">Изменить время</button>
+        <button type="submit" class="btn" id="createSave">Сохранить</button>
+        <button type="button" class="btn hidden" id="createConfirm">Сохранить всё равно</button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- Если user_id неоткуда взять - показываем поле, чтобы ввести его руками (для разработки) -->
   <form id="userForm" class="userbox hidden">
@@ -227,7 +283,7 @@ function periodRange(period) {
 }
 
 /* ---------- запросы к бэкенду ---------- */
-async function api(path, query, method = 'GET') {
+async function api(path, query, method = 'GET', body) {
   let url;
   try {
     url = new URL(API_BASE + path);
@@ -243,7 +299,11 @@ async function api(path, query, method = 'GET') {
   });
   let res;
   try {
-    res = await fetch(url.toString(), { method, headers: authHeaders(), signal: (() => { const c = new AbortController(); setTimeout(() => c.abort(), 20000); return c.signal; })() });
+    res = await fetch(url.toString(), {
+      method,
+      headers: { ...authHeaders(), ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: (() => { const c = new AbortController(); setTimeout(() => c.abort(), 20000); return c.signal; })() });
   } catch (e) {
     const err = new Error('Нет связи с сервером');
     err.network = true;
@@ -252,6 +312,7 @@ async function api(path, query, method = 'GET') {
   if (!res.ok) {
     const err = new Error(res.status === 401 ? 'Откройте мини-приложение заново через MAX.' : 'Ошибка сервера: ' + res.status);
     err.status = res.status;
+    try { err.detail = (await res.json()).detail; } catch (e) { /* сервер мог вернуть HTML */ }
     throw err;
   }
   try {
@@ -451,6 +512,7 @@ function render(events) {
 /* ---------- загрузка ---------- */
 let loadCounter = 0;
 async function load() {
+  document.getElementById('createOpen').disabled = !state.userId;
   if (!state.userId) {
     document.getElementById('userForm').classList.toggle('hidden', !isLocalDev);
     showState(isLocalDev ? 'Укажите user_id для локальной разработки' : 'Откройте мини-приложение через MAX', '', false);
@@ -549,6 +611,130 @@ document.getElementById('userForm').addEventListener('submit', (e) => {
   state.userId = v;
   document.getElementById('userForm').classList.add('hidden');
   load();
+});
+
+/* ---------- создание записи ---------- */
+const entryDialog = document.getElementById('createDialog');
+const entryForm = document.getElementById('createForm');
+const entryType = document.getElementById('createType');
+const entryName = document.getElementById('createName');
+const entryStart = document.getElementById('createStart');
+const entryDuration = document.getElementById('createDuration');
+const entryError = document.getElementById('createError');
+const entryConflict = document.getElementById('createConflict');
+const entrySave = document.getElementById('createSave');
+const entryConfirm = document.getElementById('createConfirm');
+const entryChange = document.getElementById('createChange');
+const entryCancel = document.getElementById('createCancel');
+const entryNotice = document.getElementById('createNotice');
+let entryRequestId;
+let entrySnapshot = null;
+let entryBusy = false;
+
+function entryFields() {
+  const task = entryType.value === 'task';
+  const meeting = entryType.value === 'meeting';
+  entryStart.required = !task;
+  document.getElementById('createStartLabel').textContent =
+    task ? 'Дата и время (необязательно)' : 'Дата и время';
+  const hasDuration = meeting || (task && !!entryStart.value);
+  document.getElementById('createDurationField').classList.toggle('hidden', !hasDuration);
+  document.getElementById('createDurationLabel').textContent =
+    meeting ? 'Длительность, мин' : 'Длительность, мин (необязательно)';
+  entryDuration.disabled = !hasDuration;
+  entryDuration.required = meeting;
+}
+
+function showEntryConflict(detail) {
+  entrySnapshot = detail ? detail.confirmation : null;
+  entryConflict.classList.toggle('hidden', !detail);
+  entryChange.classList.toggle('hidden', !detail);
+  entryConfirm.classList.toggle('hidden', !detail);
+  entrySave.classList.toggle('hidden', !!detail);
+  if (!detail) return;
+  const list = document.getElementById('createConflictList');
+  list.replaceChildren(...detail.conflicts.map((other) => {
+    const start = new Date(other.start_at);
+    const end = new Date(other.end_at);
+    const endDay = toDateOnly(start) === toDateOnly(end) ? '' : fmtDay(end) + ', ';
+    return el('li', '', fmtDay(start) + ', ' + fmtTime(start) + ' — ' +
+      endDay + fmtTime(end) + ' · ' + other.name);
+  }));
+  document.getElementById('conflictTitle').focus();
+}
+
+document.getElementById('createOpen').addEventListener('click', () => {
+  entryForm.reset();
+  entryRequestId = crypto.randomUUID();
+  entryError.classList.add('hidden');
+  entryNotice.classList.add('hidden');
+  showEntryConflict(null);
+  entryFields();
+  entryDialog.showModal();
+});
+entryType.addEventListener('change', () => {
+  entryDuration.value = entryType.value === 'meeting' ? '60' : '';
+  entryFields();
+});
+entryStart.addEventListener('input', entryFields);
+entryForm.addEventListener('input', () => {
+  entryRequestId = crypto.randomUUID();
+  entryError.classList.add('hidden');
+  showEntryConflict(null);
+});
+entryChange.addEventListener('click', () => {
+  showEntryConflict(null);
+  entryStart.focus();
+});
+entryCancel.addEventListener('click', () => entryDialog.close());
+entryDialog.addEventListener('cancel', (event) => {
+  if (entryBusy) event.preventDefault();
+});
+
+async function saveEntry(confirmation) {
+  if (entryBusy || !entryForm.reportValidity()) return;
+  const name = entryName.value.trim();
+  if (!name) {
+    entryError.textContent = 'Введите название.';
+    entryError.classList.remove('hidden');
+    entryName.focus();
+    return;
+  }
+  const start = entryStart.value ? toLocalISO(new Date(entryStart.value)) : null;
+  const duration = entryDuration.disabled || !entryDuration.value ? null : Number(entryDuration.value);
+  entryBusy = true;
+  const controls = [entryType, entryName, entryStart, entryCancel, entryChange, entrySave, entryConfirm];
+  controls.forEach((control) => { control.disabled = true; });
+  entryDuration.disabled = true;
+  entryError.classList.add('hidden');
+  try {
+    await api('/v1/events', { user_id: state.userId }, 'POST', {
+      type: entryType.value, name, start_at: start, duration_minutes: duration,
+      request_id: entryRequestId, confirmation,
+    });
+    entryDialog.close();
+    entryNotice.textContent = 'Сохранено: ' + name;
+    entryNotice.classList.remove('hidden');
+    load();
+  } catch (e) {
+    if (e.status === 409 && e.detail?.confirmation && Array.isArray(e.detail.conflicts)) {
+      showEntryConflict(e.detail);
+    } else {
+      entryError.textContent = typeof e.detail === 'string' ? e.detail : e.message;
+      entryError.classList.remove('hidden');
+    }
+  } finally {
+    entryBusy = false;
+    controls.forEach((control) => { control.disabled = false; });
+    entryFields();
+  }
+}
+entryForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (!entrySnapshot) saveEntry(null);
+});
+entryConfirm.addEventListener('click', () => {
+  if (entrySnapshot) saveEntry(entrySnapshot);
 });
 
 /* ---------- старт ---------- */

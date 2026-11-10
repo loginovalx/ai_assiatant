@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -130,3 +131,41 @@ def test_ics_format():
     assert all(len(line.encode()) <= 75 for line in text.split("\r\n"))
     unfolded = text.replace("\r\n ", "")
     assert "SUMMARY:Встреча\\; с Иваном\\, срочно" in unfolded
+
+
+async def test_miniapp_create_requires_current_conflict_confirmation(client, pool, tz):
+    busy = await seed(tz)
+    params = {"user_id": USER}
+    body = {
+        "type": "meeting",
+        "name": "Новая встреча",
+        "start_at": busy.start_at.isoformat(),
+        "duration_minutes": 30,
+        "request_id": str(uuid4()),
+    }
+    response = await client.post("/v1/events", params=params, json=body)
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert [item["name"] for item in detail["conflicts"]] == [busy.name]
+    assert await pool.fetchval("SELECT count(*) FROM events") == 1
+
+    await seed(tz, name="Ещё одна встреча")
+    response = await client.post(
+        "/v1/events", params=params, json={**body, "confirmation": detail["confirmation"]}
+    )
+    assert response.status_code == 409
+    assert await pool.fetchval("SELECT count(*) FROM events") == 2
+    confirmation = response.json()["detail"]["confirmation"]
+    for _ in range(2):
+        response = await client.post(
+            "/v1/events", params=params, json={**body, "confirmation": confirmation}
+        )
+        assert response.status_code == 201
+    assert await pool.fetchval("SELECT count(*) FROM events") == 3
+
+    response = await client.post(
+        "/v1/events",
+        params=params,
+        json={**body, "type": "reminder", "duration_minutes": None, "request_id": str(uuid4())},
+    )
+    assert response.status_code == 201

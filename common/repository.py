@@ -1,5 +1,6 @@
 """Весь SQL проекта в одном месте. MCP-сервер и HTTP API ходят в базу только через этот класс."""
 
+import hashlib
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
@@ -123,7 +124,11 @@ class EventRepository:
 
     async def create(self, data: EventCreate, idempotency_key: UUID | None = None) -> Event:
         embedding = await self._embed_one(_embedding_text(data.type, data.name, data.description))
-        row = await self._pool.fetchrow(
+        event_id = self.creation_id(data.user_id, idempotency_key) if idempotency_key else uuid4()
+        return await self._insert_event(self._pool, data, embedding, event_id)
+
+    async def _insert_event(self, db, data: EventCreate, embedding, event_id: UUID) -> Event:
+        row = await db.fetchrow(
             f"""
             INSERT INTO events (id, user_id, type, name, description, start_at, duration_minutes,
                                 embedding)
@@ -139,9 +144,48 @@ class EventRepository:
             data.start_at,
             data.duration_minutes,
             embedding,
-            self.creation_id(data.user_id, idempotency_key) if idempotency_key else uuid4(),
+            event_id,
         )
         return self._to_event(row)
+
+    async def create_checked(
+        self, data: EventCreate, request_id: UUID, confirmation: str | None
+    ) -> tuple[Event | None, list[Event], str | None]:
+        """Serialize Mini App submissions per user and recheck the approved conflicts."""
+        event_id = self.creation_id(data.user_id, request_id)
+        async with self._pool.acquire() as conn, conn.transaction():
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                f"miniapp-create:{data.user_id}",
+            )
+            existing = await conn.fetchrow(
+                f"SELECT {_COLUMNS} FROM events WHERE id = $1 AND user_id = $2",
+                event_id,
+                data.user_id,
+            )
+            if existing:
+                return self._to_event(existing), [], None
+            now = datetime.now(self._tz)
+            candidate = Event(
+                id=event_id,
+                **data.model_dump(),
+                status=EventStatus.ACTIVE,
+                created_at=now,
+                updated_at=now,
+            )
+            conflicts = await self._find_conflicts(conn, candidate)
+            if conflicts:
+                revisions = sorted(
+                    f"{event.id}:{event.updated_at.isoformat()}" for event in conflicts
+                )
+                payload = "\n".join([str(request_id), data.model_dump_json(), *revisions])
+                snapshot = hashlib.sha256(payload.encode()).hexdigest()
+                if confirmation != snapshot:
+                    return None, conflicts, snapshot
+            embedding = await self._embed_one(
+                _embedding_text(data.type, data.name, data.description)
+            )
+            return await self._insert_event(conn, data, embedding, event_id), [], None
 
     async def find_conflicts(self, event: Event) -> list[Event]:
         """Активные встречи и дела пользователя, пересекающиеся с event по времени.
@@ -149,11 +193,14 @@ class EventRepository:
         Пусто, если сама запись время не занимает (напоминание, дело без длительности).
         Саму запись в ответ не включаем — это важно после update.
         """
+        return await self._find_conflicts(self._pool, event)
+
+    async def _find_conflicts(self, db, event: Event) -> list[Event]:
         interval = busy_interval(event.type, event.start_at, event.duration_minutes)
         if interval is None:
             return []
         start, end = interval
-        rows = await self._pool.fetch(
+        rows = await db.fetch(
             _CONFLICTS_SQL,
             event.user_id,
             start,

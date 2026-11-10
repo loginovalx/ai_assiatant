@@ -156,7 +156,7 @@ async def test_missing_clock_clarification_offers_unique_ttl_bound_presets(quest
 
 
 @pytest.mark.asyncio
-async def test_duration_only_clarification_does_not_offer_time_presets():
+async def test_duration_only_clarification_offers_duration_presets():
     bot, max_api, _, redis = build_bot()
     response = AgentMessageResponse(
         reply_text="Какова длительность встречи?", status="need_clarification"
@@ -164,8 +164,13 @@ async def test_duration_only_clarification_does_not_offer_time_presets():
 
     await bot._result(str(USER), USER, response)
 
-    assert max_api.sent[-1]["buttons"] is None
-    assert f"bot:time-choice:{USER}" not in redis.values
+    assert [b["text"] for b in all_buttons(max_api.sent[-1])] == [
+        "30 минут",
+        "60 минут",
+        "120 минут",
+        "Другая длительность",
+    ]
+    assert f"bot:time-choice:{USER}" in redis.values
 
 
 @pytest.mark.asyncio

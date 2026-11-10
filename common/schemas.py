@@ -144,6 +144,7 @@ class EventWithConflicts(Event):
     поставить две встречи подряд или внахлёст.
     """
 
+    awaiting_confirmation: bool = False
     conflicts: list[Event] = Field(
         default_factory=list,
         description="Активные встречи и дела, пересекающиеся по времени. Пусто — пересечений нет",
@@ -177,6 +178,10 @@ class DraftAction(BaseModel):
     arguments: dict = Field(default_factory=dict)
     preview: str
     status: str = "pending_confirmation"
+
+    @property
+    def confirm_overlap(self) -> bool:
+        return self.status == "pending_overlap_confirmation"
 
 
 DRAFT_TTL_SECONDS = 3600

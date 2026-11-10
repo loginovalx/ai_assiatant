@@ -138,7 +138,7 @@ def named_weekday(text: str) -> int | None:
         r"суббот\w*",
         r"воскресень\w*",
     )
-    prefix = r"\b(?:в|на|до|к|ко)\s+(?:(?:эт|следующ|ближайш)\w*\s+)?"
+    prefix = r"\b(?:в|во|на|до|к|ко)\s+(?:(?:эт|следующ|ближайш)\w*\s+)?"
     found = {day for day, form in enumerate(forms) if re.search(prefix + form + r"\b", text, re.I)}
     return next(iter(found)) if len(found) == 1 else None
 
@@ -146,7 +146,7 @@ def named_weekday(text: str) -> int | None:
 def resolve_weekday_mismatch(text: str, start: datetime, now: datetime) -> datetime | None:
     """Resolve an unqualified weekday from the server calendar, never an explicit date."""
     weekday = named_weekday(text)
-    if weekday is None or start.weekday() == weekday:
+    if weekday is None or (start.weekday() == weekday and not mentions_week_range(text)):
         return None
     explicit = (
         r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[./]\d{1,2}\b|"
@@ -169,3 +169,25 @@ def resolve_weekday_mismatch(text: str, start: datetime, now: datetime) -> datet
             return None
         resolved += timedelta(days=7)
     return resolved
+
+
+_WEEK_RANGE = re.compile(r"\b(?:на\s+)?(?:эт\w*|следующ\w*)\s+недел\w*\b", re.I)
+_EXPLICIT_WEEKDAY_OR_DATE = re.compile(
+    r"\b(?:понедельник\w*|вторник\w*|сред(?:а|у|ы|е|ой|ою)|четверг\w*|"
+    r"пятниц\w*|суббот\w*|воскресень\w*|сегодня|завтра|послезавтра)\b|"
+    r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b|"
+    r"\b\d{1,2}(?:-?(?:го|е|й))?\s+(?:январ\w*|феврал\w*|март\w*|апрел\w*|"
+    r"ма[йя]\w*|июн\w*|июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)\b",
+    re.I,
+)
+_CLOCK_TIME = re.compile(r"\bв\s+\d{1,2}[.:]\d{2}\b", re.I)
+
+
+def has_explicit_weekday_or_date(text: str) -> bool:
+    # Dot-separated dates are valid, but "в 10.00" is a clock time, not day.month.
+    without_clock_times = _CLOCK_TIME.sub(" ", text)
+    return bool(_EXPLICIT_WEEKDAY_OR_DATE.search(without_clock_times))
+
+
+def mentions_week_range(text: str) -> bool:
+    return bool(_WEEK_RANGE.search(text))

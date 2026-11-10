@@ -2,7 +2,13 @@
 
 import re
 
-from common.timeutils import allows_default_duration, mentions_duration, mentions_start_time
+from common.timeutils import (
+    allows_default_duration,
+    has_explicit_weekday_or_date,
+    mentions_duration,
+    mentions_start_time,
+    mentions_week_range,
+)
 
 _CLOCK_QUESTION = re.compile(
     r"\bво\s+сколько\b|\b(?:в|на)\s+какое\s+(?:точное\s+)?время\b|"
@@ -25,6 +31,10 @@ def asks_for_duration(text: str) -> bool:
     return bool(_DURATION_QUESTION.search(text))
 
 
+def asks_for_day(text: str) -> bool:
+    return bool(re.search(r"\b(?:какой\s+день|какую\s+дату)\b", text, re.I))
+
+
 def is_clarification_question(text: str) -> bool:
     if asks_for_clock_time(text):
         return True
@@ -36,8 +46,9 @@ def is_clarification_question(text: str) -> bool:
         and (
             asks_for_clock_time(text)
             or asks_for_duration(text)
+            or asks_for_day(text)
             or re.search(
-                r"\b(?:какой\s+день|какую\s+дату|о\s+ч[её]м\s+напомнить|как\s+назвать)\b",
+                r"\b(?:о\s+ч[её]м\s+напомнить|как\s+назвать)\b",
                 text,
                 re.I,
             )
@@ -61,9 +72,17 @@ def is_person_appointment(text: str) -> bool:
 
 def clarification_text(question: str, source: str) -> str:
     """Ask both missing fields together, while retaining an already named field."""
+    if (
+        (asks_for_day(question) or asks_for_clock_time(question) or asks_for_duration(question))
+        and mentions_week_range(source)
+        and not has_explicit_weekday_or_date(source)
+    ):
+        if re.search(r"следующ\w*\s+недел", source, re.I):
+            return "На какой день на следующей неделе запланировать?"
+        return "На какой день на этой неделе запланировать?"
     if not is_person_appointment(source):
         return question
-    if re.search(r"\b(?:какой\s+день|какую\s+дату)\b", question, re.I):
+    if asks_for_day(question):
         return question
     if not (asks_for_clock_time(question) or asks_for_duration(question)):
         return question

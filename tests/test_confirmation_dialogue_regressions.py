@@ -54,7 +54,18 @@ class Repository:
         return self.rows[event_id]
 
     async def find_conflicts(self, event):
-        return []
+        if event.end_at is None:
+            return []
+        return [
+            other
+            for other in self.rows.values()
+            if other.user_id == event.user_id
+            and other.id != event.id
+            and other.status == "active"
+            and other.end_at is not None
+            and other.start_at < event.end_at
+            and event.start_at < other.end_at
+        ]
 
     async def preview_cancellation_ids(self, owner, types, start, end):
         return [
@@ -337,12 +348,16 @@ async def test_voice_preview_preserves_real_description(session, tz):
     assert 'Описание: "Взять учебник"' in api.sent[-1]["text"]
 
 
-async def test_plain_model_question_keeps_time_buttons_and_both_missing_fields(session, tz):
+@pytest.mark.parametrize(("answer", "minutes"), [("На 45 минут", 45), ("60", 60)])
+async def test_plain_model_question_keeps_time_buttons_and_both_missing_fields(
+    session, tz, answer, minutes
+):
     build, repo = session
-    _, api, message, click, _, _ = build(
+    _, api, message, click, model, _ = build(
         text("На какое время завтра поставить занятие с Ольгой?"),
         text("Сколько продлится занятие с Ольгой?"),
-        appointment(tz, minutes=45, person="Ольгой"),
+        appointment(tz, minutes=minutes, person="Ольгой"),
+        text("Занятие сохранено."),
     )
     await message("Поставь на завтра занятие с Ольгой")
     assert api.sent[-1]["text"] == "Во сколько начнётся встреча и сколько она продлится?"
@@ -354,11 +369,18 @@ async def test_plain_model_question_keeps_time_buttons_and_both_missing_fields(s
     ]
     await click("12:00")
     assert api.sent[-1]["text"] == "Сколько продлится встреча?"
-    assert not all_buttons(api.sent[-1]) and repo.writes == 0
-    await message("На 45 минут")
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == [
+        "30 минут",
+        "60 минут",
+        "120 минут",
+        "Другая длительность",
+    ]
+    assert repo.writes == 0
+    await message(answer)
+    assert model.requests[2]["messages"][-1]["content"] == f"На {minutes} минут"
     assert repo.writes == 1
     event = next(iter(repo.rows.values()))
-    assert event.start_at.hour == 12 and event.duration_minutes == 45
+    assert event.start_at.hour == 12 and event.duration_minutes == minutes
 
 
 @pytest.mark.parametrize(
@@ -473,3 +495,98 @@ async def test_voice_reschedule_approval_after_midnight_keeps_preview_day(
     await click("Сохранить")
     assert repo.rows[event.id].start_at == target.replace(hour=12, minute=20)
     assert repo.rows[event.id].duration_minutes == 60
+
+
+async def test_week_reminder_chooses_day_then_time(session, request_clock, tz):
+    build, repo = session
+    _, api, message, click, model, _ = build(
+        text("Какой день на следующей неделе и во сколько напомнить?"),
+        text("Во сколько напомнить во вторник?"),
+        tool_call(
+            "create_event",
+            {
+                "event_type": "reminder",
+                "name": "Проверить документы",
+                "start_at": datetime(2030, 11, 19, 9, tzinfo=tz).isoformat(),
+            },
+        ),
+        text("Напоминание сохранено."),
+    )
+    await message("Напомни на следующей неделе проверить документы")
+    assert "На какой день на следующей неделе" in api.sent[-1]["text"]
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == [
+        "Пн",
+        "Вт",
+        "Ср",
+        "Чт",
+        "Пт",
+        "Сб",
+        "Вс",
+        "Другая дата",
+    ]
+    await click("Вт")
+    assert model.requests[-1]["messages"][-1]["content"] == "Во вторник"
+    assert repo.writes == 0
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == [
+        "09:00",
+        "12:00",
+        "18:00",
+        "Другое время",
+    ]
+    await click("09:00")
+    assert repo.writes == 1
+    assert next(iter(repo.rows.values())).start_at == datetime(2030, 11, 12, 9, tzinfo=tz)
+
+
+async def test_duration_button_and_conflict_wait_for_explicit_save(session, tz):
+    build, repo = session
+    day = (datetime.now(tz) + timedelta(days=1)).replace(
+        hour=12,
+        minute=20,
+        second=0,
+        microsecond=0,
+    )
+    await repo.create(
+        EventCreate(
+            user_id="777",
+            type="meeting",
+            name="Обсуждение макета",
+            start_at=day,
+            duration_minutes=20,
+        )
+    )
+    proposed = tool_call(
+        "create_event",
+        {
+            "event_type": "meeting",
+            "name": "Встреча с Антоном",
+            "start_at": day.replace(minute=30).isoformat(),
+            "duration_minutes": 60,
+        },
+    )
+    bot, api, message, click, model, _ = build(
+        text("Сколько продлится встреча?"),
+        proposed,
+        proposed,
+    )
+    await message("Поставь завтра встречу с Антоном в 12:30")
+    await click("60 минут")
+    assert model.requests[-1]["messages"][-1]["content"] == "На 60 минут"
+    assert repo.writes == 1
+    assert "Обсуждение макета" in api.sent[-1]["text"]
+    assert api.sent[-1]["text"].startswith("Выбранное время пересекается")
+    assert api.sent[-1]["text"].endswith("Вы уверены, что хотите сохранить выбранное время?")
+    assert len(model.requests) == 2  # no generation to describe the overlap
+    assert (await bot.drafts.load("777")).confirm_overlap
+    await click("Отмена")
+    assert repo.writes == 1
+    await message("Поставь завтра встречу с Антоном в 12:30 на час")
+    assert repo.writes == 1
+    await click("Сохранить")
+    assert repo.writes == 2
+    assert (
+        next(
+            event for event in repo.rows.values() if event.name.endswith("Антоном")
+        ).duration_minutes
+        == 60
+    )

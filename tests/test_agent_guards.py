@@ -8,7 +8,7 @@ from openai.types.chat import ChatCompletion
 
 from agent.core import Agent, _user_source
 from agent.prompt import build_system_prompt
-from agent.tools import ToolResult
+from agent.tools import HIDDEN_ARGS, ToolResult
 from common.schemas import AgentStatus, DraftAction, Event
 
 
@@ -415,7 +415,7 @@ async def test_read_period_guard_preserves_complex_dates_and_other_tools(query, 
     toolbox.call = record
     await agent.handle("u", query, now=datetime(2026, 10, 30, 9, tzinfo=ZoneInfo("Europe/Moscow")))
     assert [
-        {key: value for key, value in actual.items() if key != "user_text"} for actual in calls
+        {key: value for key, value in actual.items() if key not in HIDDEN_ARGS} for actual in calls
     ] == [arguments]
 
 

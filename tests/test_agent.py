@@ -453,9 +453,8 @@ async def test_reminder_with_duration_becomes_task(make_agent, tz, pool):
     assert await pool.fetchval("SELECT type FROM events") == "task"
 
 
-async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool):
-    """Пересечение: запись сохраняется, модель видит conflicts, а пересекающаяся встреча
-    попадает в скрытую сводку — «перенеси ту встречу» работает следующим сообщением."""
+async def test_conflict_waits_for_confirmation_and_preserves_references(make_agent, tz, pool):
+    """Пересечение остаётся черновиком. После сохранения обе встречи есть в сводке."""
     existing, _ = make_agent(
         tool_call(
             "create_event",
@@ -486,7 +485,10 @@ async def test_conflict_reaches_llm_and_can_be_rescheduled(make_agent, tz, pool)
     response = await agent.handle(USER, "Встреча с дизайнером завтра в 15:30 на полчаса")
 
     assert len(llm.requests) == 1
-    assert "Созвон с Иваном" in response.reply_text and "пересечение" in response.reply_text
+    assert response.status == "needs_confirmation"
+    assert "Созвон с Иваном" in response.reply_text and "Вы уверены" in response.reply_text
+    assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 1
+    response = await agent.execute_draft(USER, response.draft)
     assert {e.name for e in response.events} == {"Встреча с дизайнером", "Созвон с Иваном"}
     assert await pool.fetchval("SELECT count(*) FROM events WHERE status = 'active'") == 2
 

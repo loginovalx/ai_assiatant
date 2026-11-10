@@ -14,15 +14,64 @@ TIME_CHOICE_OPTIONS = (
 )
 
 
-def time_choice_buttons(choice_id: UUID) -> list[list[dict[str, str]]]:
+CHOICE_OPTIONS = {
+    "time": TIME_CHOICE_OPTIONS,
+    "day": (
+        ("Пн", "mon"),
+        ("Вт", "tue"),
+        ("Ср", "wed"),
+        ("Чт", "thu"),
+        ("Пт", "fri"),
+        ("Сб", "sat"),
+        ("Вс", "sun"),
+        ("Другая дата", "manual-day"),
+    ),
+    "duration": (
+        ("30 минут", "30m"),
+        ("60 минут", "60m"),
+        ("120 минут", "120m"),
+        ("Другая длительность", "manual-duration"),
+    ),
+}
+CHOICE_REPLIES = {
+    "0900": "В 09:00",
+    "1200": "В 12:00",
+    "1800": "В 18:00",
+    "mon": "В понедельник",
+    "tue": "Во вторник",
+    "wed": "В среду",
+    "thu": "В четверг",
+    "fri": "В пятницу",
+    "sat": "В субботу",
+    "sun": "В воскресенье",
+    "30m": "На 30 минут",
+    "60m": "На 60 минут",
+    "120m": "На 120 минут",
+}
+
+
+def choice_kind(selection: str) -> str | None:
+    return next(
+        (
+            kind
+            for kind, options in CHOICE_OPTIONS.items()
+            if any(value == selection for _, value in options)
+        ),
+        None,
+    )
+
+
+def time_choice_buttons(choice_id: UUID, kind: str = "time") -> list[list[dict[str, str]]]:
     options = [
         {
             "type": "callback",
             "text": label,
             "payload": f"time-choice:{choice_id}:{value}",
         }
-        for label, value in TIME_CHOICE_OPTIONS
+        for label, value in CHOICE_OPTIONS[kind]
     ]
+    if kind == "day":
+        return [options[:4], options[4:7], options[7:]]
     return [options[:3], options[3:]]
 
 
@@ -34,7 +83,7 @@ def parse_time_choice_payload(payload: str) -> tuple[UUID, str] | None:
         choice_id = UUID(parts[1])
     except ValueError:
         return None
-    if parts[2] not in {value for _, value in TIME_CHOICE_OPTIONS}:
+    if choice_kind(parts[2]) is None:
         return None
     return choice_id, parts[2]
 
@@ -50,12 +99,17 @@ class TimeChoiceStore:
         return f"bot:time-choice:{user_id}"
 
     async def issue(
-        self, user_id: str, draft_id: UUID | None = None, *, choice_id: UUID | None = None
+        self,
+        user_id: str,
+        draft_id: UUID | None = None,
+        *,
+        choice_id: UUID | None = None,
+        kind: str = "time",
     ) -> UUID:
         choice_id = choice_id or uuid4()
         await self._redis.set(
             self._key(user_id),
-            f"{choice_id}:{draft_id or ''}",
+            self._value(choice_id, draft_id, kind),
             ex=TIME_CHOICE_TTL_SECONDS,
         )
         return choice_id
@@ -65,8 +119,10 @@ class TimeChoiceStore:
         user_id: str,
         choice_id: UUID,
         current_draft_id: UUID | None,
+        *,
+        kind: str = "time",
     ) -> bool:
-        if not await self.matches(user_id, choice_id, current_draft_id):
+        if not await self.matches(user_id, choice_id, current_draft_id, kind=kind):
             return False
         await self._redis.delete(self._key(user_id))
         return True
@@ -76,19 +132,18 @@ class TimeChoiceStore:
         user_id: str,
         choice_id: UUID,
         current_draft_id: UUID | None,
+        *,
+        kind: str = "time",
     ) -> bool:
         raw = await self._redis.get(self._key(user_id))
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8", errors="replace")
-        if not isinstance(raw, str):
-            return False
-        try:
-            stored_choice_id, stored_draft_id = raw.split(":", maxsplit=1)
-        except ValueError:
-            return False
-        if stored_choice_id != str(choice_id):
-            return False
-        return stored_draft_id == str(current_draft_id or "")
+        return raw == self._value(choice_id, current_draft_id, kind)
+
+    @staticmethod
+    def _value(choice_id: UUID, draft_id: UUID | None, kind: str) -> str:
+        suffix = "" if kind == "time" else f":{kind}"
+        return f"{choice_id}:{draft_id or ''}{suffix}"
 
     async def clear(self, user_id: str) -> None:
         await self._redis.delete(self._key(user_id))

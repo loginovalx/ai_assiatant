@@ -174,12 +174,29 @@ class AgentService:
         async def operation() -> AgentResponse:
             review_key = f"agent:voice-review:{user_id}"
             auto_key = f"agent:auto-draft:{user_id}:{request_id}" if request_id else None
+
+            async def execute_automatic(draft: DraftAction) -> AgentResponse:
+                options = (
+                    {"preview_on_conflict": True}
+                    if draft.tool in {"create_event", "update_event"}
+                    else {}
+                )
+                result = await self._agent.execute_draft(user_id, draft, **options)
+                if auto_key and result.draft and result.draft.confirm_overlap:
+                    await self._redis.set(
+                        auto_key, result.draft.model_dump_json(), ex=DRAFT_TTL_SECONDS
+                    )
+                return result
+
             staged = await self._redis.get(auto_key) if auto_key else None
             if staged:
                 # The previous text request may have committed before its receipt
                 # was saved. Replay its exact snapshot instead of invoking the model.
                 staged_draft = DraftAction.model_validate_json(staged)
-                if staged_draft.tool in {"delete_event", "delete_events"}:
+                if staged_draft.confirm_overlap or staged_draft.tool in {
+                    "delete_event",
+                    "delete_events",
+                }:
                     issued = await self._redis.get(f"agent:pending:{user_id}")
                     if issued and DraftAction.model_validate_json(issued).id != staged_draft.id:
                         raise InvalidDraft
@@ -188,7 +205,7 @@ class AgentService:
                         reply_text=staged_draft.preview,
                         draft=staged_draft,
                     )
-                return await self._agent.execute_draft(user_id, staged_draft)
+                return await execute_automatic(staged_draft)
             review = bool(
                 confirm_changes
                 or edit_draft_id is not None
@@ -216,7 +233,10 @@ class AgentService:
             if (
                 result.status == AgentStatus.NEEDS_CONFIRMATION
                 and result.draft
-                and result.draft.tool in {"delete_event", "delete_events"}
+                and (
+                    result.draft.confirm_overlap
+                    or result.draft.tool in {"delete_event", "delete_events"}
+                )
                 and auto_key
             ):
                 # Replaying a request after a lost preview receipt must show the
@@ -228,13 +248,14 @@ class AgentService:
                 not review
                 and result.status == AgentStatus.NEEDS_CONFIRMATION
                 and result.draft
+                and not result.draft.confirm_overlap
                 and result.draft.tool not in {"delete_event", "delete_events"}
             ):
                 # Non-destructive typed changes after lookup may approve their
                 # snapshot immediately. Deletions always wait for explicit review.
                 if auto_key:
                     await self._redis.set(auto_key, result.draft.model_dump_json(), ex=self._ttl)
-                result = await self._agent.execute_draft(user_id, result.draft)
+                result = await execute_automatic(result.draft)
             if result.status == AgentStatus.DONE:
                 await self._redis.delete(review_key)
             return result

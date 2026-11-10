@@ -17,14 +17,17 @@ from bot.max_api import MaxAPI, MaxAPIError
 from bot.models import AgentMessageResponse
 from bot.state import StateStore
 from bot.time_choices import (
+    CHOICE_REPLIES,
     TimeChoiceStore,
     asks_for_clock_time,
+    choice_kind,
     is_explicit_keep_confirmation,
     parse_time_choice_payload,
     time_choice_buttons,
 )
 from common.calendar_import import CalendarImportError, parse_calendar_csv
 from common.config import get_settings
+from common.dialogue import asks_for_day, asks_for_duration
 from common.repository import EventRepository
 from common.schemas import DraftAction, EventStatus
 
@@ -281,6 +284,8 @@ class BotHandler:
         buttons = None
         choice_id = None
         pending = None
+        kind = None
+        reply_text = result.reply_text
         if result.status == "needs_confirmation" and result.draft:
             buttons = confirmation_buttons(
                 result.draft.id,
@@ -288,12 +293,21 @@ class BotHandler:
                 destructive=result.draft.tool in {"delete_event", "delete_events"},
                 saving=result.draft.tool in {"create_event", "update_event"},
             )
-        elif result.status == "need_clarification" and asks_for_clock_time(result.reply_text):
-            pending = await self.drafts.load(user_id)
-            choice_id = uuid4()
-            buttons = time_choice_buttons(choice_id)
+        elif result.status == "need_clarification":
+            if asks_for_day(reply_text):
+                kind = "day"
+                week = " на следующей неделе" if "следующей неделе" in reply_text.casefold() else ""
+                reply_text = f"На какой день{week} запланировать? Выбери день или напиши дату."
+            elif asks_for_clock_time(reply_text):
+                kind = "time"
+            elif asks_for_duration(reply_text):
+                kind = "duration"
+            if kind:
+                pending = await self.drafts.load(user_id)
+                choice_id = uuid4()
+                buttons = time_choice_buttons(choice_id, kind)
         await self.max_api.send(
-            chat_id, result.reply_text or "Агент не вернул ответ", to_user=to_user, buttons=buttons
+            chat_id, reply_text or "Агент не вернул ответ", to_user=to_user, buttons=buttons
         )
         # Keep the previous draft/chooser usable if delivery fails. The user's state
         # lock prevents callbacks from racing the state publication after send.
@@ -303,7 +317,7 @@ class BotHandler:
             await self.drafts.drop(user_id)
         if choice_id is not None:
             await self.time_choices.issue(
-                user_id, pending.id if pending is not None else None, choice_id=choice_id
+                user_id, pending.id if pending is not None else None, choice_id=choice_id, kind=kind
             )
         else:
             await self.time_choices.clear(user_id)
@@ -355,21 +369,30 @@ class BotHandler:
                 draft = await self.drafts.load(user_id)
                 current_draft_id = draft.id if draft is not None else None
                 choice_id, selection = parsed_choice
-                if not await self.time_choices.matches(user_id, choice_id, current_draft_id):
+                kind = choice_kind(selection)
+                if not await self.time_choices.matches(
+                    user_id, choice_id, current_draft_id, kind=kind
+                ):
                     await self.max_api.answer_callback(callback_id, "Выбор времени устарел")
                     return
-                if selection == "manual":
+                if selection not in CHOICE_REPLIES:
                     await self.max_api.send(
                         int(user),
-                        "Напиши или скажи голосом новое время. Остальные данные сохраню "
-                        "и покажу новый вариант для подтверждения.",
+                        {
+                            "day": "Напиши или скажи голосом нужную дату.",
+                            "duration": "Укажи длительность в минутах, например 45.",
+                            "time": (
+                                "Напиши или скажи голосом новое время. Остальные данные сохраню "
+                                "и покажу новый вариант для подтверждения."
+                            ),
+                        }[kind],
                         to_user=True,
                     )
-                    await self.time_choices.consume(user_id, choice_id, current_draft_id)
+                    await self.time_choices.consume(user_id, choice_id, current_draft_id, kind=kind)
                     await self.max_api.answer_callback(callback_id)
                 else:
-                    clock_time = {"0900": "09:00", "1200": "12:00", "1800": "18:00"}[selection]
-                    await self.max_api.answer_callback(callback_id, f"Выбрано {clock_time}")
+                    answer = CHOICE_REPLIES[selection]
+                    await self.max_api.answer_callback(callback_id, f"Выбрано: {answer}")
                     await self.handle_update(
                         {
                             "update_type": "message_created",
@@ -378,13 +401,13 @@ class BotHandler:
                                 "recipient": {"chat_type": "dialog"},
                                 "body": {
                                     "mid": "callback:" + callback_id,
-                                    "text": f"В {clock_time}",
+                                    "text": answer,
                                 },
                             },
                         },
                         _state_request_id=request_id,
                     )
-                    await self.time_choices.consume(user_id, choice_id, current_draft_id)
+                    await self.time_choices.consume(user_id, choice_id, current_draft_id, kind=kind)
             else:
                 draft = await self.drafts.load(user_id)
                 parts = payload.split(":")
@@ -722,6 +745,7 @@ class BotHandler:
             }:
                 await self.agent.reset(user_id)
                 await self.drafts.drop(user_id)
+                await self.time_choices.clear(user_id)
                 await reply("Отменил действие.")
                 return
             else:

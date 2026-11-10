@@ -21,9 +21,15 @@ from agent.policy import asks_to_read, explicitly_requests_change, is_single_act
 from agent.prompt import build_system_prompt
 from agent.routing import ModelRoute, completion_problem, select_model
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
-from common.dialogue import clarification_text, is_clarification_question
+from common.dialogue import (
+    asks_for_clock_time,
+    asks_for_day,
+    asks_for_duration,
+    clarification_text,
+    is_clarification_question,
+)
 from common.display import format_calendar_time
-from common.schemas import AgentResponse, AgentStatus, DraftAction, Event
+from common.schemas import MAX_DURATION_MINUTES, AgentResponse, AgentStatus, DraftAction, Event
 from common.usage import record_usage
 
 logger = logging.getLogger(__name__)
@@ -83,6 +89,7 @@ class Agent:
                 )
             if starts_new_request(text) and history and history[-1].get("clarification_text"):
                 history = []
+            text = _duration_answer(history, text)
             source_text = _user_source(history, text)
             if _keeps_conflicting_time(history, text):
                 response = AgentResponse(
@@ -164,7 +171,9 @@ class Agent:
     async def reset(self, user_id: str) -> None:
         await self._memory.reset(user_id)
 
-    async def execute_draft(self, user_id: str, draft: DraftAction) -> AgentResponse:
+    async def execute_draft(
+        self, user_id: str, draft: DraftAction, *, preview_on_conflict: bool = False
+    ) -> AgentResponse:
         if draft.tool not in MUTATING_TOOLS:
             return AgentResponse(
                 reply_text="Не получилось выполнить: неизвестное действие.",
@@ -178,6 +187,8 @@ class Agent:
                     draft.arguments,
                     idempotency_key=str(draft.id),
                     user_text=draft.arguments.get("user_text"),
+                    date_reference=draft.arguments.get("date_reference"),
+                    preview_on_conflict=preview_on_conflict,
                 )
             elif draft.tool == "delete_events":
                 result = await self._toolbox.call(
@@ -192,10 +203,20 @@ class Agent:
                     draft.tool,
                     draft.arguments,
                     user_text=draft.arguments.get("user_text"),
+                    preview_on_conflict=preview_on_conflict,
                     date_reference=draft.arguments.get("date_reference"),
                 )
             else:
                 result = await self._toolbox.call(user_id, draft.tool, draft.arguments)
+            if _awaits_overlap_confirmation(result):
+                return _draft_response(
+                    draft.model_copy(
+                        update={
+                            "preview": _draft_preview(user_id, draft.tool, result, draft.arguments),
+                            "status": "pending_overlap_confirmation",
+                        }
+                    )
+                )
             if not result.ok:
                 return AgentResponse(
                     reply_text="Не получилось выполнить: "
@@ -384,14 +405,12 @@ class Agent:
                     )
                 args = _parse_args(call.function.arguments)
                 evidence = {}
-                if name == "create_event" and source_text is not None:
-                    evidence["user_text"] = source_text
-                    if args is not None:
-                        args = {**args, "user_text": source_text}
-                elif name == "update_event" and source_text is not None:
+                if name in {"create_event", "update_event"} and source_text is not None:
                     evidence = {"user_text": source_text, "date_reference": date_reference}
                     if args is not None:
                         args = {**args, **evidence}
+                if name in {"create_event", "update_event"}:
+                    evidence["preview_on_conflict"] = True
                 if name == "get_events" and args is not None and read_period is not None:
                     args = {
                         **args,
@@ -500,7 +519,8 @@ class Agent:
                             errors.pop(failed_key)
                 else:
                     errors[fingerprint] = (name, args, str(result.payload), round_number)
-                if preview and result.ok:
+                overlap = _awaits_overlap_confirmation(result)
+                if (preview or overlap) and result.ok:
                     draft_args = (
                         {**args, "confirmed": True, "event_ids": result.payload["event_ids"]}
                         if name == "delete_events"
@@ -510,7 +530,12 @@ class Agent:
                         tool=name,
                         arguments=draft_args,
                         preview=_draft_preview(user_id, name, result, args),
+                        status=(
+                            "pending_overlap_confirmation" if overlap else "pending_confirmation"
+                        ),
                     )
+                    if overlap:
+                        return _draft_response(draft)
                     draft_fingerprint = fingerprint
                     mutations[fingerprint] = result
                     messages.append(
@@ -583,6 +608,10 @@ def _draft_response(draft: DraftAction) -> AgentResponse:
     )
 
 
+def _awaits_overlap_confirmation(result: ToolResult) -> bool:
+    return result.ok and any(raw.get("awaiting_confirmation") is True for raw in result.events)
+
+
 def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict) -> str:
     """The approved operation and its parameters come from validated tool data.
 
@@ -608,6 +637,8 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
         "complete_event": "Отметить выполненной",
     }
     lines = []
+    conflict_lines = []
+    overlap = _awaits_overlap_confirmation(result)
     for raw in result.events:
         event = Event.model_validate(raw)
         if event.user_id != user_id:
@@ -617,7 +648,8 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
         if name == "delete_event":
             lines.extend(["Вы уверены, что хотите удалить запись?", title, _when(event)])
         else:
-            lines.extend([f"{verbs[name]} {kind} {title}?", _when(event)])
+            suffix = "" if overlap else "?"
+            lines.extend([f"{verbs[name]} {kind} {title}{suffix}", _when(event)])
         if event.duration_minutes is not None:
             lines.append(f"Длительность: {event.duration_minutes} мин.")
         source = arguments.get("user_text") or ""
@@ -641,11 +673,22 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
             conflict = Event.model_validate(raw_conflict)
             if conflict.user_id != user_id:
                 raise ValueError("Foreign preview conflict")
-            lines.append(
+            conflict_lines.append(
                 f"Пересечение: {json.dumps(conflict.name, ensure_ascii=False)}, {_when(conflict)}."
             )
     if not lines:
         raise ValueError("Missing preview facts")
+    if overlap:
+        return "\n".join(
+            [
+                "Выбранное время пересекается с другими записями.",
+                *conflict_lines,
+                "",
+                *lines,
+                "",
+                "Вы уверены, что хотите сохранить выбранное время?",
+            ]
+        )
     footer = (
         "Нажмите «Удалить» или «Нет»."
         if name == "delete_event"
@@ -653,7 +696,27 @@ def _draft_preview(user_id: str, name: str, result: ToolResult, arguments: dict)
         if name == "complete_event"
         else "Подтвердите кнопкой «Сохранить»."
     )
-    return "\n".join([*lines, footer])
+    return "\n".join([*lines, *conflict_lines, footer])
+
+
+def _duration_answer(history: list[HistoryMessage], text: str) -> str:
+    """Interpret a bare number as minutes only after a pending duration question."""
+    value = text.strip().rstrip(".!")
+    if not re.fullmatch(r"\d{1,4}", value) or not history:
+        return text
+    last = history[-1]
+    question = last["content"]
+    minutes = int(value)
+    if (
+        last["role"] == "assistant"
+        and last.get("clarification_text")
+        and asks_for_duration(question)
+        and not asks_for_clock_time(question)
+        and not asks_for_day(question)
+        and 1 <= minutes <= MAX_DURATION_MINUTES
+    ):
+        return f"На {minutes} минут"
+    return text
 
 
 def _user_source(history: list[HistoryMessage], text: str) -> str:
@@ -765,6 +828,8 @@ def _incomplete_response(events, confirmed, conflicts, errors) -> AgentResponse:
 
 
 def _public_tool_error(message: str) -> str:
+    if "Названа неделя, но не конкретный день" in message:
+        return "На какой день недели запланировать событие?"
     if "удалять нечего" in message.casefold():
         return "Подходящих записей нет — удалять нечего."
     if "длительност" in message.casefold() or "duration_minutes" in message:

@@ -40,9 +40,11 @@ from common.timeutils import (
     WEEKDAYS_RU,
     allows_default_duration,
     ensure_aware,
+    has_explicit_weekday_or_date,
     mentions_duration,
     mentions_start_time,
     mentions_time,
+    mentions_week_range,
     named_weekday,
     resolve_reschedule_day,
     resolve_weekday_mismatch,
@@ -54,23 +56,7 @@ logger = logging.getLogger(__name__)
 # Небольшой запас на задержку между репликой пользователя и вызовом тула.
 PAST_TOLERANCE = timedelta(minutes=5)
 DRAFT_EVENT_ID = UUID("00000000-0000-0000-0000-000000000000")
-_WEEK_RANGE = re.compile(r"\b(?:на\s+)?(?:эт\w*|следующ\w*)\s+недел\w*\b", re.I)
 _WEEK_END_DEADLINE = re.compile(r"\bдо\s+конца(?:\s+этой)?\s+недел\w*\b", re.I)
-_EXPLICIT_WEEKDAY_OR_DATE = re.compile(
-    r"\b(?:понедельник\w*|вторник\w*|сред(?:а|у|ы|е|ой|ою)|четверг\w*|"
-    r"пятниц\w*|суббот\w*|воскресень\w*|сегодня|завтра|послезавтра)\b|"
-    r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?\b|"
-    r"\b\d{1,2}(?:-?(?:го|е|й))?\s+(?:январ\w*|феврал\w*|март\w*|апрел\w*|"
-    r"ма[йя]\w*|июн\w*|июл\w*|август\w*|сентябр\w*|октябр\w*|ноябр\w*|декабр\w*)\b",
-    re.I,
-)
-_CLOCK_TIME = re.compile(r"\bв\s+\d{1,2}[.:]\d{2}\b", re.I)
-
-
-def _has_explicit_weekday_or_date(text: str) -> bool:
-    # Dot-separated dates are valid, but "в 10.00" is a clock time, not day.month.
-    without_clock_times = _CLOCK_TIME.sub(" ", text)
-    return bool(_EXPLICIT_WEEKDAY_OR_DATE.search(without_clock_times))
 
 
 UserId = Annotated[str, Field(description="ID пользователя MAX. Передавай всегда, как есть.")]
@@ -170,14 +156,15 @@ async def create_event(
     ] = None,
     dry_run: bool = False,
     idempotency_key: UUID | None = None,
+    date_reference: datetime | None = None,
+    preview_on_conflict: bool = False,
 ) -> EventWithConflicts:
     """Создать задачу, напоминание или встречу.
 
     Если пользователь не назвал время встречи или напоминания — не вызывай тул,
     а сначала спроси время. У встречи так же нужна длительность: не назвали — спроси,
     сколько она продлится (можно одним вопросом со временем).
-    Если время пересекается с другими встречами или делами, запись всё равно сохраняется,
-    а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
+    Если время пересекается с другими встречами или делами, нужно подтверждение пользователя.
     """
     repo = _repo(ctx)
     if not dry_run and idempotency_key is not None:
@@ -219,7 +206,7 @@ async def create_event(
     # Время проверяем по дословной реплике пользователя (user_text), а не по description:
     # модель кладёт в description только суть, а время — в start_at. Без user_text
     # (HTTP API, старые вызовы) проверяем description как раньше.
-    if source_text and not _has_explicit_weekday_or_date(source_text):
+    if source_text and not has_explicit_weekday_or_date(source_text):
         if data.type == EventType.TASK and _WEEK_END_DEADLINE.search(source_text):
             raise ToolError(
                 "Срок «до конца недели» не указывает конкретный день. Спроси, до какого дня недели."
@@ -227,11 +214,9 @@ async def create_event(
         if (
             data.type in {EventType.MEETING, EventType.REMINDER}
             and mentions_time(source_text)
-            and _WEEK_RANGE.search(source_text)
+            and mentions_week_range(source_text)
         ):
-            raise ToolError(
-                "Названа неделя, но не конкретный день. Спроси, на какой день недели запланировать."
-            )
+            raise ToolError("На какой день недели запланировать событие?")
     if (
         data.type in {EventType.MEETING, EventType.REMINDER}
         and source_text
@@ -239,9 +224,9 @@ async def create_event(
     ):
         raise ToolError("В исходном запросе нет времени, только день. Спроси точное время.")
     if data.start_at is not None:
-        resolved = resolve_weekday_mismatch(
-            source_text, data.start_at.astimezone(get_settings().tz), now
-        )
+        tz = get_settings().tz
+        reference = ensure_aware(date_reference or now, tz).astimezone(tz)
+        resolved = resolve_weekday_mismatch(source_text, data.start_at.astimezone(tz), reference)
         if resolved is not None:
             data = data.model_copy(update={"start_at": resolved})
     if data.start_at is not None and data.start_at < now - PAST_TOLERANCE:
@@ -278,18 +263,22 @@ async def create_event(
             f"duration_minutes={DEFAULT_MEETING_MINUTES} и скажи, что поставил час."
         )
 
-    repo = _repo(ctx)
-    event = (
-        Event(
-            id=DRAFT_EVENT_ID,
-            **data.model_dump(),
-            status=EventStatus.ACTIVE,
-            created_at=now,
-            updated_at=now,
-        )
-        if dry_run
-        else await repo.create(data, idempotency_key=idempotency_key)
+    candidate = Event(
+        id=DRAFT_EVENT_ID,
+        **data.model_dump(),
+        status=EventStatus.ACTIVE,
+        created_at=now,
+        updated_at=now,
     )
+    if dry_run or preview_on_conflict:
+        conflicts = await repo.find_conflicts(candidate)
+        if dry_run or conflicts:
+            return EventWithConflicts(
+                **_fields(candidate),
+                conflicts=conflicts,
+                awaiting_confirmation=bool(conflicts),
+            )
+    event = await repo.create(data, idempotency_key=idempotency_key)
     conflicts = await repo.find_conflicts(event)
     logger.info(
         "created event %s type=%s user=%s conflicts=%d",
@@ -445,14 +434,14 @@ async def update_event(
     dry_run: bool = False,
     user_text: str | None = None,
     date_reference: datetime | None = None,
+    preview_on_conflict: bool = False,
 ) -> EventWithConflicts:
     """Изменить существующую задачу, напоминание или встречу: перенести время, переименовать,
     поменять длительность.
 
     Для «перенеси её на завтра», «подвинь встречу на 15:00», «переименуй задачу»,
     «встреча будет на полчаса».
-    Если новое время пересекается с другими встречами или делами, изменение всё равно
-    сохраняется, а пересекающиеся записи приходят в conflicts — предупреди о них пользователя.
+    Если новое время пересекается с другими встречами или делами, нужно подтверждение.
     """
     if name is None and start_at is None and description is None and duration_minutes is None:
         raise ToolError("Не указано, что менять: нужно хотя бы одно новое значение")
@@ -490,7 +479,7 @@ async def update_event(
     except ValueError as error:
         raise ToolError(str(error)) from error
 
-    if dry_run:
+    if dry_run or (preview_on_conflict and (start_at is not None or duration_minutes is not None)):
         changes = {
             key: value
             for key, value in {
@@ -502,7 +491,13 @@ async def update_event(
             if value is not None
         }
         event = current.model_copy(update=changes)
-        return EventWithConflicts(**_fields(event), conflicts=await repo.find_conflicts(event))
+        conflicts = await repo.find_conflicts(event)
+        if dry_run or conflicts:
+            return EventWithConflicts(
+                **_fields(event),
+                conflicts=conflicts,
+                awaiting_confirmation=bool(conflicts),
+            )
     event = await repo.update(
         user_id,
         uuid,

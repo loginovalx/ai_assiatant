@@ -19,7 +19,15 @@ from common.internal_auth import internal_token
 logger = logging.getLogger(__name__)
 
 HIDDEN_ARGS = frozenset(
-    {"user_id", "dry_run", "idempotency_key", "event_ids", "user_text", "date_reference"}
+    {
+        "user_id",
+        "dry_run",
+        "idempotency_key",
+        "event_ids",
+        "user_text",
+        "date_reference",
+        "preview_on_conflict",
+    }
 )
 
 # Тул без MCP: им модель сообщает, что ей не хватает данных. Явный сигнал надёжнее,
@@ -127,6 +135,7 @@ class McpToolbox:
         event_ids: list[str] | None = None,
         user_text: str | None = None,
         date_reference: str | None = None,
+        preview_on_conflict: bool = False,
     ) -> ToolResult:
         if name not in ALLOWED_TOOLS - {"ask_user"}:
             return ToolResult(ok=False, payload="Недоступный инструмент")
@@ -134,8 +143,10 @@ class McpToolbox:
         args["user_id"] = user_id  # всегда наш, даже если модель прислала свой
         if user_text is not None and name in {"create_event", "update_event"}:
             args["user_text"] = user_text
-        if date_reference is not None and name == "update_event":
+        if date_reference is not None and name in {"create_event", "update_event"}:
             args["date_reference"] = date_reference
+        if preview_on_conflict and name in {"create_event", "update_event"}:
+            args["preview_on_conflict"] = True
         if dry_run and name in MUTATING_TOOLS:
             args["dry_run"] = True
         if idempotency_key is not None and name == "create_event":

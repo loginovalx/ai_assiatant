@@ -15,19 +15,10 @@
     --card: #ffffff;
     --text: #1b1d21;
     --muted: #6b7280;
-    --pixel-ink: #160e12;
-    --pixel-peach: #ffb68b;
-    --pixel-pale: #ffe4d1;
-    --pixel-active: #ff975e;
-    --pixel-focus: #70371b;
-    --pixel-cut: polygon(
-      8px 0, calc(100% - 8px) 0, calc(100% - 8px) 4px, calc(100% - 4px) 4px,
-      calc(100% - 4px) 8px, 100% 8px, 100% calc(100% - 8px),
-      calc(100% - 4px) calc(100% - 8px), calc(100% - 4px) calc(100% - 4px),
-      calc(100% - 8px) calc(100% - 4px), calc(100% - 8px) 100%, 8px 100%,
-      8px calc(100% - 4px), 4px calc(100% - 4px), 4px calc(100% - 8px),
-      0 calc(100% - 8px), 0 8px, 4px 8px, 4px 4px, 8px 4px
-    );
+    --button-ink: #241712;
+    --button-accent: #ffb68b;
+    --button-hover: #ffcca9;
+    --button-focus: #9e4b22;
     --border: #e3e5ea;
     --task: #3b6cf6;
     --meeting: #e0791f;
@@ -41,7 +32,7 @@
       --text: #eceef2;
       --muted: #9aa1ad;
       --border: #2d313a;
-      --pixel-focus: #fff3e6;
+      --button-focus: #ffdbbf;
     }
   }
   * { box-sizing: border-box; }
@@ -56,51 +47,44 @@
   .app { max-width: 640px; margin: 0 auto; padding: 16px; padding-bottom: 40px; }
   h1 { font-size: 22px; margin: 4px 0 12px; }
 
-  .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
-  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+  .filters { margin-bottom: 16px; }
+  .filters h2 { font-size: 14px; margin: 0 0 3px; }
+  .filter-hint { color: var(--muted); font-size: 13px; margin: 0 0 8px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
 
   button {
-    --button-fill: var(--pixel-pale);
-    position: relative;
-    isolation: isolate;
     min-height: 44px;
     padding: 8px 12px;
-    border: 0;
-    background: var(--pixel-ink);
-    color: var(--pixel-ink);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--card);
+    color: var(--text);
     font: inherit;
     font-size: 14px;
     font-weight: 650;
     cursor: pointer;
-    clip-path: var(--pixel-cut);
   }
-  button::before {
-    content: "";
-    position: absolute;
-    z-index: -1;
-    inset: 2px;
-    background: var(--button-fill);
-    box-shadow: inset 0 -3px 0 rgb(22 14 18 / 16%);
-    clip-path: var(--pixel-cut);
-    pointer-events: none;
-  }
-  button:focus-visible {
-    background: var(--pixel-focus);
-    outline: 0;
-  }
-  button:focus-visible::before { inset: 4px; }
-  button:active:not(:disabled)::before { box-shadow: inset 0 3px 0 rgb(22 14 18 / 20%); }
+  button:focus-visible { outline: 2px solid var(--button-focus); outline-offset: 2px; }
+  button:active:not(:disabled) { opacity: 0.8; }
   button:disabled { opacity: 0.55; cursor: default; }
   .tab { flex: 1 1 0; min-width: 0; padding-inline: 4px; }
-  .tab.active, .chip.active { --button-fill: var(--pixel-active); }
+  .chip { border-radius: 999px; }
+  .tab.active, .chip.active, .btn:not(.secondary) {
+    background: var(--button-accent);
+    border-color: var(--button-accent);
+    color: var(--button-ink);
+  }
+  @media (hover: hover) {
+    .btn:not(.secondary):hover:not(:disabled) { background: var(--button-hover); }
+  }
 
   .search { display: flex; gap: 8px; margin-bottom: 16px; }
   .search input {
     flex: 1; min-width: 0; padding: 10px 12px; font-size: 16px;
     border: 1px solid var(--border); border-radius: 12px; background: var(--card); color: var(--text);
   }
-  .btn { --button-fill: var(--pixel-peach); padding-inline: 14px; }
-  .btn.secondary { --button-fill: var(--pixel-pale); }
+  .btn { padding-inline: 14px; }
 
   .note { color: var(--muted); font-size: 14px; margin: 0 0 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 
@@ -155,11 +139,15 @@
     <button class="tab" aria-pressed="false" data-period="all">Всё</button>
   </div>
 
-  <div class="chips" id="chips">
-    <button class="chip" aria-pressed="false" data-type="task">Задачи</button>
-    <button class="chip" aria-pressed="false" data-type="meeting">Встречи</button>
-    <button class="chip" aria-pressed="false" data-type="reminder">Напоминания</button>
-  </div>
+  <section class="filters" aria-labelledby="filterTitle">
+    <h2 id="filterTitle">Какие записи показывать</h2>
+    <p class="filter-hint" id="filterHint">Можно выбрать несколько типов. Без выбора видны все.</p>
+    <div class="chips" id="chips" role="group" aria-labelledby="filterTitle" aria-describedby="filterHint">
+      <button class="chip" aria-pressed="false" data-type="task">Задачи</button>
+      <button class="chip" aria-pressed="false" data-type="meeting">Встречи</button>
+      <button class="chip" aria-pressed="false" data-type="reminder">Напоминания</button>
+    </div>
+  </section>
 
   <form class="search" id="searchForm">
     <input id="searchInput" type="search" placeholder="Поиск по смыслу, например: «врач»">

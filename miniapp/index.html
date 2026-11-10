@@ -478,6 +478,18 @@ function renderCard(ev) {
   return card;
 }
 
+function sortCalendarEntries(events, period) {
+  const today = periodRange('today').from;
+  const rank = (event) => !event.when ? 2 : (period === 'all' && event.when < today ? 1 : 0);
+  return events.sort((a, b) => {
+    const group = rank(a);
+    const order = group - rank(b);
+    if (order) return order;
+    if (group === 2) return 0;
+    return group === 1 ? b.when - a.when : a.when - b.when;
+  });
+}
+
 function render(events) {
   events = events.filter((e) => !e.cancelled); // отменённые не показываем
   if (state.types.size > 0) {
@@ -487,26 +499,7 @@ function render(events) {
     showState(state.query ? 'По запросу ничего не найдено' : 'Здесь пока ничего нет', '', false);
     return;
   }
-  // вкладка «Все»: сначала предстоящие (по возрастанию), потом без даты, потом прошедшие (свежие выше)
-  if (!state.query && state.period === 'all') {
-    const now = Date.now();
-    const rank = (e) => (!e.when ? 1 : (e.when.getTime() >= now ? 0 : 2));
-    events.sort((a, b) => {
-      const ra = rank(a), rb = rank(b);
-      if (ra !== rb) return ra - rb;
-      if (ra === 0) return a.when - b.when;
-      if (ra === 2) return b.when - a.when;
-      return 0;
-    });
-  } else if (!state.query) {
-    // сортировка: по времени, без даты в конце (в режиме поиска порядок бэкенда сохраняем)
-    events.sort((a, b) => {
-      if (!a.when && !b.when) return 0;
-      if (!a.when) return 1;
-      if (!b.when) return -1;
-      return a.when - b.when;
-    });
-  }
+  if (!state.query) sortCalendarEntries(events, state.period);
   listEl.innerHTML = '';
   let lastKey = null;
   events.forEach((ev) => {

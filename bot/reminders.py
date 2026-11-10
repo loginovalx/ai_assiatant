@@ -32,7 +32,7 @@ def event_buttons(event_id: UUID, series_id: UUID | None = None) -> list[list[di
             [
                 {
                     "type": "callback",
-                    "text": "Настроить повтор",
+                    "text": "Повтор напоминания",
                     "payload": f"repeat:manage:{series_id}",
                 }
             ]

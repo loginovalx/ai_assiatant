@@ -1,5 +1,6 @@
 """Time choice buttons stay scoped to the current user and pending draft."""
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -398,3 +399,20 @@ async def test_welcome_only_shows_calendar_format_after_import_button(start):
     assert "CSV UTF-8" in api.sent[-1]["text"]
     assert all(column in api.sent[-1]["text"] for column in ("`id`", "`date`", "`time`", "`text`"))
     assert not agent.asked
+
+
+async def test_guide_callback_is_deduplicated_across_deliveries_and_rapid_taps():
+    bot, api, _, redis = build_bot()
+    first = callback("quick:features", callback_id="first")
+    second = callback("quick:features", callback_id="second")
+    await asyncio.gather(
+        bot.handle_update(first), bot.handle_update(first), bot.handle_update(second)
+    )
+    assert len(api.sent) == 1
+    assert {ident for ident, _ in api.answered} == {"first", "second"}
+    assert len(api.answered) == 2
+    await redis.delete(f"bot:guide-burst:{USER}:quick:features")
+    await bot.handle_update(first)
+    assert len(api.sent) == 1
+    await bot.handle_update(callback("quick:features", callback_id="later"))
+    assert len(api.sent) == 2

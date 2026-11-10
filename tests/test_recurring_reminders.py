@@ -62,6 +62,7 @@ async def test_preview_edit_and_confirm_use_only_entered_clock(redis, tz):
     assert "Каждый понедельник в 10:30" in api.sent[-1]["text"]
     repo.save_reminder_series.assert_not_called()
     await press("Сохранить")
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == ["Изменить", "Отключить"]
     args = repo.save_reminder_series.await_args.args
     assert args[:3] == ("777", series, ReminderRule(name="отчёт", weekday=0, clock=time(10, 30)))
 
@@ -75,7 +76,7 @@ async def test_reminder_series_rolls_forward_edits_and_stops(repo, pool, tz):
     assert await pool.fetchval("SELECT count(*) FROM events") == 2
     api = FakeMax()
     assert await ReminderSender(repo, api, tz).tick(now + timedelta(hours=1, minutes=1)) == 1
-    assert any("Настроить повтор" == b["text"] for b in all_buttons(api.sent[-1]))
+    assert any("Повтор напоминания" == b["text"] for b in all_buttons(api.sent[-1]))
 
     later = now + timedelta(weeks=10)
     await repo.fill_reminders(later, timedelta(hours=1))

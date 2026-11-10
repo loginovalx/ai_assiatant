@@ -47,6 +47,16 @@ const context = vm.createContext({
 vm.runInContext(source, context);
 (async () => {
   await vm.runInContext('start()', context);
+  const order = vm.runInContext(`
+    const today = periodRange('today').from;
+    sortCalendarEntries([
+      {id: 'undated', when: null},
+      {id: 'tomorrow', when: periodRange('tomorrow').from},
+      {id: 'yesterday', when: new Date(today.getTime() - 3600000)},
+      {id: 'today', when: today},
+    ], 'all').map(event => event.id).join(',')
+  `, context);
+  assert.equal(order, 'today,tomorrow,yesterday,undated');
   getElementById('createOpen').listeners.click();
   getElementById('createType').value = 'meeting';
   getElementById('createType').listeners.change();

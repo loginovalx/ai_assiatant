@@ -30,6 +30,10 @@ def _button(label, action, ident):
     return {"type": "callback", "text": label, "payload": f"repeat:{action}:{ident}"}
 
 
+def repeat_actions(series_id: UUID) -> list[list[dict[str, str]]]:
+    return [[_button("Изменить", "change", series_id), _button("Отключить", "stop", series_id)]]
+
+
 class RecurringReminders:
     def __init__(self, repo, redis, max_api, tz):
         self.repo = repo
@@ -78,8 +82,8 @@ class RecurringReminders:
             for rule in rules:
                 await self._send(
                     user,
-                    f"«{rule.name}»\n{rule.schedule}.",
-                    [[_button("Настроить повтор", "manage", rule.id)]],
+                    f"Напоминание «{rule.name}»\n{rule.schedule}.",
+                    repeat_actions(rule.id),
                 )
             return True
         try:
@@ -128,28 +132,23 @@ class RecurringReminders:
             elif action == "manage":
                 await self._send(
                     user,
-                    f"«{rule.name}»\n{rule.schedule}.",
-                    [
-                        [
-                            _button("Изменить", "change", ident),
-                            _button("Остановить повтор", "stop", ident),
-                        ]
-                    ],
+                    f"Напоминание «{rule.name}»\n{rule.schedule}.",
+                    repeat_actions(ident),
                 )
             elif action == "stop":
                 await self._send(
                     user,
-                    f"Остановить будущие напоминания «{rule.name}»?",
+                    f"Отключить повтор? Напоминания «{rule.name}» больше не будут приходить.",
                     [
                         [
-                            _button("Остановить повтор", "stopyes", ident),
+                            _button("Отключить", "stopyes", ident),
                             _button("Назад", "manage", ident),
                         ]
                     ],
                 )
             elif action == "stopyes":
                 await self.repo.stop_reminder_series(user, ident, now)
-                await self._send(user, f"Повтор «{rule.name}» остановлен.")
+                await self._send(user, f"Повтор напоминания «{rule.name}» отключён.")
             else:
                 await self._choose(
                     user,
@@ -177,8 +176,9 @@ class RecurringReminders:
                 if saved:
                     await self._send(
                         user,
-                        f"Повтор «{draft.rule.name}» сохранён.\n{draft.rule.schedule}.",
-                        [[_button("Настроить повтор", "manage", draft.series_id)]],
+                        f"Напоминание «{draft.rule.name}» сохранено.\n{draft.rule.schedule}.\n"
+                        "Можно изменить расписание или отключить повтор.",
+                        repeat_actions(draft.series_id),
                     )
                 else:
                     await self._send(user, "Повтор изменился. Открой его настройки заново.")

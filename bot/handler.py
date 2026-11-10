@@ -321,6 +321,21 @@ class BotHandler:
         else:
             await self.time_choices.clear(user_id)
 
+    async def _send_guide(self, user_id: str, callback_id: str, payload: str, guide: str) -> None:
+        delivery = f"bot:guide-delivery:{user_id}:{callback_id}"
+        burst = f"bot:guide-burst:{user_id}:{payload}"
+        claim = uuid4().hex
+        if not await self.redis.set(delivery, claim, nx=True, ex=86400):
+            return
+        try:
+            if await self.redis.set(burst, claim, nx=True, ex=5):
+                await self.max_api.send(int(user_id), guide, to_user=True, text_format="markdown")
+        except BaseException:
+            await self.redis.eval(_RELEASE_UPDATE, 1, delivery, claim)
+            await self.redis.eval(_RELEASE_UPDATE, 1, burst, claim)
+            raise
+        await self.max_api.answer_callback(callback_id)
+
     async def _callback(self, update):
         callback = update.get("callback") or {}
         user = (callback.get("user") or {}).get("user_id")
@@ -331,8 +346,7 @@ class BotHandler:
         user_id = str(user)
         guide = {"quick:import": _IMPORT_HELP, "quick:features": _FEATURES_HELP}.get(payload)
         if guide:
-            await self.max_api.send(int(user), guide, to_user=True, text_format="markdown")
-            await self.max_api.answer_callback(callback_id)
+            await self._send_guide(user_id, callback_id, payload, guide)
             return
         if payload.startswith("quick:"):
             question = {

@@ -384,11 +384,17 @@ async def test_welcome_only_shows_calendar_format_after_import_button(start):
     bot, api, agent, _ = build_bot()
     await bot.handle_update(start)
     welcome = api.sent[-1]
-    assert "**Задачи и встречи**" in welcome["text"]
-    assert "мини-приложение" in welcome["text"]
+    assert welcome["text"].startswith("Привет! Я голосовой ассистент команды Нейм.Тим")
+    assert "**Весь календарь**" in welcome["text"]
+    assert "мини-приложении" in welcome["text"]
     assert "CSV" not in welcome["text"]
     assert welcome["format"] == "markdown"
-    await bot.handle_update(callback(all_buttons(welcome)[0]["payload"]))
+    buttons = {button["text"]: button["payload"] for button in all_buttons(welcome)}
+    assert buttons == {"Загрузить календарь": "quick:import", "Что я умею": "quick:features"}
+    await bot.handle_update(callback(buttons["Что я умею"], callback_id="features"))
+    assert "**Задачи и встречи**" in api.sent[-1]["text"]
+    assert "Повторяющиеся напоминания" in api.sent[-1]["text"]
+    await bot.handle_update(callback(buttons["Загрузить календарь"]))
     assert "CSV UTF-8" in api.sent[-1]["text"]
     assert all(column in api.sent[-1]["text"] for column in ("`id`", "`date`", "`time`", "`text`"))
     assert not agent.asked

@@ -71,7 +71,7 @@ class MaxAPI:
 
     async def get_message(self, message_id: str) -> dict:
         """Fetch the complete message when an update omits media fields."""
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", message_id):
+        if not re.fullmatch(r"(?:mid\.)?[A-Za-z0-9_-]+", message_id):
             raise MaxAPIError("Некорректный идентификатор сообщения")
         try:
             response = await self.client.get(f"/messages/{message_id}")

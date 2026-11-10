@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel
 
 from common.display import format_calendar_time
-from common.reminder_series import DAYS, ReminderRule, complete_clock, parse_clock, parse_command
+from common.reminder_series import DAYS, ReminderRule, complete_clock, parse_clock, parse_request
 from common.schemas import DRAFT_TTL_SECONDS
 
 _EXAMPLE = (
@@ -23,6 +23,7 @@ class RepeatDraft(BaseModel):
     revision: UUID | None = None
     rule: ReminderRule
     waiting_for_time: bool = False
+    choosing_daypart: bool = False
     first_at: datetime | None = None
 
 
@@ -72,6 +73,38 @@ class RecurringReminders:
         )
         await self._store(user, draft.model_copy(update={"first_at": first}))
 
+    async def _ask_daypart(self, user, draft):
+        rule = draft.rule
+        early = f"{rule.clock:%H:%M}"
+        late = f"{rule.clock.hour + 12:02}:{rule.clock.minute:02}"
+        await self._store(user, draft)
+        await self._send(
+            user,
+            f"Напоминание «{rule.name}»\n{rule.cadence_label}. Ты имел в виду {early} или {late}? "
+            "Можно ответить голосом.",
+            [
+                [
+                    _button(early, "early", draft.id),
+                    _button(late, "late", draft.id),
+                    _button("Отмена", "cancel", draft.id),
+                ]
+            ],
+        )
+
+    async def _preview_at(self, user, draft, clock):
+        rule = draft.rule.model_copy(update={"clock": clock})
+        await self._preview(
+            user,
+            draft.model_copy(
+                update={
+                    "id": uuid4(),
+                    "rule": rule,
+                    "waiting_for_time": False,
+                    "choosing_daypart": False,
+                }
+            ),
+        )
+
     async def message(self, user, text, series_id, *, is_voice=False):
         value = text.strip(" .!?").casefold()
         source_key = self._key(user) + ":source"
@@ -83,7 +116,9 @@ class RecurringReminders:
             await self._send(user, "Отменил изменения.")
             return True
         if draft and value in {"да", "подтверждаю", "сохранить", "подтвердить"}:
-            if draft.waiting_for_time:
+            if draft.choosing_daypart:
+                await self._ask_daypart(user, draft)
+            elif draft.waiting_for_time:
                 await self._send(user, "Напиши новое время, например 10:30.")
             elif is_voice:
                 await self._preview(user, draft)
@@ -104,6 +139,13 @@ class RecurringReminders:
                 )
             return True
         clock_answer = parse_clock(text)
+        if draft and draft.choosing_daypart:
+            if value in {"утром", "ночи", "ночью", "днем", "днём", "вечером"}:
+                offset = 12 if value in {"днем", "днём", "вечером"} else 0
+                clock_answer = draft.rule.clock.replace(hour=draft.rule.clock.hour + offset)
+            if clock_answer is not None:
+                await self._preview_at(user, draft, clock_answer)
+                return True
         if (
             source
             and not clock_answer
@@ -116,11 +158,11 @@ class RecurringReminders:
             return True
         candidate = complete_clock(source, clock_answer) if source and clock_answer else text
         try:
-            rule = parse_command(candidate)
+            parsed = parse_request(candidate)
         except ValueError:
             await self.redis.delete(self._key(user))
             try:
-                can_fix_clock = parse_command(complete_clock(candidate, time(10))) is not None
+                can_fix_clock = parse_request(complete_clock(candidate, time(10))) is not None
             except ValueError:
                 can_fix_clock = False
             if can_fix_clock:
@@ -132,8 +174,15 @@ class RecurringReminders:
                 await self.redis.delete(source_key)
                 await self._send(user, _EXAMPLE)
             return True
-        if rule:
-            await self._preview(user, RepeatDraft(id=uuid4(), series_id=series_id, rule=rule))
+        if parsed:
+            rule, ambiguous = parsed
+            new_draft = RepeatDraft(
+                id=uuid4(), series_id=series_id, rule=rule, choosing_daypart=is_voice and ambiguous
+            )
+            if new_draft.choosing_daypart:
+                await self._ask_daypart(user, new_draft)
+            else:
+                await self._preview(user, new_draft)
             await self.redis.delete(source_key)
             return True
         if (
@@ -144,11 +193,7 @@ class RecurringReminders:
             if clock_answer is None:
                 await self._send(user, "Введи время в формате ЧЧ:ММ, например 09:30.")
                 return True
-            rule = draft.rule.model_copy(update={"clock": clock_answer})
-            await self._preview(
-                user,
-                draft.model_copy(update={"id": uuid4(), "rule": rule, "waiting_for_time": False}),
-            )
+            await self._preview_at(user, draft, clock_answer)
             return True
         if draft:
             await self.redis.delete(self._key(user))
@@ -199,6 +244,13 @@ class RecurringReminders:
             draft = await self._load(user)
             if draft is None or draft.id != ident:
                 reply = "Черновик устарел"
+            elif draft.choosing_daypart and action in {"early", "late"}:
+                clock = draft.rule.clock
+                await self._preview_at(
+                    user, draft, clock.replace(hour=clock.hour + (12 if action == "late" else 0))
+                )
+            elif draft.choosing_daypart and action != "cancel":
+                reply = "Сначала выбери время."
             elif action == "edit":
                 await self._choose(user, draft)
             elif action == "time":

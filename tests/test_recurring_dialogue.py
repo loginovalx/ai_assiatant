@@ -18,6 +18,7 @@ from tests.test_time_choice_buttons import FakeMax, MemoryRedis, all_buttons
         "Напоминай мне поливать цветы каждый вторник в 10:00",
         "Каждый вторник в десять напоминай мне поливать цветы",
         "Напоминай мне каждый вторник поливать цветы в 10:00",
+        "Я хочу каждый вторник в десять часов утра поливать цветы",
     ],
 )
 def test_natural_repeat_is_understood_with_all_required_fields(command):
@@ -126,3 +127,79 @@ async def test_real_bot_repeat_flow_never_calls_agent_or_asks_for_date(repo, poo
     assert await pool.fetchval("SELECT count(*) FROM reminder_series WHERE user_id='777'") == 1
     agent.ask.assert_not_awaited()
     assert await bot.state.current("777") == "idle"
+
+
+@pytest.mark.parametrize(
+    ("max_transcript", "choose_by_voice"), [(True, False), (True, True), (False, True)]
+)
+async def test_max_transcript_of_weekly_intention_uses_the_requested_hour(
+    repo, pool, redis, max_transcript, choose_by_voice
+):
+    from bot.handler import BotHandler
+    from bot.state import StateStore
+
+    api, agent, asr = FakeMax(), AsyncMock(), AsyncMock()
+    phrase = "Я хочу каждый понедельник в два часа поливать цветы."
+    asr.transcribe.return_value = "Мне ничего не надо." if max_transcript else phrase
+    api.get_message = AsyncMock(
+        return_value={
+            "body": {
+                "attachments": [
+                    {"type": "audio", "transcription": phrase if max_transcript else None}
+                ]
+            }
+        }
+    )
+    api.get_audio = AsyncMock(return_value=b"audio")
+    bot = BotHandler(api, asr, agent, StateStore(redis), redis, repo)
+
+    async def message(payload):
+        await bot.handle_update(
+            {
+                "update_type": "message_created",
+                "message": {
+                    "sender": {"user_id": 777},
+                    "recipient": {"chat_type": "dialog"},
+                    "body": {
+                        "mid": uuid4().hex,
+                        "attachments": [{"type": "audio", "payload": payload}],
+                    },
+                },
+            }
+        )
+
+    async def click(label):
+        payload = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == label)
+        await bot.handle_update(
+            {
+                "update_type": "message_callback",
+                "callback": {
+                    "user": {"user_id": 777},
+                    "callback_id": uuid4().hex,
+                    "payload": payload,
+                },
+            }
+        )
+
+    await message({"url": "https://example.invalid/voice.ogg"})
+    assert [b["text"] for b in all_buttons(api.sent[-1])] == ["02:00", "14:00", "Отмена"]
+    assert "понедельник" in api.sent[-1]["text"] and "поливать цветы" in api.sent[-1]["text"]
+    if choose_by_voice:
+        await message({"transcription": "Днём"})
+    else:
+        await click("14:00")
+    assert "Каждый понедельник в 14:00" in api.sent[-1]["text"]
+    assert await pool.fetchval("SELECT count(*) FROM reminder_series") == 0
+    await click("Сохранить")
+    row = await pool.fetchrow(
+        "SELECT name, weekday, clock FROM reminder_series WHERE user_id='777'"
+    )
+    assert tuple(row.values()) == ("поливать цветы", 0, time(14))
+    api.get_message.assert_awaited_once()
+    if max_transcript:
+        api.get_audio.assert_not_awaited()
+        asr.transcribe.assert_not_awaited()
+    else:
+        api.get_audio.assert_awaited_once_with("https://example.invalid/voice.ogg")
+        asr.transcribe.assert_awaited_once_with(b"audio")
+    agent.ask.assert_not_awaited()

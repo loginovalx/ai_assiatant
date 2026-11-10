@@ -212,11 +212,18 @@ def extract_audio(message: dict[str, Any]) -> tuple[str | None, str | None]:
         if not _is_audio_attachment(attachment):
             continue
         payload = attachment.get("payload") or {}
-        text = payload.get("transcription") or attachment.get("transcription")
+        text = next(
+            (
+                value.strip()
+                for value in (attachment.get("transcription"), payload.get("transcription"))
+                if isinstance(value, str) and value.strip()
+            ),
+            None,
+        )
         url = payload.get("url") or attachment.get("url")
         return (
             url if isinstance(url, str) and url else None,
-            text.strip() if isinstance(text, str) and text.strip() else None,
+            text,
         )
     return None, None
 
@@ -250,7 +257,9 @@ def _brief_attachment_diagnostics(message: dict[str, Any]) -> list[dict[str, Any
             "type": a.get("type"),
             "url": bool((a.get("payload") or {}).get("url")),
             "filename": bool((a.get("payload") or {}).get("filename")),
-            "transcription": bool((a.get("payload") or {}).get("transcription")),
+            "transcription": bool(
+                a.get("transcription") or (a.get("payload") or {}).get("transcription")
+            ),
         }
         for a in _attachments(message)
     ]
@@ -653,14 +662,14 @@ class BotHandler:
         is_voice = _audio_present(message)
         fetched: dict[str, Any] | None = None
 
-        # The MAX event may omit payload.url/filename (or all attachments).
-        # The message endpoint can return richer details for this same mid.
+        # MAX can omit the transcript in the update even when it has an audio URL.
+        # Check the full message before running the fallback recognizer.
         # Файл без имени может оказаться CSV-календарём, поэтому подробности нужны
         # до того, как решаем: это голос или файл.
-        if (
-            not text
-            and mid
-            and (not is_voice or not (url or transcription) or _untyped_file_present(message))
+        if mid and (
+            (is_voice and not transcription)
+            or (not text and not is_voice)
+            or _untyped_file_present(message)
         ):
             try:
                 full_message = await self.max_api.get_message(str(mid))
@@ -708,10 +717,10 @@ class BotHandler:
 
         try:
             if is_voice:
-                await reply("🎤 Голос получил, распознаю…")
                 if transcription:
                     text = transcription
                 else:
+                    await reply("🎤 Голос получил, распознаю…")
                     audio = await self.max_api.get_audio(url)
                     text = await self.asr.transcribe(audio)
                 if not text.strip():

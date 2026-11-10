@@ -43,13 +43,18 @@ CLOCK_HOUR_WORDS = (
     "двадцать три",
 )
 _HOUR = rf"(?:\d{{1,2}}|{'|'.join(reversed(CLOCK_HOUR_WORDS))})"
-_CLOCK = rf"{_HOUR}(?:[:. ]\d{{2}})?(?:\s+(?:утра|дня|вечера|ночи))?\b(?![:.\d]|\s+\d{{2}}\b)"
+_HOUR_UNIT = r"(?:\s+час(?:а|ов)?)?"
+_PART = r"(?:утра|дня|вечера|ночи|утром|дн[её]м|вечером|ночью)"
+_CLOCK = (
+    rf"{_HOUR}(?:[:. ]\d{{2}}|\s+ноль\s+ноль|{_HOUR_UNIT})(?:\s+{_PART})?"
+    rf"\b(?![:.]\d|\d|\s+(?:\d{{2}}|час(?:а|ов)?|{_PART})\b)"
+)
 _CLOCK_IN_TEXT = re.compile(rf"\bв\s+{_CLOCK}", re.I)
 _CADENCE = rf"(?:каждый день|ежедневно|(?:кажд(?:ый|ую|ое)|по) (?:{'|'.join(_DAY_FORMS)}))"
 _VERB = r"(?:напомни(?:те)?|напоминай(?:те)?|напоминать)"
 _CREATE = rf"(?:{_VERB}\s+(?:мне\s+)?|"
-_CREATE += r"(?:поставь|создай|добавь|запланируй)(?:\s+мне)?\s+напоминание\s+)"
-_SCHEDULE = rf"(?P<cadence>{_CADENCE})\s+в\s+(?P<clock>{_CLOCK})"
+_CREATE += r"(?:поставь|создай|добавь|запланируй)(?:\s+мне)?\s+напоминание\s+|(?:я\s+)?хочу\s+)"
+_SCHEDULE = rf"(?P<cadence>{_CADENCE})\s*[,—]?\s+в\s+(?P<clock>{_CLOCK})"
 _COMMANDS = tuple(
     re.compile(pattern, re.I)
     for pattern in (
@@ -81,8 +86,8 @@ class ReminderRule(BaseModel):
         return first
 
     @property
-    def schedule(self) -> str:
-        day = (
+    def cadence_label(self) -> str:
+        return (
             "Каждый день"
             if self.weekday is None
             else (
@@ -95,7 +100,10 @@ class ReminderRule(BaseModel):
                 "Каждое воскресенье",
             )[self.weekday]
         )
-        return f"{day} в {self.clock:%H:%M}"
+
+    @property
+    def schedule(self) -> str:
+        return f"{self.cadence_label} в {self.clock:%H:%M}"
 
 
 class SavedReminderRule(ReminderRule):
@@ -106,7 +114,8 @@ class SavedReminderRule(ReminderRule):
 def parse_clock(value: str) -> time | None:
     value = re.sub(r"^в\s+", "", " ".join(value.casefold().split()).strip(" .!?"))
     match = re.fullmatch(
-        rf"(?P<hour>{_HOUR})(?:[:. ](?P<minute>\d{{2}}))?(?:\s+(?P<part>утра|дня|вечера|ночи))?",
+        rf"(?P<hour>{_HOUR})(?:[:. ](?P<minute>\d{{2}})|\s+ноль\s+ноль|{_HOUR_UNIT})"
+        rf"(?:\s+(?P<part>{_PART}))?",
         value,
     )
     if not match:
@@ -116,9 +125,9 @@ def parse_clock(value: str) -> time | None:
     minute = int(match["minute"] or 0)
     if hour > 23 or minute > 59:
         return None
-    if match["part"] in {"дня", "вечера"} and hour < 12:
+    if match["part"] in {"дня", "вечера", "днем", "днём", "вечером"} and hour < 12:
         hour += 12
-    if match["part"] == "ночи" and hour == 12:
+    if match["part"] in {"ночи", "ночью"} and hour == 12:
         hour = 0
     return time(hour, minute)
 
@@ -131,6 +140,12 @@ def complete_clock(text: str, clock: time) -> str:
 
 
 def parse_command(text: str) -> ReminderRule | None:
+    parsed = parse_request(text)
+    return parsed[0] if parsed else None
+
+
+def parse_request(text: str) -> tuple[ReminderRule, bool] | None:
+    """Return the recurring rule and whether its hour needs morning/evening clarification."""
     source = " ".join(text.split()).strip(" .!?")
     if not _REPEATING.search(re.sub(r'«[^»]*»|"[^"]*"', "", source)):
         return None
@@ -157,4 +172,7 @@ def parse_command(text: str) -> ReminderRule | None:
     clock = parse_clock(match["clock"])
     if clock is None:
         raise ValueError
-    return ReminderRule(name=name, weekday=day, clock=clock)
+    ambiguous = 1 <= clock.hour <= 11 and bool(
+        re.fullmatch(rf"{_HOUR}{_HOUR_UNIT}", match["clock"], re.I)
+    )
+    return ReminderRule(name=name, weekday=day, clock=clock), ambiguous

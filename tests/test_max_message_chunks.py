@@ -19,6 +19,23 @@ def make_api(handler) -> MaxAPI:
     return api
 
 
+async def test_full_message_lookup_accepts_max_mid_prefix():
+    message_id = "mid.0000000000001_ab-2"
+    result = {
+        "body": {"mid": message_id, "attachments": [{"type": "audio", "transcription": "Текст"}]}
+    }
+
+    def handler(request):
+        assert request.url.path == f"/messages/{message_id}"
+        return httpx.Response(200, json=result)
+
+    api = make_api(handler)
+    try:
+        assert await api.get_message(message_id) == result
+    finally:
+        await api.close()
+
+
 @pytest.mark.parametrize(
     "text",
     ["Запись в календаре\n" * 400, "x" * 8_500],

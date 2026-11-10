@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -15,7 +16,7 @@ from redis.exceptions import RedisError
 from agent.core import Agent
 from agent.dialogue import starts_new_request
 from common.schemas import DRAFT_TTL_SECONDS, AgentResponse, AgentStatus, DraftAction
-from common.timeutils import reschedule_clock
+from common.timeutils import has_meeting_day, reschedule_clock
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,15 @@ class AgentService:
                 issued = DraftAction.model_validate_json(pending) if pending else None
                 if issued is None or issued.id != edit_draft_id:
                     raise InvalidDraft
+                # A bare meeting title in an open draft is a name correction.
+                title = text.strip().rstrip(".!")
+                if (
+                    issued.tool == "create_event"
+                    and issued.arguments.get("event_type") == "meeting"
+                    and re.fullmatch(r"встреча\s+(?:с|со)\s+[а-яё-]+(?:\s+[а-яё-]+)?", title, re.I)
+                    and not has_meeting_day(title)
+                ):
+                    return await self._agent.rename_meeting_draft(user_id, issued, title)
                 source = issued.arguments.get("user_text")
                 if isinstance(source, str) and (
                     issued.tool == "create_event"

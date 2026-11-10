@@ -181,6 +181,35 @@ class Agent:
     async def reset(self, user_id: str) -> None:
         await self._memory.reset(user_id)
 
+    async def rename_meeting_draft(
+        self, user_id: str, draft: DraftAction, title: str
+    ) -> AgentResponse:
+        arguments = {**draft.arguments, "name": title}
+        result = await self._toolbox.call(
+            user_id,
+            draft.tool,
+            arguments,
+            dry_run=True,
+            user_text=arguments.get("user_text"),
+            date_reference=arguments.get("date_reference"),
+        )
+        if not result.ok:
+            return AgentResponse(
+                reply_text=_public_tool_error(str(result.payload)), status=AgentStatus.ERROR
+            )
+        return _draft_response(
+            DraftAction(
+                tool=draft.tool,
+                arguments=arguments,
+                preview=_draft_preview(user_id, draft.tool, result, arguments),
+                status=(
+                    "pending_overlap_confirmation"
+                    if _awaits_overlap_confirmation(result)
+                    else "pending_confirmation"
+                ),
+            )
+        )
+
     async def execute_draft(
         self, user_id: str, draft: DraftAction, *, preview_on_conflict: bool = False
     ) -> AgentResponse:

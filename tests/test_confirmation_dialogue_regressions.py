@@ -813,3 +813,34 @@ async def test_reschedule_rejects_cancelled_record(session, tz):
     assert repo.writes == 2
     assert repo.rows[event.id].start_at == when
     assert api.sent[-1]["text"].startswith("Эта запись уже отменена.")
+
+
+async def test_name_only_edit_keeps_meeting_day_time_and_duration(session, request_clock, tz):
+    build, repo = session
+    start = datetime(2030, 11, 21, 7, tzinfo=tz)
+    _, api, message, click, model, _ = build(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Встреча с Сольгой",
+                "start_at": start.isoformat(),
+                "duration_minutes": 20,
+            },
+        )
+    )
+    await message("Поставь встречу с Сольгой 21 ноября 2030 в 07:00 на 20 минут", voice=True)
+    old_save = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Сохранить")
+    await click("Исправить")
+    await message("Встреча с Ольгой")
+    assert len(model.requests) == 1 and repo.writes == 0
+    assert "Встреча с Ольгой" in api.sent[-1]["text"]
+    assert "21 ноября 2030" in api.sent[-1]["text"]
+    assert "с 07:00 до 07:20" in api.sent[-1]["text"]
+    new_save = next(b["payload"] for b in all_buttons(api.sent[-1]) if b["text"] == "Сохранить")
+    await click(payload=old_save)
+    assert repo.writes == 0
+    await click(payload=new_save)
+    assert repo.writes == 1
+    event = next(iter(repo.rows.values()))
+    assert (event.name, event.start_at, event.duration_minutes) == ("Встреча с Ольгой", start, 20)

@@ -8,7 +8,7 @@
 
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -117,6 +117,19 @@ def _validation_message(error: ValidationError) -> str:
     return "; ".join(e["msg"].removeprefix("Value error, ") for e in error.errors())
 
 
+def _task_has_start_time(text: str) -> bool:
+    source = re.sub(r'"[^"\n]*"|«[^»]*»|`[^`]*`', "", text)
+    source = re.sub(r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b", "", source)
+    source = re.sub(r"(?<!\bв )\b\d{1,2}\.\d{1,2}\b", "", source, flags=re.I)
+    return mentions_start_time(source)
+
+
+def _is_past_start(start: datetime, now: datetime, all_day: bool) -> bool:
+    if all_day:
+        return start.astimezone(now.tzinfo).date() < now.date()
+    return start < now - PAST_TOLERANCE
+
+
 @mcp.tool
 async def create_event(
     user_id: UserId,
@@ -143,7 +156,8 @@ async def create_event(
         Field(
             description=(
                 "Когда событие. Обязательно для meeting и reminder. "
-                "Для task без срока — null. ISO 8601 со смещением."
+                "Для task без срока — null; если указали только день — эта дата с 00:00 "
+                "как технической отметкой. ISO 8601 со смещением."
             )
         ),
     ] = None,
@@ -204,6 +218,16 @@ async def create_event(
             raise ToolError("В исходном запросе нет времени, только день. Спроси точное время.")
         if not length:
             raise ToolError("Сколько продлится встреча?")
+    all_day = (
+        event_type == "task"
+        and user_text is not None
+        and has_meeting_day(user_text)
+        and not _task_has_start_time(user_text)
+    )
+    if all_day:
+        if start_at is None:
+            raise ToolError("Для задачи на указанный день передай его дату в start_at.")
+        duration_minutes = None
     try:
         data = EventCreate(
             user_id=user_id,
@@ -212,6 +236,7 @@ async def create_event(
             description=description,
             start_at=start_at,
             duration_minutes=duration_minutes,
+            all_day=all_day,
         )
     except ValidationError as error:
         raise ToolError(_validation_message(error)) from error
@@ -240,10 +265,14 @@ async def create_event(
     if data.start_at is not None:
         tz = get_settings().tz
         reference = ensure_aware(date_reference or now, tz).astimezone(tz)
+        if data.all_day:
+            reference = datetime.combine(reference.date(), time.min, tz)
         resolved = resolve_weekday_mismatch(source_text, data.start_at.astimezone(tz), reference)
         if resolved is not None:
             data = data.model_copy(update={"start_at": resolved})
-    if data.start_at is not None and data.start_at < now - PAST_TOLERANCE:
+    if data.start_at is not None and _is_past_start(data.start_at, now, data.all_day):
+        if data.all_day:
+            raise ToolError("Этот день уже прошёл. На какую дату поставить задачу?")
         raise ToolError(PAST_TIME_QUESTION)
     weekday = named_weekday(source_text)
     if data.start_at is not None and weekday is not None:
@@ -488,9 +517,21 @@ async def update_event(
             start_at = resolve_reschedule_day(user_text or "", start_at, reference)
         except ValueError as error:
             raise ToolError(str(error)) from error
-    if start_at is not None and start_at < now - PAST_TOLERANCE:
-        raise ToolError(PAST_TIME_QUESTION)
+    all_day = current.all_day
+    if start_at is not None:
+        if all_day:
+            all_day = (
+                clock is None and user_text is not None and not _task_has_start_time(user_text)
+            )
+        if all_day:
+            start_at = datetime.combine(start_at.date(), time.min, tz)
+        if _is_past_start(start_at, now, all_day):
+            if all_day:
+                raise ToolError("Этот день уже прошёл. На какую дату перенести задачу?")
+            raise ToolError(PAST_TIME_QUESTION)
 
+    if all_day and duration_minutes is not None:
+        raise ToolError("Во сколько начать задачу с указанной длительностью?")
     try:
         check_duration(
             current.type,
@@ -508,6 +549,7 @@ async def update_event(
                 "description": description,
                 "start_at": start_at,
                 "duration_minutes": duration_minutes,
+                "all_day": all_day,
             }.items()
             if value is not None
         }
@@ -526,6 +568,7 @@ async def update_event(
         description=description,
         start_at=start_at,
         duration_minutes=duration_minutes,
+        all_day=all_day if start_at is not None else None,
     )
     if event is None:
         raise ToolError("Событие не найдено")

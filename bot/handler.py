@@ -649,6 +649,8 @@ class BotHandler:
         )
         url, transcription = extract_audio(message)
         is_voice = _audio_present(message)
+        if is_voice:
+            await reply("🎙 Распознаю голосовое…")
         fetched: dict[str, Any] | None = None
 
         # MAX can omit the transcript in the update even when it has an audio URL.
@@ -706,6 +708,8 @@ class BotHandler:
 
         try:
             if is_voice:
+                if not _audio_present(message):
+                    await reply("🎙 Распознаю голосовое…")
                 if transcription:
                     text = transcription
                 else:

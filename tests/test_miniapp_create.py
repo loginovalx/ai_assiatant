@@ -37,7 +37,7 @@ const context = vm.createContext({
       return {ok: true, json: async () => url.includes('/v1/me') ? {user_id: '1'} : []};
     }
     calls.push(JSON.parse(options.body));
-    if (calls.length === 3) return {ok: true, json: async () => ({})};
+    if (calls.length >= 3) return {ok: true, json: async () => ({})};
     return {ok: false, status: 409, json: async () => ({detail: {
       confirmation: 'snapshot-' + calls.length,
       conflicts: [{name: 'Занято', start_at: '2030-11-11T10:00Z', end_at: '2030-11-11T11:00Z'}],
@@ -74,6 +74,22 @@ vm.runInContext(source, context);
   assert.deepEqual(calls.map(call => call.confirmation), [null, null, 'snapshot-2']);
   assert.notEqual(calls[0].request_id, calls[1].request_id);
   assert.equal(calls[1].request_id, calls[2].request_id);
+
+  getElementById('createOpen').listeners.click();
+  getElementById('createType').value = 'task';
+  getElementById('createType').listeners.change();
+  getElementById('createName').value = 'Сделать ДЗ';
+  getElementById('createDate').value = '2030-11-16';
+  getElementById('createTime').value = '';
+  assert.equal(getElementById('createTime').required, false);
+  await vm.runInContext('saveEntry(null)', context);
+  assert.equal(calls[3].all_day, true);
+  assert.equal(calls[3].start_at, '2030-11-16T00:00:00');
+  const date = vm.runInContext(`
+    const task = normalize({all_day: true, start_at: '2030-11-16T00:00:00+03:00'});
+    [task.dateOnly, toDateOnly(task.when)].join(',')
+  `, context);
+  assert.equal(date, 'true,2030-11-16');
 })().catch(error => { console.error(error); process.exit(1); });
 """
     subprocess.run([node, "-e", harness, str(html)], check=True, timeout=15)

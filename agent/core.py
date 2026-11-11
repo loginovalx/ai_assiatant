@@ -1215,6 +1215,8 @@ def _with_event_refs(response: AgentResponse) -> str:
 
 
 def _when(event: Event) -> str:
+    if event.all_day and event.start_at is not None:
+        return format_calendar_day(event.start_at)
     return format_calendar_time(event.start_at, event.end_at)
 
 
@@ -1265,7 +1267,7 @@ def _read_response(events: dict[str, Event], read_tools: set[str]) -> AgentRespo
         if day != previous_day:
             lines.extend(["", day])
             previous_day = day
-        when = format_calendar_slot(event.start_at, event.end_at, tz)
+        when = "" if event.all_day else format_calendar_slot(event.start_at, event.end_at, tz)
         status = " · выполнено" if event.status == "done" else ""
         title = _entry_name(event)
         kind = _ENTRY_KINDS[event.type]

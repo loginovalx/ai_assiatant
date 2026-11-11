@@ -80,6 +80,7 @@ class MiniAppEventInput(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
     start_at: datetime | None = None
+    all_day: bool = False
     duration_minutes: int | None = None
     request_id: UUID
     confirmation: str | None = Field(default=None, max_length=64)

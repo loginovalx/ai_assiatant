@@ -24,7 +24,7 @@ from common.schemas import (
 )
 
 _COLUMNS = (
-    "id, user_id, type, name, description, start_at, duration_minutes, status, "
+    "id, user_id, type, name, description, start_at, duration_minutes, all_day, status, "
     "created_at, updated_at"
 )
 
@@ -131,8 +131,8 @@ class EventRepository:
         row = await db.fetchrow(
             f"""
             INSERT INTO events (id, user_id, type, name, description, start_at, duration_minutes,
-                                embedding)
-            VALUES ($8, $1, $2, $3, $4, $5, $6, $7)
+                                embedding, all_day)
+            VALUES ($8, $1, $2, $3, $4, $5, $6, $7, $9)
             ON CONFLICT (id) DO UPDATE SET id = events.id
             WHERE events.user_id = EXCLUDED.user_id
             RETURNING {_COLUMNS}
@@ -145,6 +145,7 @@ class EventRepository:
             data.duration_minutes,
             embedding,
             event_id,
+            data.all_day,
         )
         return self._to_event(row)
 
@@ -228,6 +229,7 @@ class EventRepository:
         start_at: datetime | None = None,
         event_type: EventType | None = None,
         duration_minutes: int | None = None,
+        all_day: bool | None = None,
     ) -> Event | None:
         """Частичное обновление: None в параметре — «не менять».
 
@@ -252,6 +254,9 @@ class EventRepository:
             description=new_description,
             start_at=new_start,
             duration_minutes=new_duration,
+            all_day=all_day
+            if all_day is not None
+            else current.all_day and new_type == EventType.TASK,
         )
         new_name, new_description = validated.name, validated.description
 
@@ -266,11 +271,12 @@ class EventRepository:
             f"""
             UPDATE events
             SET name = $3, description = $4, type = $5, start_at = $6, duration_minutes = $7,
-                embedding = COALESCE($8, embedding),
-                notified_at = CASE WHEN start_at IS DISTINCT FROM $6 THEN NULL ELSE notified_at END,
-                notification_claimed_at = CASE WHEN start_at IS DISTINCT FROM $6
+                embedding = COALESCE($8, embedding), all_day = $9,
+                notified_at = CASE WHEN start_at IS DISTINCT FROM $6 OR all_day <> $9
+                    THEN NULL ELSE notified_at END,
+                notification_claimed_at = CASE WHEN start_at IS DISTINCT FROM $6 OR all_day <> $9
                     THEN NULL ELSE notification_claimed_at END,
-                notification_claim_token = CASE WHEN start_at IS DISTINCT FROM $6
+                notification_claim_token = CASE WHEN start_at IS DISTINCT FROM $6 OR all_day <> $9
                     THEN NULL ELSE notification_claim_token END
             WHERE id = $1 AND user_id = $2 AND status <> 'cancelled'
             RETURNING {_COLUMNS}
@@ -280,9 +286,10 @@ class EventRepository:
             new_name,
             new_description,
             new_type.value,
-            new_start,
+            validated.start_at,
             new_duration,
             embedding,
+            validated.all_day,
         )
         return self._to_event(row) if row is not None else None
 
@@ -478,7 +485,7 @@ class EventRepository:
             UPDATE events SET notification_claimed_at = $1, notification_claim_token = $4
             WHERE id IN (
                 SELECT id FROM events
-                WHERE status = 'active' AND notified_at IS NULL
+                WHERE status = 'active' AND notified_at IS NULL AND NOT all_day
                   AND start_at IS NOT NULL AND start_at <= $1 AND start_at > $2
                   AND (reminder_series_id IS NULL OR EXISTS (
                       SELECT 1 FROM reminder_series s WHERE s.id = reminder_series_id AND s.active
@@ -508,7 +515,7 @@ class EventRepository:
             f"""
             UPDATE events SET start_at = $3, notified_at = NULL,
                 notification_claimed_at = NULL, notification_claim_token = NULL
-            WHERE id = $1 AND user_id = $2 AND status = 'active'
+            WHERE id = $1 AND user_id = $2 AND status = 'active' AND NOT all_day
             RETURNING {_COLUMNS}
             """,
             event_id,
@@ -654,7 +661,8 @@ class EventRepository:
               AND status <> 'cancelled'
               AND ($4::text[] IS NULL OR type = ANY($4))
               AND (
-                    (start_at >= $2 AND start_at < $3)
+                    (NOT all_day AND start_at >= $2 AND start_at < $3)
+                 OR (all_day AND start_at >= $6 AND start_at < $7)
                  OR ($5 AND start_at IS NULL AND status = 'active')
               )
             ORDER BY start_at NULLS LAST, created_at
@@ -664,6 +672,10 @@ class EventRepository:
             end,
             [t.value for t in types] if types else None,
             include_undated,
+            # Day-only tasks use the calendar dates of the requested bounds, even
+            # when the Mini App sends an offset different from the bot timezone.
+            start.replace(tzinfo=self._tz),
+            end.replace(tzinfo=self._tz),
         )
         return [self._to_event(r) for r in rows]
 
@@ -795,6 +807,7 @@ class EventRepository:
             # База отдаёт UTC; наружу — время пользователя, чтобы агенту не пересчитывать.
             start_at=start_at.astimezone(self._tz) if start_at else None,
             duration_minutes=row["duration_minutes"],
+            all_day=row["all_day"],
             status=EventStatus(row["status"]),
             reminder_series_id=row.get("reminder_series_id"),
             created_at=row["created_at"].astimezone(self._tz),

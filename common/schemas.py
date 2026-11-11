@@ -5,7 +5,7 @@
 - Бот (B) и агент (C): AgentRequest, AgentResponse.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from enum import StrEnum
 from uuid import UUID, uuid4
 
@@ -83,6 +83,7 @@ class EventCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = Field(default="", max_length=2000)
     start_at: datetime | None = None
+    all_day: bool = False
     duration_minutes: int | None = DurationMinutes
 
     @field_validator("name")
@@ -108,6 +109,12 @@ class EventCreate(BaseModel):
         if self.type in TIMED_TYPES and self.start_at is None:
             raise ValueError(f"Для типа '{self.type}' нужно указать дату и время (start_at)")
         check_duration(self.type, self.start_at, self.duration_minutes)
+        if self.all_day:
+            if self.type != EventType.TASK or self.start_at is None or self.duration_minutes:
+                raise ValueError("Для задачи на весь день укажите дату без длительности")
+            tz = get_settings().tz
+            day = self.start_at.astimezone(tz).date()
+            self.start_at = datetime.combine(day, time.min, tz)
         return self
 
 
@@ -119,6 +126,7 @@ class Event(BaseModel):
     name: str
     description: str
     start_at: datetime | None
+    all_day: bool = False
     duration_minutes: int | None = None
     status: EventStatus
     created_at: datetime

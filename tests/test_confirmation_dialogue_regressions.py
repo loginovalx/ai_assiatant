@@ -13,7 +13,7 @@ import httpx
 import pytest
 from fastmcp import FastMCP
 
-from agent.core import Agent
+from agent.core import Agent, _read_response
 from agent.main import app, get_agent
 from agent.memory import ConversationMemory
 from agent.service import AgentService
@@ -528,6 +528,41 @@ def request_clock(monkeypatch, tz):
     return clock
 
 
+@pytest.mark.parametrize(
+    ("date_phrase", "clock_phrase", "day", "all_day"),
+    [
+        ("16 ноября", "", 16, True),
+        ("16.11", "", 16, True),
+        ("16 ноября", " в 00:00", 16, False),
+        ("сегодня", "", 10, True),
+    ],
+)
+async def test_task_on_a_date_keeps_midnight_only_if_requested(
+    session, request_clock, tz, date_phrase, clock_phrase, day, all_day
+):
+    build, repo = session
+    proposed = datetime(2030, 11, day, 18 if all_day else 0, tzinfo=tz)
+    _, api, message, _, _, _ = build(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "task",
+                "name": "Сделать ДЗ по английскому",
+                "start_at": proposed.isoformat(),
+            },
+        )
+    )
+    await message(f"Поставь задачу сделать ДЗ по английскому на {date_phrase}{clock_phrase}")
+
+    [event] = repo.rows.values()
+    assert event.all_day is all_day
+    assert event.start_at == datetime(2030, 11, day, tzinfo=tz)
+    assert ("00:00" in api.sent[-1]["text"]) is not all_day
+    assert f"{day} ноября" in api.sent[-1]["text"]
+    schedule = _read_response({str(event.id): event}, {"get_events"}).reply_text
+    assert ("00:00" in schedule) is not all_day
+
+
 async def test_read_reschedule_shorten_rename_keeps_tomorrow(session, request_clock, tz):
     build, repo = session
     target = datetime(2030, 11, 11, 11, tzinfo=tz)
@@ -830,14 +865,15 @@ async def test_complete_voice_command_only_offers_verified_confirmation(session,
     mid = uuid4().hex
     await message(source, voice=True, mid=mid)
     await message(source, voice=True, mid=mid)
-    assert len(api.sent) == 1
+    assert len(api.sent) == 2
+    assert api.sent[0]["text"] == "🎙 Распознаю голосовое…"
     assert "Встреча с Анной" in api.sent[-1]["text"] and "14:00" in api.sent[-1]["text"]
     buttons = all_buttons(api.sent[-1])
     assert [b["text"] for b in buttons][:2] == ["Да", "Нет"]
     assert repo.writes == 0
     await click(payload=buttons[0]["payload"])
     await click(payload=buttons[0]["payload"])
-    assert len(api.sent) == 2 and repo.writes == 1
+    assert len(api.sent) == 3 and repo.writes == 1
     saved = next(iter(repo.rows.values()))
     assert (saved.name, saved.start_at, saved.duration_minutes) == (
         "Встреча с Анной",
@@ -1044,7 +1080,10 @@ async def test_late_max_transcript_keeps_name_date_and_time_after_duration_choic
 
     await bot.handle_update(update)
     assert api.get_message.await_count == 2
-    assert api.sent[-1]["text"] == "Сколько продлится встреча?"
+    assert [item["text"] for item in api.sent] == [
+        "🎙 Распознаю голосовое…",
+        "Сколько продлится встреча?",
+    ]
     assert not model.requests
 
     await click("30 минут")

@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 
+from common.config import get_settings
 from common.schemas import Event, EventStatus, EventType
 
 # Сколько показывать в календаре, если запись сама время не занимает (end_at пустой):
@@ -22,13 +23,18 @@ def build_ics(event: Event, now: datetime | None = None) -> str:
     if event.start_at is None:
         raise ValueError("У события нет даты — его нельзя добавить в календарь")
 
-    start = event.start_at.astimezone(UTC)
-    end = (
-        event.end_at.astimezone(UTC)
-        if event.end_at is not None
-        else start + _DISPLAY_DURATION[event.type]
-    )
-    alarm_minutes = int(_ALARM_BEFORE[event.type].total_seconds() // 60)
+    if event.all_day:
+        day = event.start_at.astimezone(get_settings().tz).date()
+        next_day = day + timedelta(days=1)
+        dates = [f"DTSTART;VALUE=DATE:{day:%Y%m%d}", f"DTEND;VALUE=DATE:{next_day:%Y%m%d}"]
+    else:
+        start = event.start_at.astimezone(UTC)
+        end = (
+            event.end_at.astimezone(UTC)
+            if event.end_at is not None
+            else start + _DISPLAY_DURATION[event.type]
+        )
+        dates = [f"DTSTART:{_fmt(start)}", f"DTEND:{_fmt(end)}"]
     stamp = (now or datetime.now(UTC)).astimezone(UTC)
     title = f"✓ Выполнено: {event.name}" if event.status == EventStatus.DONE else event.name
 
@@ -41,14 +47,14 @@ def build_ics(event: Event, now: datetime | None = None) -> str:
         "BEGIN:VEVENT",
         f"UID:{event.id}@voice-assistant",
         f"DTSTAMP:{_fmt(stamp)}",
-        f"DTSTART:{_fmt(start)}",
-        f"DTEND:{_fmt(end)}",
+        *dates,
         f"SUMMARY:{_escape(title)}",
         "STATUS:CANCELLED" if event.status == EventStatus.CANCELLED else "STATUS:CONFIRMED",
     ]
     if event.description and event.description != event.name:
         lines.append(f"DESCRIPTION:{_escape(event.description)}")
-    if event.status == EventStatus.ACTIVE:
+    if event.status == EventStatus.ACTIVE and not event.all_day:
+        alarm_minutes = int(_ALARM_BEFORE[event.type].total_seconds() // 60)
         lines += [
             "BEGIN:VALARM",
             "ACTION:DISPLAY",

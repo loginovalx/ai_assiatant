@@ -168,7 +168,7 @@
         <label><span id="createDateLabel">Дата (необязательно)</span>
           <input id="createDate" type="date">
         </label>
-        <label>Время <input id="createTime" type="time"></label>
+        <label><span id="createTimeLabel">Время</span> <input id="createTime" type="time"></label>
       </div>
       <label class="hidden" id="createDurationField"><span id="createDurationLabel">Длительность, мин</span>
         <input id="createDuration" type="number" min="1" max="1440" step="1" inputmode="numeric">
@@ -377,12 +377,12 @@ function normalize(raw) {
   const o = (raw && typeof raw.event === 'object' && raw.event) ? raw.event : raw; // в поиске бывает {event:{...}, score}
   const whenRaw = pick(o, ['start_at', 'starts_at', 'start', 'start_time', 'datetime', 'due_at', 'due', 'remind_at', 'scheduled_at', 'date', 'time']);
   let when = null;
-  let dateOnly = false;
+  const dateOnly = o.all_day === true || (typeof whenRaw === 'string' && whenRaw.length <= 10);
   if (whenRaw) {
-    const d = new Date(whenRaw);
+    const d = new Date(dateOnly && typeof whenRaw === 'string'
+      ? whenRaw.slice(0, 10) + 'T00:00:00' : whenRaw);
     if (!isNaN(d.getTime())) {
       when = d;
-      dateOnly = typeof whenRaw === 'string' && whenRaw.length <= 10;
     }
   }
   const endRaw = pick(o, ['end_at', 'ends_at', 'end', 'end_time']);
@@ -639,8 +639,9 @@ function entryFields() {
   const task = entryType.value === 'task';
   const meeting = entryType.value === 'meeting';
   entryDate.required = !task || !!entryTime.value;
-  entryTime.required = !task || !!entryDate.value;
+  entryTime.required = !task;
   document.getElementById('createDateLabel').textContent = task ? 'Дата (необязательно)' : 'Дата';
+  document.getElementById('createTimeLabel').textContent = task ? 'Время (необязательно)' : 'Время';
   const hasDuration = meeting || (task && !!entryDate.value && !!entryTime.value);
   document.getElementById('createDurationField').classList.toggle('hidden', !hasDuration);
   document.getElementById('createDurationLabel').textContent =
@@ -705,9 +706,12 @@ async function saveEntry(confirmation) {
     entryName.focus();
     return;
   }
-  const start = entryDate.value && entryTime.value
-    ? toLocalISO(new Date(entryDate.value + 'T' + entryTime.value))
-    : null;
+  const allDay = entryType.value === 'task' && !!entryDate.value && !entryTime.value;
+  let start = null;
+  if (allDay) start = entryDate.value + 'T00:00:00';
+  else if (entryDate.value && entryTime.value) {
+    start = toLocalISO(new Date(entryDate.value + 'T' + entryTime.value));
+  }
   const duration = entryDuration.disabled || !entryDuration.value ? null : Number(entryDuration.value);
   entryBusy = true;
   const controls = [entryType, entryName, entryDate, entryTime, entryCancel, entryChange, entrySave, entryConfirm];
@@ -717,7 +721,7 @@ async function saveEntry(confirmation) {
   try {
     await api('/v1/events', { user_id: state.userId }, 'POST', {
       type: entryType.value, name, start_at: start, duration_minutes: duration,
-      request_id: entryRequestId, confirmation,
+      all_day: allDay, request_id: entryRequestId, confirmation,
     });
     entryDialog.close();
     entryNotice.textContent = 'Сохранено: ' + name;

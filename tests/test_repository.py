@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -42,6 +42,23 @@ async def test_create_returns_local_time_and_weekday(repo, tz):
 async def test_task_without_date(repo):
     event = await add(repo, EventType.TASK, "Купить билеты")
     assert event.start_at is None and event.weekday is None
+
+
+async def test_date_only_task_is_in_schedule_but_does_not_trigger_midnight_notification(repo, tz):
+    day, tomorrow = at(tz, 0, 0), at(tz, 1, 0)
+    all_day = await repo.create(
+        EventCreate(user_id=USER, type="task", name="ДЗ", start_at=day, all_day=True)
+    )
+    timed = await add(repo, EventType.TASK, "Проверить отчёт в полночь", day)
+
+    events = await repo.list_by_period(USER, day, tomorrow)
+    assert {event.id: event.all_day for event in events} == {all_day.id: True, timed.id: False}
+    browser_events = await repo.list_by_period(
+        USER, day.replace(tzinfo=UTC), tomorrow.replace(tzinfo=UTC)
+    )
+    assert [event.id for event in browser_events] == [all_day.id]
+    due = await repo.claim_due_events(day + timedelta(minutes=1), timedelta(hours=1), 10)
+    assert [event.id for event in due] == [timed.id]
 
 
 async def test_list_today_half_open_interval(repo, tz):

@@ -133,6 +133,28 @@ def test_ics_format():
     assert "SUMMARY:Встреча\\; с Иваном\\, срочно" in unfolded
 
 
+def test_ics_date_only_task_has_a_calendar_day_and_no_alarm(tz):
+    from common.schemas import Event
+
+    start = datetime(2030, 11, 16, tzinfo=tz)
+    event = Event(
+        id=uuid4(),
+        user_id=USER,
+        type=EventType.TASK,
+        name="Сделать ДЗ",
+        description="",
+        start_at=start,
+        all_day=True,
+        status="active",
+        created_at=start,
+        updated_at=start,
+    )
+    text = build_ics(event, now=start)
+    assert "DTSTART;VALUE=DATE:20301116\r\n" in text
+    assert "DTEND;VALUE=DATE:20301117\r\n" in text
+    assert "VALARM" not in text
+
+
 async def test_miniapp_create_requires_current_conflict_confirmation(client, pool, tz):
     busy = await seed(tz)
     params = {"user_id": USER}

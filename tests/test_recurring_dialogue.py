@@ -196,7 +196,7 @@ async def test_max_transcript_of_weekly_intention_uses_the_requested_hour(
         "SELECT name, weekday, clock FROM reminder_series WHERE user_id='777'"
     )
     assert tuple(row.values()) == ("поливать цветы", 0, time(14))
-    api.get_message.assert_awaited_once()
+    assert api.get_message.await_count == (1 if max_transcript else 2)
     if max_transcript:
         api.get_audio.assert_not_awaited()
         asr.transcribe.assert_not_awaited()

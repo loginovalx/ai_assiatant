@@ -417,6 +417,15 @@ class Agent:
             if simple_voice_create and date_reference
             else None
         )
+        if (
+            grounded is not None
+            and grounded["event_type"] == "meeting"
+            and grounded["duration_minutes"] is None
+        ):
+            return AgentResponse(
+                reply_text="Сколько продлится встреча?",
+                status=AgentStatus.NEED_CLARIFICATION,
+            )
         simple_voice_meeting = simple_voice_create and is_appointment_request(source)
         if simple_voice_meeting and (hour := ambiguous_hour(source)) is not None:
             return AgentResponse(

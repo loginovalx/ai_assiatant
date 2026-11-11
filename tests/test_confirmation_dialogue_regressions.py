@@ -6,6 +6,7 @@ These tests verify confirmation/state contracts, not live GigaChat language qual
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import httpx
@@ -1011,3 +1012,47 @@ async def test_name_only_edit_keeps_meeting_day_time_and_duration(session, reque
     assert repo.writes == 1
     event = next(iter(repo.rows.values()))
     assert (event.name, event.start_at, event.duration_minutes) == ("Встреча с Ольгой", start, 20)
+
+
+async def test_late_max_transcript_keeps_name_date_and_time_after_duration_choice(session, tz):
+    build, repo = session
+    bot, api, _, click, model, _ = build(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "meeting",
+                "name": "Сыграем в Синутро",
+                "start_at": (datetime.now(tz) + timedelta(days=1)).isoformat(),
+                "duration_minutes": 60,
+            },
+        )
+    )
+    phrase = "Поставь встречу послезавтра с Игорем, в семь утра"
+    api.get_message = AsyncMock(
+        side_effect=[
+            {"body": {"attachments": [{"type": "audio"}]}},
+            {"body": {"attachments": [{"type": "audio", "transcription": phrase}]}},
+        ]
+    )
+    api.get_audio = AsyncMock(return_value=b"audio")
+    bot.asr = AsyncMock()
+    bot.asr.transcribe.return_value = "После завтра сыграем в Синутро"
+    update = text_message("", uuid4().hex)
+    update["message"]["body"]["attachments"] = [
+        {"type": "audio", "payload": {"url": "https://cdn.max.ru/example"}}
+    ]
+
+    await bot.handle_update(update)
+    assert api.get_message.await_count == 2
+    assert api.sent[-1]["text"] == "Сколько продлится встреча?"
+    assert not model.requests
+
+    await click("30 минут")
+    preview = api.sent[-1]["text"]
+    assert "Встреча с Игорем" in preview and "07:00" in preview and "Синутро" not in preview
+    assert repo.writes == 0
+    await click("Да")
+    [event] = repo.rows.values()
+    assert event.name == "Встреча с Игорем"
+    assert event.start_at.date() == (datetime.now(tz) + timedelta(days=2)).date()
+    assert (event.start_at.hour, event.start_at.minute, event.duration_minutes) == (7, 0, 30)

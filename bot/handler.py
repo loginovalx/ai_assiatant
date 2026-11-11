@@ -711,6 +711,21 @@ class BotHandler:
                 else:
                     audio = await self.max_api.get_audio(url)
                     text = await self.asr.transcribe(audio)
+                    if mid:
+                        try:
+                            _, transcription = extract_audio(
+                                await self.max_api.get_message(str(mid))
+                            )
+                        except MaxAPIError as exc:
+                            logger.warning("MAX transcript refresh unavailable: %s", exc)
+                    if transcription:
+                        text = transcription
+                    elif text.strip():
+                        await reply(
+                            f"Распознал: «{text.strip()}». "
+                            "Если текст неверный, пришли команду целиком."
+                        )
+                logger.info("Voice transcription source=%s", "max" if transcription else "asr")
                 if not text.strip():
                     raise SpeechRecognitionError("Не получилось распознать речь")
                 await self.state.transition(user_id, request_id)

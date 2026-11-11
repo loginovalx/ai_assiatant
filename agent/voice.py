@@ -11,7 +11,9 @@ _DAYS = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
 _DAY = rf"(?:на\s+)?(?P<day>{'|'.join(_DAYS)})"
 _TIME = rf"(?:в|на)\s+(?P<clock>{CLOCK_EXPRESSION})"
 _MEETING_VERB = r"(?:назначь|поставь|создай|добавь|запланируй)"
-_MEETING_NAME = r"(?P<name>(?:встречу|созвон)(?:\s+с(?:о)?\s+[а-яё-]+(?:\s+[а-яё-]+){0,2})?)"
+_MEETING_KIND = r"(?:встречу|созвон)"
+_PERSON = r"с(?:о)?\s+[а-яё-]+(?:\s+[а-яё-]+){0,2}"
+_MEETING_NAME = rf"(?P<name>{_MEETING_KIND}(?:\s+{_PERSON})?)"
 _LENGTH = r"на\s+(?P<duration>.+?)"
 _MEETINGS = tuple(
     re.compile(rf"{_MEETING_VERB}\s+{body}", re.I)
@@ -19,6 +21,8 @@ _MEETINGS = tuple(
         rf"{_MEETING_NAME}\s+{_DAY}\s+{_TIME}\s+{_LENGTH}",
         rf"{_DAY}\s+{_MEETING_NAME}\s+{_TIME}\s+{_LENGTH}",
         rf"{_MEETING_NAME}\s+{_TIME}\s+{_LENGTH}\s+{_DAY}",
+        rf"(?P<kind>{_MEETING_KIND})\s+{_DAY}\s+(?P<person>{_PERSON}),?\s+"
+        rf"{_TIME}(?:\s+{_LENGTH})?",
     )
 )
 _REMINDERS = tuple(
@@ -44,7 +48,7 @@ _MINUTES = {
 
 
 def grounded_voice_create(source: str, reference: datetime) -> dict | None:
-    """Accept complete single commands with explicit calendar fields."""
+    """Read explicit fields from a single spoken command."""
     value = " ".join(line.strip(" .!?") for line in source.splitlines())
     value = " ".join(value.split())
     if not is_single_action_request(value, "create_event"):
@@ -59,7 +63,7 @@ def grounded_voice_create(source: str, reference: datetime) -> dict | None:
     if clock is None or clock_needs_daypart(match["clock"], clock):
         return None
     duration = None
-    if meeting:
+    if meeting and meeting["duration"] is not None:
         length = meeting["duration"].casefold()
         minutes = re.fullmatch(r"(.+?)\s+минут(?:у|ы)?", length)
         if minutes:
@@ -69,7 +73,9 @@ def grounded_voice_create(source: str, reference: datetime) -> dict | None:
             duration = _DURATIONS.get(length)
         if duration is None or not 1 <= duration <= MAX_DURATION_MINUTES:
             return None
-    name = match["name"].strip(' «»"')
+    fields = match.groupdict()
+    name = fields.get("name") or f"{fields['kind']} {fields['person']}"
+    name = name.strip(' «»"')
     if not name or len(name) > 200:
         return None
     if meeting:

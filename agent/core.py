@@ -21,7 +21,7 @@ from agent.policy import asks_to_read, explicitly_requests_change, is_single_act
 from agent.prompt import build_system_prompt
 from agent.routing import ModelRoute, completion_problem, select_model
 from agent.tools import ALLOWED_TOOLS, MUTATING_TOOLS, McpToolbox, ToolResult
-from agent.voice import grounded_voice_create
+from agent.voice import grounded_voice_create, normalize_voice_reminder
 from common.config import get_settings
 from common.dialogue import (
     PAST_TIME_QUESTION,
@@ -88,6 +88,14 @@ class Agent:
         trusted_edit_source: str | None = None,
     ) -> AgentResponse:
         now = now or datetime.now(self._tz)
+        if confirm_changes and not trusted_edit_source:
+            try:
+                text = normalize_voice_reminder(text, now.astimezone(self._tz))
+            except ValueError:
+                return AgentResponse(
+                    reply_text="Повтори только новое напоминание: о чём и во сколько напомнить.",
+                    status=AgentStatus.NEED_CLARIFICATION,
+                )
         try:
             direct = direct_reply(text)
             if direct:

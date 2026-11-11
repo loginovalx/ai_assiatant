@@ -720,11 +720,6 @@ class BotHandler:
                             logger.warning("MAX transcript refresh unavailable: %s", exc)
                     if transcription:
                         text = transcription
-                    elif text.strip():
-                        await reply(
-                            f"Распознал: «{text.strip()}». "
-                            "Если текст неверный, пришли команду целиком."
-                        )
                 logger.info("Voice transcription source=%s", "max" if transcription else "asr")
                 if not text.strip():
                     raise SpeechRecognitionError("Не получилось распознать речь")

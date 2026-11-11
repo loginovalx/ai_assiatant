@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from common.reminder_series import CLOCK_HOUR_WORDS, parse_clock
 
 _HOUR = rf"(?:\d{{1,2}}|{'|'.join(reversed(CLOCK_HOUR_WORDS))})"
-_DAY_PART = r"(?:утра|дня|вечера|ночи)"
+_DAY_PART = r"(?:утра|дня|вечера|ночи|утром|дн[её]м|вечером|ночью)"
 _EXACT_CLOCK = re.compile(
     rf"\b(?:\d{{1,2}}:\d{{2}}(?:\s+{_DAY_PART})?|"
     rf"(?:в\s+\d{{1,2}}\.\d{{2}}|на\s+\d{{1,2}}\.00)(?![./]\d)(?:\s+{_DAY_PART})?|"

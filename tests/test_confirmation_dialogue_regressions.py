@@ -1056,3 +1056,28 @@ async def test_late_max_transcript_keeps_name_date_and_time_after_duration_choic
     assert event.name == "Встреча с Игорем"
     assert event.start_at.date() == (datetime.now(tz) + timedelta(days=2)).date()
     assert (event.start_at.hour, event.start_at.minute, event.duration_minutes) == (7, 0, 30)
+
+
+async def test_voice_reminder_keeps_only_the_replacement_and_deduplicates_its_clock(session, tz):
+    build, repo = session
+    _, api, message, click, _, _ = build(
+        tool_call(
+            "create_event",
+            {
+                "event_type": "reminder",
+                "name": "Сходить к врачу",
+                "start_at": (datetime.now(tz) + timedelta(days=1)).replace(hour=22).isoformat(),
+            },
+        )
+    )
+    await message(
+        "Напомни, завтра сходить к врачу в 10 утра. А, нет, не надо это напоминать. "
+        "Напомни. Лучше завтра полить цветы в 10: 30. И потом еще: Ну, да, в 10: 30",
+        voice=True,
+    )
+    preview = api.sent[-1]["text"]
+    assert "Полить цветы" in preview and "10:30" in preview and "к врачу" not in preview
+    assert repo.writes == 0
+    await click("Да")
+    [event] = repo.rows.values()
+    assert (event.name, event.start_at.hour, event.start_at.minute) == ("Полить цветы", 10, 30)

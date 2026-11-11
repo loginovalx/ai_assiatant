@@ -26,7 +26,7 @@ _MEETINGS = tuple(
     )
 )
 _REMINDERS = tuple(
-    re.compile(rf"напомни(?:\s+мне)?\s+{body}", re.I)
+    re.compile(rf"напомни(?:\s+мне)?[,]?\s+{body}", re.I)
     for body in (
         rf"{_DAY}\s+{_TIME}[,:]?\s+(?P<name>.+)",
         rf"{_DAY}\s+(?P<name>.+?)\s+{_TIME}",
@@ -88,3 +88,38 @@ def grounded_voice_create(source: str, reference: datetime) -> dict | None:
         "start_at": datetime.combine(day, clock, reference.tzinfo).isoformat(),
         "duration_minutes": duration,
     }
+
+
+_REMINDER_CORRECTION = re.compile(
+    r"^напомн(?:и|ите|ю)\b.+?\bнет[\s,]+не\s+надо\s+"
+    r"(?:(?:мне|это)\s+)*напоминать\b[\s,.!?;—-]*(.*)$",
+    re.I | re.S,
+)
+
+
+def normalize_voice_reminder(source: str, reference: datetime) -> str:
+    """Keep a single clearly specified replacement after a spoken cancellation."""
+    source = re.sub(r"(?<=\d):\s+(?=\d{2}\b)", ":", source)
+    correction = _REMINDER_CORRECTION.fullmatch(source.strip())
+    if not correction:
+        return source
+
+    replacement = re.sub(r"^напомни(?:те)?[\s,.!?]+", "", correction[1], flags=re.I)
+    replacement = re.sub(r"^лучше[\s,]+", "", replacement, flags=re.I)
+    parts = re.split(
+        r"[.!?,]*\s+и\s+потом(?:\s+ещ[её])?[\s,:]*",
+        replacement,
+        maxsplit=1,
+        flags=re.I,
+    )
+    command = parts[0]
+    command = f"Напомни {command.strip(' .!?,')}"
+    grounded = grounded_voice_create(command, reference)
+    if grounded is None:
+        raise ValueError("Missing replacement reminder")
+    if len(parts) == 2:
+        repeated = re.sub(r"^(?:ну[\s,]+)?да[\s,]+", "", parts[1], flags=re.I)
+        clock = parse_clock(repeated)
+        if clock != datetime.fromisoformat(grounded["start_at"]).time():
+            raise ValueError("Different or unclear reminder time")
+    return command
